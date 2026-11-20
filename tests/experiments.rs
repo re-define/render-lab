@@ -1,0 +1,400 @@
+mod support;
+use anyhow::Result;
+use glam::Mat4;
+use render_lab::{
+    engine::{Schedule, System},
+    experiments::{clusters, motion},
+    render::{Camera, Forward, GeometrySelection, Snapshot, Technique},
+    rhi::Backend,
+    scene::*,
+};
+use std::sync::Arc;
+
+#[test]
+fn cluster_cut_refines_and_round_trips() -> Result<()> {
+    let mut w = clusters::terrain()?;
+    let dir = support::tempdir()?;
+    let path = dir.path().join("terrain.json");
+    w.save(&path)?;
+    w = World::load(&path)?;
+    let camera = Camera::fit(&w)?;
+    let cut = |mut w: World, px: f32| -> Result<Vec<u32>> {
+        *w.entities
+            .values_mut()
+            .find_map(|e| e.components.get_mut(clusters::SETTING))
+            .unwrap() = px.into();
+        let view = Snapshot {
+            materials: Default::default(),
+            world: Arc::new(w),
+            camera,
+            extent: [480, 300],
+        };
+        let geom = view
+            .world
+            .entities
+            .values()
+            .find(|e| e.hierarchy.is_some())
+            .unwrap();
+        clusters::ClusterLod::default().triangles(geom, Mat4::IDENTITY, &view)
+    };
+    let mut fine = cut(w.clone(), 0.)?;
+    fine.sort_unstable();
+    assert_eq!(fine, (0..8192).collect::<Vec<_>>());
+    let coarse = cut(w, 1000.)?;
+    assert!(!coarse.is_empty() && coarse.len() < fine.len() / 2);
+    Ok(())
+}
+fn player(w: &World) -> Result<motion::Player> {
+    Ok(serde_json::from_value(
+        w.entities
+            .values()
+            .find_map(|e| e.components.get(motion::PLAYER))
+            .unwrap()
+            .clone(),
+    )?)
+}
+#[test]
+fn motion_queries_change_clips_and_drive_skin() -> Result<()> {
+    let mut w = motion::scene();
+    w.validate()?;
+    let framed = Camera::fit(&w)?;
+    let mut displaced = w.clone();
+    let actor = displaced
+        .entities
+        .values_mut()
+        .find(|e| e.skin_binding.is_some())
+        .unwrap();
+    actor.local = Mat4::from_translation(glam::Vec3::X * 100.);
+    assert_eq!(
+        Camera::fit(&displaced)?.target,
+        framed.target,
+        "frame the skinned pose in joint space"
+    );
+    let m = motion::Matcher::default();
+    for (speed, turn, expected) in [(0., 0., "Idle"), (3., 0., "Run"), (1.35, -1., "Turn left")] {
+        motion::set_goal(&mut w, speed, turn)?;
+        for _ in 0..10 {
+            m.update(&w, 1. / 30.)?(&mut w);
+        }
+        let p = player(&w)?;
+        assert_eq!(p.clip, expected);
+        assert!(p.cost.is_finite());
+    }
+    let initial = player(&w)?;
+    let before = w.entities[&initial.bones[1]].local;
+    m.update(&w, 0.)?(&mut w);
+    assert_eq!(before, w.entities[&initial.bones[1]].local);
+    m.update(&w, 1. / 30.)?(&mut w);
+    assert_ne!(before, w.entities[&initial.bones[1]].local);
+    Ok(())
+}
+#[test]
+#[ignore = "requires Vulkan 1.4 and VK_EXT_descriptor_heap"]
+fn experiments_share_gpu_backend_and_match_reference() -> Result<()> {
+    let mut gpu = Backend::open()?;
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+    let w = Arc::new(clusters::terrain()?);
+    let mut camera = Camera::fit(&w)?;
+    camera.pitch = 0.5;
+    let mut view = Snapshot {
+        materials: Default::default(),
+        world: w,
+        camera,
+        extent: [256, 160],
+    };
+    let reference = Forward {
+        selection: Arc::new(clusters::ClusterLod::default()),
+    };
+    let draw =
+        |g: &mut Backend, t: &dyn Technique, v: &Snapshot| g.execute(t.build(v)?.compile()?, &pool);
+    let cpu = draw(&mut gpu, &reference, &view)?;
+    let compact = draw(&mut gpu, &clusters::ClusterLod::default(), &view)?;
+    let mismatches = cpu
+        .pixels
+        .chunks_exact(4)
+        .zip(compact.pixels.chunks_exact(4))
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(
+        mismatches < 30,
+        "indirect and direct images differ at {mismatches} pixels"
+    );
+    assert!(compact.passes.iter().any(|p| {
+        p.parents
+            .iter()
+            .any(|&row| compact.passes[row].name.starts_with("Main Hi-Z"))
+    }));
+    view.world = Arc::new(motion::scene());
+    view.camera = Camera::fit(&view.world)?;
+    let bind = draw(&mut gpu, &Forward::default(), &view)?;
+    let mut schedule = Schedule::default();
+    schedule.stage(vec![Arc::new(motion::Matcher::default())]);
+    for _ in 0..10 {
+        schedule.tick(&mut view.world, 1. / 30., &pool)?;
+    }
+    let posed = draw(&mut gpu, &Forward::default(), &view)?;
+    assert_ne!(bind.pixels, posed.pixels);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Vulkan mesh shader"]
+fn different_assets_share_one_frontier_and_cluster_list() -> Result<()> {
+    let mut world = clusters::terrain()?;
+    let marker = world.spawn(Entity {
+        mesh: Some(Arc::new(Mesh {
+            positions: vec![[-0.2, 0., -0.2], [0.2, 0., -0.2], [0., 0., 0.2]],
+            indices: vec![0, 2, 1],
+            normals: vec![],
+            uv: vec![],
+            joints: vec![],
+            weights: vec![],
+        })),
+        ..Default::default()
+    });
+    let paint = world.spawn(Entity {
+        material: Some(Material {
+            shading: Shading::Toon,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    for i in 0..70 {
+        world.spawn(Entity {
+            local: Mat4::from_translation(glam::Vec3::new(
+                (i % 10) as f32 * 0.6 - 2.7,
+                1.3,
+                (i / 10) as f32 * 0.6 - 1.8,
+            )),
+            instance: Some(Instance::new(marker, Some(paint))),
+            ..Default::default()
+        });
+    }
+    clusters::prepare(&mut world)?;
+    let view = Snapshot {
+        materials: Default::default(),
+        world: Arc::new(world),
+        camera: Camera {
+            pitch: 1.1,
+            distance: 13.,
+            ..Default::default()
+        },
+        extent: [320, 240],
+    };
+    let technique = clusters::ClusterLod::default();
+    let graph = technique.build(&view)?;
+    for name in ["Global BVH node list", "Global cluster candidates"] {
+        assert_eq!(graph.resources.iter().filter(|(n, _)| n == name).count(), 1);
+    }
+    for name in [
+        "GPU instance frustum",
+        "GPU BVH level 0",
+        "GPU cluster cull",
+    ] {
+        assert_eq!(graph.passes.iter().filter(|p| p.name == name).count(), 1);
+    }
+    let mut gpu = Backend::open()?;
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build()?;
+    let frame = gpu.execute(graph.compile()?, &pool)?;
+    assert_eq!(frame.counters["Frustum instances"], 71);
+    assert!(frame.counters["Peak BVH frontier"] >= 71);
+    assert!(frame.counters["PBR pixels"] > 0 && frame.counters["Toon pixels"] > 0);
+    let reference = Forward {
+        selection: Arc::new(technique),
+    };
+    let cpu = gpu.execute(reference.build(&view)?.compile()?, &pool)?;
+    let mismatches = cpu
+        .pixels
+        .chunks_exact(4)
+        .zip(frame.pixels.chunks_exact(4))
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(
+        mismatches < 30,
+        "mixed-asset visibility mismatch at {mismatches} pixels"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Vulkan mesh shader"]
+fn occlusion_history_recovers_after_camera_move() -> Result<()> {
+    use glam::Vec3;
+    let mut world = clusters::terrain()?;
+    let wall = world.spawn(Entity {
+        mesh: Some(Arc::new(Mesh {
+            positions: vec![
+                [-10., 3., -10.],
+                [10., 3., -10.],
+                [10., 3., 10.],
+                [-10., 3., 10.],
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            normals: vec![],
+            uv: vec![],
+            joints: vec![],
+            weights: vec![],
+        })),
+        ..Default::default()
+    });
+    let paint = world.spawn(Entity {
+        material: Some(Material {
+            shading: Shading::Toon,
+            base_color: [1., 0.25, 0.05, 1.],
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    world.spawn(Entity {
+        instance: Some(Instance::new(wall, Some(paint))),
+        ..Default::default()
+    });
+    let settings = world
+        .entities
+        .values_mut()
+        .find(|e| e.components.contains_key(clusters::SETTING))
+        .unwrap();
+    settings
+        .components
+        .insert(clusters::SETTING.into(), 0.into());
+    let mut s = Snapshot {
+        materials: Default::default(),
+        world: Arc::new(world),
+        camera: Camera {
+            distance: 12.,
+            pitch: 1.52,
+            yaw: 0.,
+            target: Vec3::ZERO,
+        },
+        extent: [257, 159],
+    };
+    let mut gpu = Backend::open()?;
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build()?;
+    let clusters = clusters::ClusterLod::default();
+    let mut draw =
+        |tech: &dyn Technique, s: &Snapshot| gpu.execute(tech.build(s)?.compile()?, &pool);
+    let cold = draw(&clusters, &s)?;
+    assert_eq!(cold.counters["Deferred clusters"], 0);
+    let covered = draw(&clusters, &s)?;
+    assert!(covered.counters["Deferred clusters"] > 0);
+    assert_eq!(covered.counters["Recovered clusters"], 0);
+    assert_eq!(covered.counters["PBR pixels"], 0);
+    assert!(covered.counters["Toon pixels"] > 0);
+    s.camera.pitch = -1.48;
+    let restored = draw(&clusters, &s)?;
+    assert!(restored.counters["Recovered clusters"] > 0);
+    assert!(restored.counters["L0"] > 0);
+    let reference = draw(&Forward::default(), &s)?;
+    let different = reference
+        .pixels
+        .chunks_exact(4)
+        .zip(restored.pixels.chunks_exact(4))
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(
+        different < 30,
+        "visibility mismatch at {different} pixels after disocclusion"
+    );
+    let e = Arc::make_mut(&mut s.world)
+        .entities
+        .values_mut()
+        .find(|e| e.components.contains_key(clusters::SETTING))
+        .unwrap();
+    e.components.insert(clusters::VISUALIZE.into(), true.into());
+    let debug = draw(&clusters, &s)?;
+    assert_ne!(restored.pixels, debug.pixels);
+    assert_eq!(
+        restored.counters["Toon pixels"],
+        debug.counters["Toon pixels"]
+    );
+    for (normal, visual) in restored
+        .pixels
+        .chunks_exact(4)
+        .zip(debug.pixels.chunks_exact(4))
+    {
+        if normal[2] > normal[1] && normal[1] > normal[0] {
+            assert_eq!(normal, visual, "ordinary material was recolored");
+        }
+    }
+    s.extent = [251, 157];
+    assert_eq!(draw(&clusters, &s)?.counters["Deferred clusters"], 0);
+    s.camera.target += Vec3::X * 1000.;
+    let empty = draw(&clusters, &s)?;
+    assert_eq!(empty.counters["Frustum instances"], 0);
+    assert_eq!(empty.counters["BVH visits"], 0);
+    assert_eq!(empty.counters["Cluster tests"], 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires local dragon glTF and Vulkan mesh shader"]
+fn dragon_farm_shares_geometry_and_displays_different_lod_cuts() -> Result<()> {
+    let world = clusters::scene()?;
+    let geometries = world
+        .entities
+        .values()
+        .filter(|e| e.hierarchy.is_some())
+        .count();
+    assert_eq!(geometries, 1);
+    let instances = world
+        .entities
+        .values()
+        .filter_map(|e| e.instance.as_ref())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        instances
+            .iter()
+            .filter(|i| world.entities[&i.mesh].meshlets.is_some())
+            .count(),
+        36
+    );
+    assert_eq!(
+        instances
+            .iter()
+            .filter(|i| world.entities[&i.mesh].meshlets.is_none())
+            .count(),
+        1
+    );
+    let camera = Camera {
+        distance: 195.,
+        pitch: 0.48,
+        target: glam::Vec3::Y * 8.,
+        ..Default::default()
+    };
+    let mut s = Snapshot {
+        materials: Default::default(),
+        world: Arc::new(world),
+        extent: [403, 259],
+        camera,
+    };
+    let technique = clusters::ClusterLod::default();
+    let mut gpu = Backend::open()?;
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build()?;
+    let mut draw = |s: &mut Snapshot, error: f32| {
+        let e = Arc::make_mut(&mut s.world)
+            .entities
+            .values_mut()
+            .find(|e| e.components.contains_key(clusters::SETTING))
+            .unwrap();
+        e.components.insert(clusters::SETTING.into(), error.into());
+        e.components.insert(clusters::VISUALIZE.into(), true.into());
+        gpu.execute(technique.build(s)?.compile()?, &pool)
+    };
+    let fine = draw(&mut s, 0.2)?;
+    let coarse = draw(&mut s, 1.5)?;
+    for frame in [&fine, &coarse] {
+        assert!(frame.counters["Cluster tests"] < frame.counters["Potential clusters"]);
+        assert!(frame.counters["Toon pixels"] > 0 && frame.counters["PBR pixels"] > 0);
+    }
+    let tris = |frame: &render_lab::rhi::Frame| {
+        frame
+            .counters
+            .iter()
+            .filter(|(k, _)| k.starts_with('L'))
+            .map(|(_, n)| n)
+            .sum::<u64>()
+    };
+    assert!(tris(&fine) > tris(&coarse));
+    assert_ne!(fine.pixels, coarse.pixels);
+    Ok(())
+}

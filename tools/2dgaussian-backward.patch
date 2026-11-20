@@ -1,0 +1,56 @@
+--- a/submodules/picturegs/cuda_rasterizer/backward.cu
++++ b/submodules/picturegs/cuda_rasterizer/backward.cu
+@@ -81,10 +81,6 @@
+ 	float last_color[C] = { 0 };
+ 
+ 
+-	// Gradient of pixel coordinate w.r.t. normalized 
+-	// screen-space viewport corrdinates (-1 to 1)
+-	const float ddelx_dx = 0.5 * W;
+-	const float ddely_dy = 0.5 * H;
+ 
+ 	// Traverse all Gaussians
+ 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+@@ -123,7 +119,9 @@
+ 				continue;
+ 
+ 			const float G = exp(power);
+-			const float alpha = min(0.99f, con_o.w * G);
++			const float base_alpha = min(0.99f, con_o.w * G);
++			const float sign_scale = negative[collected_id[j]];
++			const float alpha = base_alpha * sign_scale;
+ 			if (alpha < 1.0f / 255.0f)
+ 				continue;
+ 
+@@ -156,23 +154,26 @@
+ 
+ 
+ 			// Helpful reusable temporary variables
+-			const float dL_dG = con_o.w * dL_dalpha;
++			atomicAdd(&dL_dnegative[global_id], base_alpha * dL_dalpha);
++			if (con_o.w * G >= 0.99f)
++				continue;
++			const float dL_dG = con_o.w * sign_scale * dL_dalpha;
+ 			const float gdx = G * d.x;
+ 			const float gdy = G * d.y;
+ 			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+ 			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+ 
+ 			// Update gradients w.r.t. 2D mean position of the Gaussian
+-			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
+-			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
++			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx);
++			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely);
+ 
+ 			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
+ 			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
+-			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
++			atomicAdd(&dL_dconic2D[global_id].y, -gdx * d.y * dL_dG);
+ 			atomicAdd(&dL_dconic2D[global_id].z, -0.5f * gdy * d.y * dL_dG);
+ 
+ 			// Update gradients w.r.t. opacity of the Gaussian
+-			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
++			atomicAdd(&(dL_dopacity[global_id]), G * sign_scale * dL_dalpha);
+ 		}
+ 	}
+ }

@@ -1,0 +1,26 @@
+#version 460
+#include "cluster_scene.glsl"
+layout(local_size_x=64) in;
+layout(set=0, binding=2, std430) readonly buffer Camera { View view; };
+layout(set=0, binding=3, std430) readonly buffer Candidates { uvec4 head; uvec2 jobs[]; };
+layout(set=0, binding=4, std430) buffer Selected { uvec4 selectedHead; uvec2 selected[]; };
+layout(set=0, binding=5, std430) buffer Dispatch { uvec4 args; };
+layout(set=0, binding=6, std430) buffer Stats { uint counters[]; };
+
+void main() {
+    uint index = workIndex();
+    if (index >= head.x) return;
+    if (index == 0u) counters[2] = head.x;
+    uvec2 job = jobs[index];
+    Instance obj = instances[job.x];
+    Asset asset = assets[obj.routing.z];
+    Cluster cluster = asset.clusters.data[job.y];
+    if (outsideFrustum(view.vp * obj.model, cluster.sphere)) return;
+    if (cluster.meta.y != NONE) {
+        Group finer = asset.groups.data[cluster.meta.y];
+        if (refine(finer.error, finer.sphere, obj, view)) return;
+    }
+    uint slot = atomicAdd(selectedHead.x, 1u);
+    selected[slot] = job;
+    PUBLISH_WORK(args, slot, 1u, 64u);
+}

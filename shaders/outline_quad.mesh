@@ -1,0 +1,41 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=32) in;
+layout(triangles, max_vertices=128, max_primitives=64) out;
+#include "outline.glsl"
+layout(set=0, binding=3, std430) readonly buffer Edges { uvec4 edges[]; };
+layout(set=0, binding=4, std430) readonly buffer Incidence { uint faceIds[]; };
+layout(push_constant) uniform Params { layout(offset=20) uint count; } p;
+void main() {
+    uint first = 32u * groupIndex(), n = min(p.count - min(first, p.count), 32u);
+    SetMeshOutputsEXT(4u * n, 2u * n);
+    uint lane = gl_LocalInvocationID.x;
+    if (lane >= n) return;
+    uvec4 edge = edges[first + lane];
+    vec4 a = vp * vec4(position(edge.x), 1), b = vp * vec4(position(edge.y), 1);
+    bool hasFront = false, hasBack = false;
+    vec3 inside = vec3(0);
+    for (uint i = 0; i < edge.w; ++i) {
+        uvec3 tri = faces[faceIds[edge.z + i]].xyz;
+        vec3 v0 = position(tri.x), v1 = position(tri.y), v2 = position(tri.z);
+        bool facing = front(v0,v1,v2);
+        if (facing || i == 0u) inside = (v0 + v1 + v2) / 3.0;
+        hasFront = hasFront || facing;
+        hasBack = hasBack || !facing;
+    }
+    vec4 c = vp * vec4(inside, 1);
+    vec2 outward = vec2(0);
+    if ((edge.w == 1u || (hasFront && hasBack)) && min(min(a.w,b.w),c.w) > 1e-6) {
+        vec2 ab = (b.xy / b.w - a.xy / a.w) * screen;
+        outward = unitOrZero(vec2(-ab.y, ab.x));
+        if (dot(outward, (c.xy / c.w - a.xy / a.w) * screen) > 0.0) outward = -outward;
+    }
+    uint v = 4u * lane, t = 2u * lane;
+    gl_MeshVerticesEXT[v].gl_Position = expandPixel(a, vec2(0));
+    gl_MeshVerticesEXT[v+1u].gl_Position = expandPixel(b, vec2(0));
+    gl_MeshVerticesEXT[v+2u].gl_Position = expandPixel(a, outward);
+    gl_MeshVerticesEXT[v+3u].gl_Position = expandPixel(b, outward);
+    gl_PrimitiveTriangleIndicesEXT[t] = v + uvec3(0,1,2);
+    gl_PrimitiveTriangleIndicesEXT[t+1u] = v + uvec3(2,1,3);
+    id[t] = id[t+1u] = uvec2(0,1);
+}

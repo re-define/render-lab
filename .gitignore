@@ -1,0 +1,17 @@
+/target
+__pycache__/
+.ruff_cache/
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+*.log
+*.pdb
+*.dmp
+.render-lab-*
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

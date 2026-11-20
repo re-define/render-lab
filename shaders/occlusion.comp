@@ -1,0 +1,61 @@
+#version 460
+#include "cluster_scene.glsl"
+layout(local_size_x=64) in;
+layout(set=0,binding=2,std430) readonly buffer Candidates{uvec4 header;uvec2 candidates[];};
+layout(set=0,binding=3,std430) readonly buffer Hierarchy{float z[];};
+layout(set=0,binding=4,std430) readonly buffer Camera{View view;};
+layout(set=0,binding=5,std430) buffer Visible{uvec4 visibleHead;uvec2 visible[];};
+layout(set=0,binding=6,std430) buffer Draw{uvec4 drawArgs[];};
+layout(set=0,binding=7,std430) buffer Stats{uint counters[];};
+#ifndef POST
+layout(set=0,binding=8,std430) buffer Deferred{uvec4 deferredHead;uvec2 deferred[];};
+layout(set=0,binding=9,std430) buffer Dispatch{uvec4 postArgs;};
+#endif
+
+bool hidden(vec4 sphere,mat4 model){
+    if(z[view.screen.z+16]!=1.0)return false;
+    mat4 clip;
+    for(uint i=0;i<16;i++)clip[i/4][i%4]=z[view.screen.z+i];
+    clip*=model;
+    vec2 lo=vec2(1),hi=vec2(-1);float nearest=1;
+    for(uint i=0;i<8;i++){
+        vec3 corner=vec3((i&1u)!=0u?1:-1,(i&2u)!=0u?1:-1,(i&4u)!=0u?1:-1);
+        vec4 v=clip*vec4(sphere.xyz+sphere.w*corner,1);
+        if(v.w<=0.00001 || v.z<=0)return false;
+        vec3 ndc=v.xyz/v.w;lo=min(lo,ndc.xy);hi=max(hi,ndc.xy);nearest=min(nearest,ndc.z);
+    }
+    if(any(lessThan(lo,vec2(-1)))||any(greaterThan(hi,vec2(1)))||any(greaterThan(lo,hi)))return false;
+    uvec2 size=view.screen.xy;
+    uvec2 a=min(uvec2(floor((lo*.5+.5)*vec2(size))),size-1);
+    uvec2 b=min(uvec2(ceil((hi*.5+.5)*vec2(size))),size-1);
+    uint offset=0;
+    while(any(greaterThan(b-a,uvec2(1)))){offset+=size.x*size.y;size=(size+1)/2;a/=2;b/=2;}
+    float farthest=0;
+    for(uint y=a.y;y<=b.y;y++)for(uint x=a.x;x<=b.x;x++)farthest=max(farthest,z[offset+y*size.x+x]);
+    return nearest>farthest+0.000002;
+}
+void main(){
+    uint idx=workIndex();if(idx>=header.x)return;
+    uvec2 pair=candidates[idx];
+    Instance obj=instances[pair.x];
+    Cluster c=assets[obj.routing.z].clusters.data[pair.y];
+    if(hidden(c.sphere,obj.model)){
+#ifndef POST
+        uint slot=atomicAdd(deferredHead.x,1);
+        deferred[slot]=pair;
+        PUBLISH_WORK(postArgs, slot, 1u, 64u);
+        atomicAdd(counters[4],1);
+#endif
+        return;
+    }
+    uint slot=atomicAdd(visibleHead.x,1);visible[slot]=pair;
+    uint page=slot/view.screen.w, local=slot%view.screen.w;
+    if(local<ROW_GROUPS) atomicMax(drawArgs[page].x,local+1);
+    if(local>=ROW_GROUPS && local%ROW_GROUPS==0u) atomicMax(drawArgs[page].y,local/ROW_GROUPS+1u);
+#ifdef POST
+    atomicAdd(counters[5],1);
+#else
+    atomicAdd(counters[3],1);
+#endif
+    atomicAdd(counters[6+min(c.meta.z,9u)],c.span.w);
+}

@@ -1,0 +1,187 @@
+{
+  "version": 1,
+  "fps": 30,
+  "model": "nvidia/Kimodo-SOMA-RP-v1.2",
+  "revision": "0e3c89024d896064b6851201373f7834784a386b",
+  "bones": [
+    "Hips_04",
+    "Spine_05",
+    "Chest_06",
+    "Neck_07",
+    "Head_08",
+    "Right shoulder_058",
+    "Right arm_059",
+    "Right elbow_061",
+    "Right wrist_063",
+    "Left shoulder_083",
+    "Left arm_084",
+    "Left elbow_086",
+    "Left wrist_088",
+    "Right leg_0126",
+    "Right knee_0127",
+    "Right ankle_0128",
+    "Right toe_0129",
+    "Left leg_0131",
+    "Left knee_0132",
+    "Left ankle_0133",
+    "Left toe_0134"
+  ],
+  "clips": [
+    {
+      "name": "backward_41",
+      "frames": 120
+    },
+    {
+      "name": "backward_42",
+      "frames": 120
+    },
+    {
+      "name": "backward_43",
+      "frames": 120
+    },
+    {
+      "name": "idle_41",
+      "frames": 120
+    },
+    {
+      "name": "idle_42",
+      "frames": 120
+    },
+    {
+      "name": "idle_43",
+      "frames": 120
+    },
+    {
+      "name": "jog-left_41",
+      "frames": 120
+    },
+    {
+      "name": "jog-left_42",
+      "frames": 120
+    },
+    {
+      "name": "jog-left_43",
+      "frames": 120
+    },
+    {
+      "name": "jog-right_41",
+      "frames": 120
+    },
+    {
+      "name": "jog-right_42",
+      "frames": 120
+    },
+    {
+      "name": "jog-right_43",
+      "frames": 120
+    },
+    {
+      "name": "run_41",
+      "frames": 120
+    },
+    {
+      "name": "run_42",
+      "frames": 120
+    },
+    {
+      "name": "run_43",
+      "frames": 120
+    },
+    {
+      "name": "slow-walk_41",
+      "frames": 120
+    },
+    {
+      "name": "slow-walk_42",
+      "frames": 120
+    },
+    {
+      "name": "slow-walk_43",
+      "frames": 120
+    },
+    {
+      "name": "start_41",
+      "frames": 120
+    },
+    {
+      "name": "start_42",
+      "frames": 120
+    },
+    {
+      "name": "start_43",
+      "frames": 120
+    },
+    {
+      "name": "stop_41",
+      "frames": 120
+    },
+    {
+      "name": "stop_42",
+      "frames": 120
+    },
+    {
+      "name": "stop_43",
+      "frames": 120
+    },
+    {
+      "name": "strafe-left_41",
+      "frames": 120
+    },
+    {
+      "name": "strafe-left_42",
+      "frames": 120
+    },
+    {
+      "name": "strafe-left_43",
+      "frames": 120
+    },
+    {
+      "name": "strafe-right_41",
+      "frames": 120
+    },
+    {
+      "name": "strafe-right_42",
+      "frames": 120
+    },
+    {
+      "name": "strafe-right_43",
+      "frames": 120
+    },
+    {
+      "name": "walk-left_41",
+      "frames": 120
+    },
+    {
+      "name": "walk-left_42",
+      "frames": 120
+    },
+    {
+      "name": "walk-left_43",
+      "frames": 120
+    },
+    {
+      "name": "walk-right_41",
+      "frames": 120
+    },
+    {
+      "name": "walk-right_42",
+      "frames": 120
+    },
+    {
+      "name": "walk-right_43",
+      "frames": 120
+    },
+    {
+      "name": "walk_41",
+      "frames": 120
+    },
+    {
+      "name": "walk_42",
+      "frames": 120
+    },
+    {
+      "name": "walk_43",
+      "frames": 120
+    }
+  ]
+}

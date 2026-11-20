@@ -1,0 +1,12 @@
+#version 460
+layout(local_size_x=1) in;
+layout(set=0,binding=0,std430) buffer Bins{uvec4 bins[];};
+layout(set=0,binding=1,std430) writeonly buffer Args{uvec4 args[];};
+layout(push_constant) uniform Params{layout(offset=8)uint binsCount;}p;
+void main(){
+    uint base=0;
+    for(uint i=0;i<p.binsCount;i++){
+        uint n=bins[i].x;bins[i].y=base;base+=n;
+        uint groups=(n+63u)/64u;args[i]=uvec4(min(groups,32768u),(groups+32767u)/32768u,1,0);
+    }
+}

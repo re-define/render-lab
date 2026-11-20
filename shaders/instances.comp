@@ -1,0 +1,21 @@
+#version 460
+#include "cluster_scene.glsl"
+layout(local_size_x=64) in;
+layout(set=0, binding=2, std430) readonly buffer Camera { View view; };
+layout(set=0, binding=3, std430) writeonly buffer NodesOut { uvec2 roots[]; };
+layout(set=0, binding=4, std430) buffer Dispatch { uvec4 args; };
+layout(set=0, binding=5, std430) buffer Stats { uint counters[]; };
+layout(set=0, binding=6, std430) buffer Frontiers { uint counts[]; };
+layout(push_constant) uniform Params { layout(offset=28) uint count; } p;
+
+void main() {
+    uint id = workIndex();
+    if (id >= p.count) return;
+    Instance obj = instances[id];
+    vec4 bounds = assets[obj.routing.z].tree.data[0].geometry;
+    if (outsideFrustum(view.vp * obj.model, bounds)) return;
+    uint slot = atomicAdd(counts[0], 1u);
+    roots[slot] = uvec2(id, 0);
+    atomicAdd(counters[0], 1u);
+    PUBLISH_WORK(args, slot, 1u, NODES_PER_GROUP);
+}

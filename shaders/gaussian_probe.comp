@@ -1,0 +1,13 @@
+#version 460
+// Test the production sampler at every texel center, before PBR shading.
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0,std430) readonly buffer Atlas {uint texels[];};
+layout(set=0,binding=1,std430) writeonly buffer Output {uint pixels[];};
+#include "materials/gaussian.glsl"
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    uvec2 extent = uvec2(texels[1], texels[2]);
+    if (any(greaterThanEqual(pixel, extent))) return;
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(extent);
+    pixels[pixel.y*extent.x + pixel.x] = packUnorm4x8(vec4(gaussianColor(0u, uv), 1.));
+}

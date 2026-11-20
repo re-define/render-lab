@@ -1,0 +1,20 @@
+#version 460
+#include "cluster.glsl"
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0,std430) buffer Hierarchy{float z[];};
+layout(set=0,binding=1,std430) readonly buffer Camera{View view;};
+layout(push_constant) uniform Params{layout(offset=8) uvec2 srcSize;uint src;uint dst;}p;
+void main(){
+    uvec2 dstSize=(p.srcSize+1)/2,xy=gl_GlobalInvocationID.xy;
+    if(any(greaterThanEqual(xy,dstSize)))return;
+    float farthest=0;
+    for(uint y=0;y<2;y++)for(uint x=0;x<2;x++){
+        uvec2 src=min(xy*2+uvec2(x,y),p.srcSize-1);
+        farthest=max(farthest,z[p.src+src.y*p.srcSize.x+src.x]);
+    }
+    z[p.dst+xy.y*dstSize.x+xy.x]=farthest;
+    if(all(equal(dstSize,uvec2(1)))){
+        for(uint i=0;i<16;i++)z[view.screen.z+i]=view.vp[i/4][i%4];
+        z[view.screen.z+16]=1.0;
+    }
+}

@@ -1,0 +1,24 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#include "cluster_scene.glsl"
+layout(local_size_x=32) in;
+layout(triangles,max_vertices=64,max_primitives=64) out;
+layout(set=0,binding=2,std430) readonly buffer Camera{View view;};
+layout(set=0,binding=3,std430) readonly buffer Visible{uvec4 head;uvec2 visible[];};
+layout(push_constant) uniform Params { layout(offset=16) uint base; } p;
+layout(location=0) perprimitiveEXT flat out uvec2 id[];
+void main(){
+    uint slot=p.base+gl_WorkGroupID.x+gl_WorkGroupID.y*ROW_GROUPS;
+    bool valid=slot<head.x; uvec2 pair=uvec2(0);uvec4 span=uvec4(0);
+    if(valid){pair=visible[slot];span=assets[instances[pair.x].routing.z].clusters.data[pair.y].span;}
+    SetMeshOutputsEXT(span.y,span.w);
+    if(!valid)return;
+    Instance obj=instances[pair.x]; Asset asset=assets[obj.routing.z]; mat4 clip=view.vp*obj.model;
+    for(uint i=gl_LocalInvocationID.x;i<span.y;i+=32){
+        gl_MeshVerticesEXT[i].gl_Position=clip*vec4(asset.vertices.data[2*asset.indices.data[span.x+i]].xyz,1);
+    }
+    for(uint t=gl_LocalInvocationID.x;t<span.w;t+=32){
+        gl_PrimitiveTriangleIndicesEXT[t]=(uvec3(asset.indices.data[span.z+t])>>uvec3(0,8,16))&255u;
+        id[t]=uvec2(obj.routing.y+1,(pair.y<<6)|t);
+    }
+}

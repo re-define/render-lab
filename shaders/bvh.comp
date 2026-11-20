@@ -1,0 +1,55 @@
+#version 460
+#include "cluster_scene.glsl"
+layout(local_size_x=64) in;
+layout(set=0, binding=2, std430) readonly buffer Camera { View view; };
+layout(set=0, binding=3, std430) buffer Frontier { uvec2 nodes[]; };
+layout(set=0, binding=4, std430) buffer Leaves { uvec4 clusterHead; uvec2 clusters[]; };
+layout(set=0, binding=5, std430) buffer ClusterDispatch { uvec4 clusterArgs; };
+layout(set=0, binding=6, std430) buffer Stats { uint counters[]; };
+layout(set=0, binding=7, std430) buffer Frontiers { uint counts[]; };
+#ifndef LAST_LEVEL
+layout(set=0, binding=8, std430) buffer ChildDispatch { uvec4 childArgs; };
+#define PARAM_OFFSET 36
+#else
+#define PARAM_OFFSET 32
+#endif
+layout(push_constant) uniform Params {
+    layout(offset=PARAM_OFFSET) uint level;
+    uint inputBase;
+    uint outputBase;
+} p;
+
+void main() {
+    uint index = linearGroup() * NODES_PER_GROUP + gl_LocalInvocationID.x / NODE_FANOUT;
+    uint lane = gl_LocalInvocationID.x % NODE_FANOUT;
+    uint count = counts[p.level];
+    if (index >= count) return;
+    uvec2 job = nodes[p.inputBase + index];
+    Instance obj = instances[job.x];
+    Nodes tree = assets[obj.routing.z].tree;
+    Node parent = tree.data[job.y];
+    if (lane == 0u) {
+        atomicAdd(counters[1], max(parent.children, 1u));
+        if (index == 0u) atomicMax(counters[17], count);
+    }
+    // A one-group asset has a leaf at its root and uses just the first lane.
+    if (lane >= max(parent.children, 1u)) return;
+    uint child = parent.children == 0u ? job.y : parent.first + lane;
+    Node node = tree.data[child];
+    if (outsideFrustum(view.vp * obj.model, node.geometry)
+        || !refine(node.error, node.projection, obj, view)) return;
+
+#ifndef LAST_LEVEL
+    if (node.children != 0u) {
+        uint slot = atomicAdd(counts[p.level + 1u], 1u);
+        nodes[p.outputBase + slot] = uvec2(job.x, child);
+        PUBLISH_WORK(childArgs, slot, 1u, NODES_PER_GROUP);
+        return;
+    }
+#endif
+    Group group = assets[obj.routing.z].groups.data[node.group];
+    uint first = atomicAdd(clusterHead.x, group.clusterCount);
+    for (uint i = 0; i < group.clusterCount; ++i)
+        clusters[first + i] = uvec2(job.x, group.firstCluster + i);
+    PUBLISH_WORK(clusterArgs, first, group.clusterCount, 64u);
+}

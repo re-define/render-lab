@@ -1,0 +1,25 @@
+#version 460
+#include "cluster.glsl"
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0,std430) readonly buffer Visibility{uvec2 ids[];};
+struct Item {Instance obj;uvec4 refs;};
+layout(set=0,binding=1,std430) readonly buffer Objects{Item items[];};
+layout(set=0,binding=2,std430) buffer Bins{uvec4 bins[];}; // count, base, scatter cursor, reserved
+layout(set=0,binding=3,std430) writeonly buffer Output{uint data[];};
+layout(push_constant) uniform Params{layout(offset=16)uvec2 size;uint background;}p;
+void main(){
+    uvec2 xy=gl_GlobalInvocationID.xy;if(any(greaterThanEqual(xy,p.size)))return;
+    uint i=xy.y*p.size.x+xy.x,object=ids[i].x;
+    if(object==0){
+#ifndef SCATTER
+        data[i]=ids[i].y==1u ? 0xff33283bu : p.background;
+#endif
+        return;
+    }
+    uint bin=items[object-1].obj.routing.x;
+#ifdef SCATTER
+    uint slot=atomicAdd(bins[bin].z,1);data[bins[bin].y+slot]=i;
+#else
+    atomicAdd(bins[bin].x,1);
+#endif
+}

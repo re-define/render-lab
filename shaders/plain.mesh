@@ -1,0 +1,21 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x=32) in;
+layout(triangles,max_vertices=96,max_primitives=32) out;
+layout(set=0,binding=0,std430) readonly buffer Vertices {vec4 data[];};
+layout(set=0,binding=1,std430) readonly buffer Faces {uvec4 faces[];};
+layout(push_constant) uniform Params {layout(offset=16) mat4 vp;uint object;uint triangles;} p;
+layout(location=0) perprimitiveEXT flat out uvec2 id[];
+void main(){
+    uint group=gl_WorkGroupID.x+gl_WorkGroupID.y*32768u;
+    uint first=group*32, count=min(p.triangles-min(first,p.triangles),32u);
+    SetMeshOutputsEXT(3*count,count);
+    uint lane=gl_LocalInvocationID.x;
+    if(lane>=count)return;
+    uint tri=first+lane;
+    for(uint j=0;j<3;j++){
+        gl_MeshVerticesEXT[3*lane+j].gl_Position=p.vp*vec4(data[2*faces[tri][j]].xyz,1);
+    }
+    gl_PrimitiveTriangleIndicesEXT[lane]=uvec3(3*lane)+uvec3(0,1,2);
+    id[lane]=uvec2(p.object+1,tri);
+}
