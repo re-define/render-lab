@@ -80,7 +80,7 @@ pub(super) struct Surface {
     chain: vk::SwapchainKHR,
     images: Vec<vk::Image>,
     finished: Vec<vk::Semaphore>,
-    available: vk::Semaphore,
+    available: [vk::Semaphore; 2],
     extent: [u32; 2],
     pub mode: vk::PresentModeKHR,
     dirty: bool,
@@ -103,7 +103,7 @@ impl Surface {
                 chain: vk::SwapchainKHR::null(),
                 images: vec![],
                 finished: vec![],
-                available: vk::Semaphore::null(),
+                available: [vk::Semaphore::null(); 2],
                 extent: [0; 2],
                 mode: vk::PresentModeKHR::FIFO,
                 dirty: true,
@@ -113,9 +113,11 @@ impl Surface {
                     .get_physical_device_surface_support_khr(g.physical, g.family, surface)?,
                 "queue family cannot present to viewport"
             );
-            s.available = g
-                .dev
-                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+            for semaphore in &mut s.available {
+                *semaphore = g
+                    .dev
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+            }
             Ok(s)
         }
     }
@@ -208,7 +210,7 @@ impl Surface {
             Ok(true)
         }
     }
-    pub fn acquire(&mut self, extent: [u32; 2]) -> Result<Option<Acquired>> {
+    pub fn acquire(&mut self, extent: [u32; 2], slot: usize) -> Result<Option<Acquired>> {
         unsafe {
             if (self.dirty || self.extent != extent) && !self.recreate(extent)? {
                 return Ok(None);
@@ -216,7 +218,7 @@ impl Surface {
             match self.gpu.dev.acquire_next_image_khr(
                 self.chain,
                 u64::MAX,
-                self.available,
+                self.available[slot],
                 vk::Fence::null(),
             ) {
                 Ok((index, status)) => {
@@ -224,7 +226,7 @@ impl Surface {
                     Ok(Some(Acquired {
                         image: self.images[index as usize],
                         index,
-                        available: self.available,
+                        available: self.available[slot],
                         finished: self.finished[index as usize],
                     }))
                 }
@@ -262,7 +264,9 @@ impl Drop for Surface {
             for s in self.finished.drain(..) {
                 g.dev.destroy_semaphore(s, None);
             }
-            g.dev.destroy_semaphore(self.available, None);
+            for semaphore in self.available {
+                g.dev.destroy_semaphore(semaphore, None);
+            }
             g.dev.destroy_swapchain_khr(self.chain, None);
             g.instance().destroy_surface_khr(self.surface, None);
         }

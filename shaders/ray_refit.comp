@@ -1,0 +1,33 @@
+#version 460
+#include "lighting_scene.glsl"
+layout(local_size_x=64) in;
+layout(binding=0,std430) readonly buffer Geometry {Triangle triangles[];};
+layout(binding=1,std430) buffer Bounds {RayNode nodes[];};
+layout(push_constant) uniform Params {layout(offset=8) uint depth;uint height;uint count;} p;
+// In preorder each right turn skips the complete left subtree. Internal nodes store
+// their escape index so shadow traversal needs neither an explicit stack nor atomics.
+void main(){
+    uint index=gl_GlobalInvocationID.x+gl_WorkGroupID.y*32768u*64u;
+    if(index>=(1u<<p.depth))return;
+    uint subtree=(2u<<(p.height-p.depth))-1u;
+    uint at=p.depth+(index<<(p.height-p.depth+1u))-bitCount(index);
+    RayNode node;
+    node.low=vec3(1e30);node.high=vec3(-1e30);
+    if(p.depth==p.height){
+        uint start=index*8u;
+        node.first=start;
+        node.count=min(8u,p.count-min(start,p.count));
+        for(uint i=0;i<node.count;++i)
+            for(uint j=0;j<3;++j){
+                vec3 v=triangles[start+i].point[j].xyz;
+                node.low=min(node.low,v);node.high=max(node.high,v);
+            }
+        node.low-=vec3(.00005);node.high+=vec3(.00005);
+        if(node.count==0u)node.first=at+1u;
+    }else{
+        RayNode a=nodes[at+1u],b=nodes[at+1u+subtree/2u];
+        node.low=min(a.low,b.low); node.high=max(a.high,b.high);
+        node.first=at+subtree;node.count=0u;
+    }
+    nodes[at]=node;
+}

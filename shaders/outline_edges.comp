@@ -1,0 +1,29 @@
+#version 460
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std430) readonly buffer Vertices { vec4 vertices[]; };
+layout(set=0,binding=1,std430) readonly buffer Records { uvec4 records[]; };
+layout(set=0,binding=2,std430) readonly buffer View { mat4 model; vec4 eye; };
+layout(set=0,binding=3,std430) writeonly buffer Faces { uvec4 faces[]; };
+layout(push_constant) uniform Params { layout(offset=16) uint count; } p;
+vec3 position(uint i) { return (model*vec4(vertices[2u*i].xyz,1)).xyz; }
+vec3 faceNormal(uvec3 tri, out bool facing) {
+    vec3 a=position(tri.x), b=position(tri.y), c=position(tri.z);
+    vec3 n=cross(b-a,c-a);
+    float square=dot(n,n);
+    facing=dot(n,eye.xyz-a)>=0.0;
+    return square>0.0 ? n*inversesqrt(square) : vec3(0);
+}
+void main() {
+    uint i=(gl_WorkGroupID.x+32768u*gl_WorkGroupID.y)*64u+gl_LocalInvocationID.x;
+    if(i>=p.count) return;
+    uvec4 face=records[2u*i], neighbors=records[2u*i+1u];
+    if(neighbors.y>0u){
+        bool a; vec3 n=faceNormal(face.xyz,a);
+        for(uint j=0u;j<neighbors.y;++j){
+            uvec4 neighbor=records[neighbors.x+j];
+            bool b; vec3 m=faceNormal(neighbor.xyz,b);
+            if(a!=b || dot(n,m)<=0.75) face.w|=neighbor.w;
+        }
+    }
+    faces[i]=face;
+}

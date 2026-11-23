@@ -2,4 +2,25 @@
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_buffer_reference_uvec2 : require
 #include "materials/pbr.glsl"
+#ifdef SCENE_LIGHTING
+#define SCENE_LIGHT_BINDING 8
+#include "scene_lights.glsl"
+#define LIGHTING_MATERIAL
+#define RESOLVE_BINDING_BYTES 36
+#endif
 #include "resolve.glsl"
+#ifdef SCENE_LIGHTING
+vec3 shadeLighting(uint pixel,vec3 albedo,vec3 position,vec3 N,vec3 V,Instance obj) {
+    vec3 result = albedo * 0.14;
+    for (uint i=0u; i<lightHeader.x; ++i) {
+        vec3 L;
+        float distanceToLight;
+        vec3 energy=lightAt(lights[i],position,L,distanceToLight);
+        result+=albedo*(1.-obj.params.x)*skyEnergy(lights[i])*(0.48+0.52*max(N.y,0.));
+        if (dot(N,L)>0.0 && any(greaterThan(energy,vec3(0.0)))) {
+            result += energy * pbrDirect(albedo,N,V,L,obj.params.xy);
+        }
+    }
+    return result;
+}
+#endif

@@ -8,6 +8,9 @@
 | Modern Hall | `scenes/modern-hall/modern_hall_core.gltf` | NewSee2l035，Benedikt Bitterli Rendering Resources 场景转换为 glTF，CC BY 3.0。原文见场景目录内的 `LICENSE.txt` |
 | Cornell Box | `scenes/cornell-box/cornell_box_core.gltf` | Benedikt Bitterli，转换为 glTF，CC0。原文见场景目录内的 `LICENSE.txt` |
 | Silver Wolf | `characters/silver-wolf/scene.gltf` | X9_YT，CC BY 4.0。模型署名与原文见人物目录内的 `license.txt` |
+| Studio Small 02 | `environments/studio_small_02_1k.hdr` | Greg Zaal，Poly Haven，CC0。IBL 实验从线性 HDR 图生成环境光照表。[原始资产](https://polyhaven.com/a/studio_small_02) |
+| Rock Face 03 | `environments/rock_face_03_diff_1k.jpg` | Dario Barresi 摄影，Rico Cilliers 处理，Poly Haven，CC0。山谷岩壁使用扫描反照率。[原始资产](https://polyhaven.com/a/rock_face_03) |
+| Rocky Terrain | `environments/rocky_terrain_diff_1k.jpg` | Amal Kumar，Poly Haven，CC0。林间裸地使用扫描反照率。[原始资产](https://polyhaven.com/a/rocky_terrain) |
 
 Dragon 和室内场景取自同一份 glTF Research Scenes 本地转换结果。随附 core glTF 及其引用的 buffer、纹理和许可文本。[Rendering Resources](https://benedikt-bitterli.me/resources/) · [Dragon 原作](https://blendswap.com/blend/15891) · [Modern Hall 原作](https://blendswap.com/blend/6304)
 

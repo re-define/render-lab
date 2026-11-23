@@ -1,0 +1,29 @@
+#version 460
+#include "restir_types.glsl"
+#include "gi12_types.glsl"
+layout(binding=0,std430) buffer World { Cell cells[]; };
+layout(binding=1,std430) buffer Batch { Samples batches[]; };
+layout(binding=2,std430) readonly buffer Clock { uvec4 frame; };
+#ifndef CLEAR_BATCH
+layout(binding=3,std430) readonly buffer Traced { Path paths[]; };
+#endif
+layout(local_size_x=64) in;
+void main(){
+    uint i=gl_GlobalInvocationID.x;
+    if(i>=cells.length()) return;
+#ifdef CLEAR_BATCH
+    batches[i]=Samples(uvec4(0),uvec4(0),uvec4(INVALID));
+    if(frame.x-cells[i].tag.y>32u) cells[i]=Cell(uvec4(0),vec4(0),vec4(0),vec4(0),emptyReservoir(),emptyReservoir(),uvec4(0));
+#else
+    Samples s=batches[i];
+    if(s.first.w>0u) cells[i].firstDirect=accumulate(cells[i].firstDirect,decodeLight(s.first.rgb),float(min(s.first.w,SAMPLE_CAP)),12.);
+    if(s.second.w>0u) cells[i].secondDirect=accumulate(cells[i].secondDirect,decodeLight(s.second.rgb),float(min(s.second.w,SAMPLE_CAP)),12.);
+    if(s.representative.x!=INVALID) cells[i].firstLamp=paths[s.representative.x].firstLamp;
+    if(s.representative.y!=INVALID) cells[i].secondLamp=paths[s.representative.y].secondLamp;
+    uvec4 p=cells[i].pending;
+    if(p.w>0u) {
+        cells[i].indirect=accumulate(cells[i].indirect,decodeLight(p.rgb),float(min(p.w,SAMPLE_CAP)),16.);
+        cells[i].pending=uvec4(0);
+    }
+#endif
+}

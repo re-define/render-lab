@@ -1,0 +1,19 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#define LIGHTING_MATERIAL
+#define RESOLVE_BINDING_BYTES 40
+#include "resolve.glsl"
+#define IBL_TABLES 8
+#define IBL_CONFIG 9
+#include "ibl.glsl"
+#include "ibl_brdf.glsl"
+
+vec3 shadeLighting(uint pixel, vec3 albedo, vec3 position, vec3 n, vec3 v, Instance obj) {
+    vec3 radiance=environmentLighting(albedo,n,v,obj.params.xy);
+#ifdef HDR_OUTPUT
+    return radiance*controls.x;
+#else
+    return iblToneMap(radiance);
+#endif
+}

@@ -1,0 +1,71 @@
+#version 460
+#include "cluster.glsl"
+#include "scene_slots.glsl"
+layout(local_size_x=64) in;
+
+struct Asset { uvec4 refs; uvec4 flags; };
+struct Item { Instance obj; uvec4 refs; };
+struct Previous { mat4 transform; uvec4 info; };
+layout(set=0,binding=0,std430) readonly buffer Layout { uvec4 slots[]; };
+layout(set=0,binding=1,std430) readonly buffer Transforms { SceneModel current[]; };
+layout(set=0,binding=2,std430) readonly buffer OldTransforms { SceneModel previous[]; };
+layout(set=0,binding=3,std430) readonly buffer Materials { SceneMaterial materials[]; };
+layout(set=0,binding=4,std430) readonly buffer Assets { Asset assets[]; };
+layout(set=0,binding=5,std430) writeonly buffer Cull { Instance instances[]; };
+layout(set=0,binding=6,std430) writeonly buffer Shading { Item items[]; };
+layout(set=0,binding=7,std430) writeonly buffer Motion { Previous motions[]; };
+layout(set=0,binding=8,std430) writeonly buffer OldPlants { SceneModel oldPlants[]; };
+layout(push_constant) uniform Params {
+    layout(offset=36) uint count;
+    uint temporal;
+    uint valid;
+    uint oldWind;
+    uint motionPalette;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x + gl_WorkGroupID.y * 32768u * 64u;
+    if (i >= p.count) return;
+    uvec4 slot = slots[2u*i];
+    SceneModel now = current[slot.x];
+    SceneModel old = now;
+    if (p.valid != 0u) old = previous[slot.x];
+    Asset asset = assets[slot.y];
+    SceneMaterial m = materials[slot.z];
+
+    Instance obj;
+    obj.model = now.model;
+    obj.color = m.color;
+    obj.params = m.params;
+    obj.params.z = uintBitsToFloat(now.data.x);
+    obj.tex = m.tex;
+    obj.tex.w |= asset.flags.x | now.data.w;
+    obj.routing = uvec4(m.routing.x, i, slot.y, slot.w);
+    if (p.temporal != 0u && p.valid != 0u && any(notEqual(now.data.yz, old.data.yz))) {
+        obj.tex.w |= TEMPORAL_REACTIVE;
+    }
+    instances[i] = obj;
+
+    obj.routing.y = 0u;
+    if ((obj.tex.w & PLANT) != 0u) obj.routing.z = asset.flags.y;
+    items[i] = Item(obj, asset.refs);
+    if (p.temporal == 0u) return;
+
+    uint token = slots[2u*i + 1u].x;
+    Previous motion;
+    motion.transform = mat4(1.);
+    motion.info = uvec4(token, p.valid != 0u ? token : 0u, 4u, 0u);
+    if (p.valid != 0u) {
+        if (p.oldWind != 0u && (obj.tex.w & PLANT) != 0u) {
+            motion.transform = old.model;
+            motion.info.zw = uvec2(3, p.motionPalette);
+        } else if (now.model == old.model) {
+            motion.info.z = 0u;
+        } else if (abs(determinant(now.model)) > 0.) {
+            motion.transform = old.model * inverse(now.model);
+            motion.info.z = 1u;
+        }
+    }
+    motions[i] = motion;
+    if (p.oldWind != 0u) oldPlants[i] = old;
+}

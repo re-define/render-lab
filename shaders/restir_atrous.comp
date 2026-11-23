@@ -1,0 +1,39 @@
+#version 460
+#include "restir_types.glsl"
+#define RESTIR_CONFIG 1
+#include "restir_controls.glsl"
+layout(set=0,binding=0,std430) readonly buffer Current { Surface surfaces[]; };
+layout(set=0,binding=2,std430) readonly buffer Input { Radiance inputLight[]; };
+layout(set=0,binding=3,std430) writeonly buffer Output { Radiance outputLight[]; };
+layout(push_constant) uniform Wavelet { layout(offset=16) int stride; } wavelet;
+layout(local_size_x=8,local_size_y=8) in;
+void main() {
+    uvec2 xy=gl_GlobalInvocationID.xy;
+    if(any(greaterThanEqual(xy,screenSize))) return;
+    uint i=indexAt(xy);
+    Surface a=surfaces[i];
+    Radiance center=inputLight[i];
+    if(a.id==0u){outputLight[i]=center;return;}
+    vec4 sum=vec4(0);
+    float total=0.0, variance=0.0;
+    const float kernel[3]=float[](0.375,0.25,0.0625);
+    float sigma=max(sqrt(center.moments.z),center.color.w*0.09+0.026);
+    if(center.moments.y<=1.0) sigma=max(sigma,0.38);
+    for(int y=-2;y<=2;++y)for(int x=-2;x<=2;++x){
+        ivec2 p=ivec2(xy)+ivec2(x,y)*wavelet.stride;
+        if(!inScreen(p)) continue;
+        uint j=indexAt(uvec2(p));
+        Surface b=surfaces[j];
+        if(!compatible(a,b,0.03+0.014*a.point.w*float(wavelet.stride+1))) continue;
+        Radiance tap=inputLight[j];
+        float dw=abs(dot(b.point.xyz-a.point.xyz,surfaceNormal(a)))/(0.015+0.003*a.point.w);
+        float lw=abs(center.color.w-tap.color.w)/(3.5*sigma+sqrt(tap.moments.z));
+        float weight=kernel[abs(x)]*kernel[abs(y)]*pow(max(dot(surfaceNormal(a),surfaceNormal(b)),0.0),24.0)*exp(-dw-lw);
+        sum+=tap.color*weight;
+        variance+=weight*weight*tap.moments.z;
+        total+=weight;
+    }
+    center.color=sum/max(total,1e-5);
+    center.moments.z=variance/max(total*total,1e-10);
+    outputLight[i]=center;
+}

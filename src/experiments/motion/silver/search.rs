@@ -14,6 +14,23 @@ pub(super) enum Mode {
     Scan,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum Candidate {
+    Idle,
+    Transition,
+    Steady,
+}
+
+impl Candidate {
+    pub fn of(clip: &str) -> Self {
+        match clip.split('_').next() {
+            Some("idle") => Self::Idle,
+            Some("start" | "stop") => Self::Transition,
+            _ => Self::Steady,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct Node {
     low: Point,
@@ -44,6 +61,8 @@ pub(super) struct Index {
     order: Vec<usize>,
     #[serde(skip)]
     samples: Vec<Feature>,
+    #[serde(skip)]
+    candidates: Vec<Candidate>,
 }
 
 pub(super) struct Hit {
@@ -56,6 +75,7 @@ struct Query<'a> {
     features: Feature,
     span: &'a Range<usize>,
     next: usize,
+    class: Option<Candidate>,
 }
 
 impl Index {
@@ -87,16 +107,32 @@ impl Index {
             ensure!(valid, "invalid motion tree node");
         }
         index.samples = raw.iter().map(|row| index.normalize(row)).collect();
+        index.candidates = vec![Candidate::Transition; raw.len()];
+        for (span, name) in clips {
+            index.candidates[span.clone()].fill(Candidate::of(name));
+        }
         Ok(index)
     }
     fn normalize(&self, raw: &Feature) -> Feature {
         std::array::from_fn(|i| (raw[i] - self.mean[i]) * self.gain[i])
     }
     fn score(&self, id: usize, query: &Query, hit: &mut Hit) {
+        if query
+            .class
+            .is_some_and(|class| class != self.candidates[id])
+        {
+            return;
+        }
         if id != query.next && id.abs_diff(query.next) < 8 && query.span.contains(&id) {
             return;
         }
-        let mut cost = if id == query.next { 0. } else { 0.18 };
+        let mut cost = if id == query.next {
+            0.
+        } else if query.span.contains(&id) {
+            0.28
+        } else {
+            0.42
+        };
         for (a, b) in self.samples[id].iter().zip(query.features.iter()) {
             let delta = a - b;
             cost += delta * delta;
@@ -137,11 +173,13 @@ impl Index {
         next: usize,
         span: &Range<usize>,
         clips: &[(Range<usize>, String)],
+        class: Option<Candidate>,
     ) -> Hit {
         let query = Query {
             features: self.normalize(raw),
             span,
             next,
+            class,
         };
         let mut hit = Hit {
             sample: usize::MAX,

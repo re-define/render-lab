@@ -1,0 +1,17 @@
+#version 460
+#include "cluster_scene.glsl"
+layout(local_size_x=64) in;
+layout(binding=2,std430) readonly buffer Cut { uvec4 head; uvec2 jobs[]; };
+layout(binding=3,std430) buffer Pages { uvec4 pageHead; uvec2 pages[]; };
+layout(binding=4,std430) buffer Indirect { uvec4 args; };
+void main() {
+    uint index=workIndex();
+    if(index>=head.x) return;
+    uvec2 job=jobs[index];
+    Cluster c=assets[instances[job.x].routing.z].clusters.data[job.y];
+    bool voxel=(c.meta.w&VOXEL_CLUSTER)!=0u;
+    uint n=voxel?c.span.y:1u, base=voxel?c.span.z:job.y;
+    uint slot=atomicAdd(pageHead.x,n);
+    for(uint i=0u;i<n;i++) pages[slot+i]=uvec2(job.x,base+i);
+    PUBLISH_WORK(args,slot,n,64u);
+}

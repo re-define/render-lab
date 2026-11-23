@@ -3,7 +3,7 @@
 layout(local_size_x=32) in;
 layout(triangles, max_vertices=96, max_primitives=32) out;
 #include "outline.glsl"
-layout(push_constant) uniform Params { layout(offset=12) uint count; } p;
+layout(push_constant) uniform Params { layout(offset=16) uint count; } p;
 void main() {
     uint first = 32u * groupIndex(), n = min(p.count - min(first, p.count), 32u);
     SetMeshOutputsEXT(3u * n, n);
@@ -13,7 +13,7 @@ void main() {
     vec3 a = position(tri.x), b = position(tri.y), c = position(tri.z);
     for (uint i = 0; i < 3; ++i) {
         vec4 clip = vp * vec4(position(tri[i]), 1);
-        vec3 normal = vertices[2u * tri[i] + 1u].xyz;
+        vec3 normal = transpose(inverse(mat3(model))) * vertices[2u * tri[i] + 1u].xyz;
         if (dot(normal, normal) < 1e-10) normal = cross(b - a, c - a);
         vec4 delta = vp * vec4(normal, 0);
         vec2 direction = unitOrZero((delta.xy * clip.w - clip.xy * delta.w) * screen);

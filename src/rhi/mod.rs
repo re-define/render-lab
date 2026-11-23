@@ -1,21 +1,46 @@
 //! RHI-owned queues, independently recorded command pools and timeline-retired frame resources.
 #![allow(unsafe_op_in_unsafe_fn)]
+mod allocator;
+mod clusters;
 mod device;
+mod frame;
+pub use frame::{AllocationInfo, Frame, FrameMemory, FrameProfile, PassReport, RasterCounts};
+mod memory;
+mod raster_queries;
+use memory::Class;
+pub use memory::{AllocationActivity, Class as MemoryClass, ManagedMemory, MemoryBreakdown};
+mod purposes;
+use purposes::Purpose;
+pub use purposes::PurposeMemory;
+mod ngx;
 mod pipeline;
 mod present;
 mod queues;
+mod ray;
 mod record;
+mod slot;
+mod transient;
 use crate::rdg::*;
+use crate::render::FramePlan;
 use anyhow::{Context, Result, ensure};
 use device::{Buffer, Gpu, Image};
 use pipeline::Pipeline;
 use rayon::prelude::*;
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use slot::FrameSlot;
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Weak},
+    time::Instant,
+};
 use vulkanalia::{prelude::v1_4::*, vk::ExtDescriptorHeapExtensionDeviceCommands};
 
 enum Physical {
+    Vacant,
     Buffer(Buffer),
-    Image(Image, [u32; 2], bool),
+    SharedBuffer(Arc<Buffer>),
+    Image(Image, ImageDesc),
+    Acceleration(Box<ray::Acceleration>),
+    Clusters(Box<clusters::Allocation>),
 }
 impl Physical {
     fn image(&self) -> &Image {
@@ -27,6 +52,7 @@ impl Physical {
     fn buffer(&self) -> &Buffer {
         match self {
             Self::Buffer(b) => b,
+            Self::SharedBuffer(b) => b,
             _ => unreachable!(),
         }
     }
@@ -35,16 +61,25 @@ struct Heap {
     _buffer: Buffer,
     bind: vk::BindHeapInfoEXT,
     stride: u32,
-    slots: Vec<Option<(u64, u64)>>,
+    slots: Vec<Option<HeapBinding>>,
     base: usize,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeapBinding {
+    Buffer(u64, u64),
+    Image(vk::Image),
+}
 impl Heap {
-    fn new(g: &Arc<Gpu>, count: usize) -> Result<Self> {
+    fn new(g: &Arc<Gpu>, count: usize, slot: usize) -> Result<Self> {
         let h = g.heap;
-        let align = h.resource_heap_alignment.max(h.buffer_descriptor_alignment);
+        let descriptor_align = h
+            .buffer_descriptor_alignment
+            .max(h.image_descriptor_alignment);
+        let align = h.resource_heap_alignment.max(descriptor_align);
         let stride = h
             .buffer_descriptor_size
-            .next_multiple_of(h.buffer_descriptor_alignment);
+            .max(h.image_descriptor_size)
+            .next_multiple_of(descriptor_align);
         let reserved = (stride * count as u64).next_multiple_of(align);
         let size = reserved + h.min_resource_heap_reserved_range;
         ensure!(
@@ -56,12 +91,20 @@ impl Heap {
             size + align,
             vk::BufferUsageFlags::DESCRIPTOR_HEAP_EXT,
             false,
+            Purpose {
+                slot: Some(slot),
+                ..Class::Infrastructure.named("Resource descriptor heap")
+            },
         )?;
         let address = buffer.address.next_multiple_of(align);
         let base = (address - buffer.address) as usize;
         let bind = vk::BindHeapInfoEXT {
             heap_range: vk::DeviceAddressRangeEXT { address, size },
-            reserved_range_offset: reserved,
+            reserved_range_offset: if h.min_resource_heap_reserved_range == 0 {
+                0
+            } else {
+                reserved
+            },
             reserved_range_size: h.min_resource_heap_reserved_range,
             ..Default::default()
         };
@@ -73,14 +116,15 @@ impl Heap {
             base,
         })
     }
-    fn write(&mut self, g: &Gpu, r: usize, buf: &Buffer) -> Result<()> {
-        let binding = (buf.address, buf.size);
+    fn write(&mut self, g: &Gpu, r: usize, buf: &Buffer, bytes: u64) -> Result<()> {
+        debug_assert!(bytes <= buf.size);
+        let binding = HeapBinding::Buffer(buf.address, bytes);
         if self.slots[r] == Some(binding) {
             return Ok(());
         }
         let range = vk::DeviceAddressRangeEXT {
             address: buf.address,
-            size: buf.size,
+            size: bytes,
         };
         let desc = vk::ResourceDescriptorInfoEXT {
             type_: vk::DescriptorType::STORAGE_BUFFER,
@@ -89,11 +133,51 @@ impl Heap {
             },
             ..Default::default()
         };
+        self.write_descriptor(g, r, binding, desc, g.heap.buffer_descriptor_size)
+    }
+
+    fn write_image(&mut self, g: &Gpu, r: usize, image: &Image) -> Result<()> {
+        let binding = HeapBinding::Image(image.raw);
+        if self.slots[r] == Some(binding) {
+            return Ok(());
+        }
+        let view = vk::ImageViewCreateInfo::builder()
+            .image(image.raw)
+            .view_type(vk::ImageViewType::_2D)
+            .format(image.format)
+            .subresource_range(image.range)
+            .build();
+        let image = vk::ImageDescriptorInfoEXT {
+            view: &view,
+            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            ..Default::default()
+        };
+        self.write_descriptor(
+            g,
+            r,
+            binding,
+            vk::ResourceDescriptorInfoEXT {
+                type_: vk::DescriptorType::SAMPLED_IMAGE,
+                data: vk::ResourceDescriptorDataEXT { image: &image },
+                ..Default::default()
+            },
+            g.heap.image_descriptor_size,
+        )
+    }
+
+    fn write_descriptor(
+        &mut self,
+        g: &Gpu,
+        r: usize,
+        binding: HeapBinding,
+        desc: vk::ResourceDescriptorInfoEXT,
+        size: u64,
+    ) -> Result<()> {
         self._buffer.mapped(|data| {
             let offset = self.base + r * self.stride as usize;
             let dst = vk::HostAddressRangeEXT {
                 address: data[offset..].as_mut_ptr().cast(),
-                size: g.heap.buffer_descriptor_size as usize,
+                size: size as usize,
             };
             unsafe {
                 g.dev.write_resource_descriptors_ext(&[desc], &[dst])?;
@@ -110,6 +194,7 @@ struct Recorder {
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     query: vk::QueryPool,
+    raster: Option<raster_queries::Pools>,
 }
 impl Recorder {
     fn new(g: &Arc<Gpu>) -> Result<Self> {
@@ -124,6 +209,7 @@ impl Recorder {
                 pool,
                 cmd: vk::CommandBuffer::null(),
                 query: vk::QueryPool::null(),
+                raster: None,
             };
             r.cmd = g.dev.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::builder()
@@ -150,167 +236,353 @@ impl Drop for Recorder {
     }
 }
 
-#[derive(Default, Clone, serde::Serialize)]
-pub struct AllocationInfo {
-    pub allocated_bytes: u64,
-    pub memory_type: u32,
-    pub heap_index: u32,
-    pub device_local: bool,
-}
-
-#[derive(Default, Clone, serde::Serialize)]
-pub struct FrameMemory {
-    pub atlas_buffer_bytes: u64,
-    pub atlas: Option<AllocationInfo>,
-    /// Explicit VkDeviceMemory allocations for live RDG resources and the descriptor heap.
-    pub device_local_bytes: u64,
-    pub nonlocal_bytes: u64,
-}
-
-#[derive(Default, Clone, serde::Serialize)]
-pub struct FrameProfile {
-    pub main_ms: f64,
-    pub build_ms: f64,
-    pub compile_ms: f64,
-    pub rhi_prepare_ms: f64,
-    pub acquire_ms: f64,
-    pub record_ms: f64,
-    pub submit_ms: f64,
-    pub present_ms: f64,
-    pub retire_ms: f64,
-    pub rhi_ms: f64,
-    pub gpu_span_ms: Option<f64>,
-    pub task_workers: usize,
-    pub recording_workers: usize,
-    pub overlapping_recordings: usize,
-    pub dependency_edges: usize,
-    pub resource_barriers: usize,
-    pub barrier_calls: usize,
-    pub memory_barriers: usize,
-    pub image_barriers: usize,
-    pub timeline_waits: usize,
-    pub timeline_signals: usize,
-    pub physical_queues: usize,
-    pub wsi_transitions: usize,
-    pub wsi_binary_pairs: usize,
-}
-pub struct Frame {
-    pub first_profile: Arc<FrameProfile>,
-    pub profile: FrameProfile,
-    pub completed: Instant,
-    pub sequence: u64,
-    pub pixels: Vec<u8>,
-    pub counters: std::collections::BTreeMap<&'static str, u64>,
-    pub extent: [u32; 2],
-    pub passes: Vec<PassReport>,
-    pub gpu: String,
-    pub memory: FrameMemory,
-    pub presentation: Option<String>,
-    pub submissions: usize,
-}
-pub struct PassReport {
-    pub queue: Queue,
-    pub name: String,
-    /// Indices in Frame::passes, in submission order.
-    pub parents: Vec<usize>,
-    pub barriers: Vec<String>,
-    pub ms: f64,
-}
 pub struct Backend {
     gpu: Arc<Gpu>,
-    heap: Heap,
-    resources: Vec<Physical>,
+    slots: [FrameSlot; 2],
+    pending: VecDeque<Submitted>,
+    completed: VecDeque<Frame>,
     pipes: HashMap<(Shader, usize), Pipeline>,
-    recorders: Vec<Recorder>,
+    resident: HashMap<(usize, u32), ResidentBuffer>,
+    histories: HashMap<(u64, usize, [u32; 2]), Arc<Buffer>>,
     frame_number: u64,
     first_profile: Option<Arc<FrameProfile>>,
     timelines: queues::Timelines,
     surface: Option<present::Surface>,
 }
+struct ResidentBuffer {
+    source: Weak<[u8]>,
+    buffer: Arc<Buffer>,
+}
+struct Submitted {
+    plan: FramePlan,
+    slot: usize,
+    output: Resource,
+    retire: Vec<u64>,
+    start: Instant,
+    profile: FrameProfile,
+    managed: ManagedMemory,
+    recordings: Vec<(usize, Instant, Instant)>,
+    presentation: Option<String>,
+}
 impl Backend {
+    pub(crate) fn dlss_unavailable(&self) -> Option<String> {
+        self.gpu.dlss_unavailable.clone()
+    }
+    pub fn buffer_atomic64(&self) -> bool {
+        self.gpu.buffer_atomic64
+    }
     pub fn open() -> Result<Self> {
-        let gpu = Gpu::open()?;
-        let heap = Heap::new(&gpu, 16)?;
+        Self::open_device(false)
+    }
+    /// Count native fragment invocations and depth-passing samples per draw.
+    pub fn open_with_raster_queries() -> Result<Self> {
+        Self::open_device(true)
+    }
+    fn open_device(raster_queries: bool) -> Result<Self> {
+        let gpu = Gpu::open(raster_queries)?;
+        if let Some(value) = std::env::var_os("RENDER_LAB_GPU_BUDGET_MIB") {
+            let mib: u64 = value
+                .to_str()
+                .context("invalid GPU budget")?
+                .parse()
+                .context("GPU budget must be an integer in MiB")?;
+            gpu.allocator.lock().unwrap().stats.set_budget(Some(
+                mib.checked_mul(1 << 20).context("GPU budget overflow")?,
+            ))?;
+        }
+        let slots = [FrameSlot::new(&gpu, 0)?, FrameSlot::new(&gpu, 1)?];
         let timelines = queues::Timelines::new(&gpu)?;
         Ok(Self {
             gpu,
-            heap,
-            resources: vec![],
+            slots,
+            pending: VecDeque::new(),
+            completed: VecDeque::new(),
             pipes: HashMap::new(),
-            recorders: vec![],
+            resident: HashMap::new(),
+            histories: HashMap::new(),
             frame_number: 0,
             first_profile: None,
             timelines,
             surface: None,
         })
     }
-    fn prepare(&mut self, plan: &Plan) -> Result<()> {
+    /// Limit device-local allocations owned by this backend. Host-visible resources can fall back to a compatible nonlocal heap.
+    pub fn set_device_local_budget(&mut self, limit: Option<u64>) -> Result<()> {
+        self.gpu.allocator.lock().unwrap().stats.set_budget(limit)
+    }
+
+    fn prepare(
+        &mut self,
+        plan: &FramePlan,
+        index: usize,
+        reuse: &transient::Reuse,
+    ) -> Result<(u64, u64, u64)> {
         let g = &self.gpu;
         let graph = &plan.graph;
+        let slot = &mut self.slots[index];
         ensure!(
             graph
                 .extent
                 .iter()
+                .chain(&graph.output_extent())
                 .all(|&d| d <= g.limits.max_image_dimension_2d),
             "viewport exceeds device limits"
         );
-        if self.heap.slots.len() < graph.resources.len() {
-            self.heap = Heap::new(g, graph.resources.len())?;
+        let ray_vertices: std::collections::BTreeSet<_> = graph
+            .passes
+            .iter()
+            .flat_map(|p| match p.op {
+                Op::BuildBlas {
+                    vertices, indices, ..
+                } => vec![vertices, indices],
+                Op::BuildClusters {
+                    records,
+                    count,
+                    vertices,
+                    indices,
+                    addresses,
+                    ..
+                } => vec![records, count, vertices, indices, addresses],
+                Op::BuildClusterBottom {
+                    record, addresses, ..
+                } => vec![record, addresses],
+                _ => vec![],
+            })
+            .collect();
+        if graph
+            .passes
+            .iter()
+            .any(|pass| matches!(pass.op, Op::Dlss(_)))
+        {
+            ensure!(
+                g.ngx.is_some(),
+                "{}",
+                g.dlss_unavailable.as_deref().unwrap_or("DLSS unavailable")
+            );
         }
-        self.resources.truncate(graph.resources.len());
-        for (i, (_, s)) in graph.resources.iter().enumerate() {
-            let prefer_local = graph.material_atlas == Some(Resource(i));
-            let matches = match (self.resources.get(i), s) {
-                (Some(Physical::Buffer(b)), Storage::Buffer { bytes, .. }) => {
-                    b.size == *bytes as u64 && b.prefer_local == prefer_local
+        ensure!(
+            ray_vertices.is_empty() || g.ray.is_some(),
+            "RT experiment requires VK_KHR_ray_tracing_pipeline and VK_KHR_acceleration_structure"
+        );
+        if slot.heap.slots.len() < graph.resources.len() {
+            // A descriptor heap reservation stays bound even after timeline retirement.
+            // Release every recording, including passes absent from the new graph,
+            // before the allocator can reuse the old heap's address for either slot.
+            for recorder in &slot.recorders {
+                unsafe {
+                    g.dev
+                        .reset_command_pool(recorder.pool, vk::CommandPoolResetFlags::empty())?;
                 }
-                (Some(Physical::Image(_, size, depth)), Storage::Color | Storage::Depth) => {
-                    *size == graph.extent && *depth == matches!(s, Storage::Depth)
+            }
+            slot.heap = Heap::new(g, graph.resources.len(), index)?;
+        }
+        slot.bind_layout(graph);
+        self.resident
+            .retain(|_, resource| resource.source.strong_count() != 0);
+        self.histories.retain(|(key, _, extent), _| {
+            *extent == graph.extent && graph.histories.values().any(|&current| current == *key)
+        });
+        let mut resident_upload_bytes = 0;
+        let mut dynamic_bytes = 0;
+        let mut table_bytes = 0;
+        let mut pooled = HashMap::<usize, Arc<Buffer>>::new();
+        let mut claimed = std::collections::BTreeSet::new();
+        for (i, (name, s)) in graph.resources.iter().enumerate() {
+            let resource = Resource(i);
+            let tag = Purpose {
+                name,
+                class: Class::Transient,
+                owner: graph.scratch_owners.get(&resource).copied(),
+                slot: Some(index),
+            };
+            let prefer_local = graph.local_buffers.contains(&resource);
+            let mut usage = vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::INDIRECT_BUFFER;
+            if ray_vertices.contains(&Resource(i)) {
+                usage |= vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
+            }
+            let shared = if let Some(cache) = graph.cluster_caches.get(&resource) {
+                let Physical::Clusters(owner) = &slot.resources[cache.output.0] else {
+                    anyhow::bail!("CLAS version table requires its preceding triangle allocation")
+                };
+                Some(
+                    owner
+                        .versions
+                        .clone()
+                        .context("missing CLAS version table")?,
+                )
+            } else if let Some(&key) = graph.histories.get(&resource) {
+                let Storage::Buffer { bytes, .. } = *s else {
+                    unreachable!()
+                };
+                let key = (key, bytes, graph.extent);
+                let entry = match self.histories.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let mut buffer = Buffer::new(
+                            g,
+                            bytes as u64,
+                            usage,
+                            prefer_local,
+                            Class::History.named(name),
+                        )?;
+                        buffer.mapped(|data| {
+                            data.fill(0);
+                            Ok(())
+                        })?;
+                        entry.insert(Arc::new(buffer))
+                    }
+                };
+                Some(entry.clone())
+            } else if let Some(&leader) = reuse.groups.get(&resource) {
+                let Storage::Buffer { bytes, .. } = *s else {
+                    unreachable!()
+                };
+                let buffer = match pooled.entry(leader.0) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let old = slot.resources.get(leader.0).and_then(|item| match item {
+                            Physical::SharedBuffer(b)
+                                if b.class == Class::Transient
+                                    && b.size == bytes as u64
+                                    && b.usage == usage
+                                    && b.prefer_local == prefer_local
+                                    && claimed.insert(b.address) =>
+                            {
+                                Some(b.clone())
+                            }
+                            _ => None,
+                        });
+                        let b = match old {
+                            Some(b) => b,
+                            None => Arc::new(Buffer::new(
+                                g,
+                                bytes as u64,
+                                usage,
+                                prefer_local,
+                                Purpose {
+                                    name: &graph.resources[leader.0].0,
+                                    ..tag
+                                },
+                            )?),
+                        };
+                        entry.insert(b)
+                    }
+                };
+                Some(buffer.clone())
+            } else if graph.resident_inputs.contains(&resource) {
+                let Storage::Buffer {
+                    bytes,
+                    initial: Some(source),
+                } = s
+                else {
+                    unreachable!()
+                };
+                let key = (source.as_ptr() as usize, usage.bits());
+                let entry = match self.resident.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let mut buffer =
+                            Buffer::new(g, *bytes as u64, usage, true, Class::Asset.named(name))?;
+                        buffer.mapped(|data| {
+                            data[..source.len()].copy_from_slice(source);
+                            data[source.len()..].fill(0);
+                            Ok(())
+                        })?;
+                        resident_upload_bytes += source.len() as u64;
+                        entry.insert(ResidentBuffer {
+                            source: Arc::downgrade(source),
+                            buffer: Arc::new(buffer),
+                        })
+                    }
+                };
+                Some(entry.buffer.clone())
+            } else {
+                None
+            };
+            if let Some(buffer) = shared {
+                slot.heap.write(g, i, &buffer, buffer.size)?;
+                slot.resources[i] = Physical::SharedBuffer(buffer);
+                continue;
+            }
+            let growable = graph.scratch_owners.contains_key(&resource);
+            let matches = match (&slot.resources[i], s) {
+                (Physical::Buffer(b), Storage::Buffer { bytes, .. }) => {
+                    let fits = if growable {
+                        b.size >= *bytes as u64
+                    } else {
+                        b.size == *bytes as u64
+                    };
+                    fits && b.prefer_local == prefer_local && b.usage == usage
+                }
+                (Physical::Clusters(c), Storage::Acceleration(shape)) => c.shape == *shape,
+                (Physical::Acceleration(a), Storage::Acceleration(shape)) => a.shape == *shape,
+                (Physical::Image(image, desc), _) => {
+                    s.image(graph.extent) == Some(*desc)
+                        && image.usage == Image::usage_for(desc.format, plan.image_usage[i])
                 }
                 _ => false,
             };
             if !matches {
+                slot.heap.slots[i] = None;
                 let item = match s {
-                    Storage::Buffer { bytes, .. } => Physical::Buffer(Buffer::new(
-                        g,
-                        *bytes as u64,
-                        vk::BufferUsageFlags::STORAGE_BUFFER
-                            | vk::BufferUsageFlags::TRANSFER_DST
-                            | vk::BufferUsageFlags::TRANSFER_SRC
-                            | vk::BufferUsageFlags::INDIRECT_BUFFER,
-                        prefer_local,
-                    )?),
-                    _ => {
-                        let depth = matches!(s, Storage::Depth);
-                        Physical::Image(Image::new(g, graph.extent, depth)?, graph.extent, depth)
+                    Storage::Buffer { bytes, .. } if growable => {
+                        Physical::Buffer(slot::allocate_scratch(g, *bytes as u64, usage, tag)?)
+                    }
+                    Storage::Buffer { bytes, .. } => {
+                        Physical::Buffer(Buffer::new(g, *bytes as u64, usage, prefer_local, tag)?)
+                    }
+                    Storage::Color | Storage::Depth | Storage::Image(_) => {
+                        let desc = s.image(graph.extent).unwrap();
+                        ensure!(
+                            desc.extent
+                                .iter()
+                                .all(|&dim| dim != 0 && dim <= g.limits.max_image_dimension_2d),
+                            "image extent exceeds device limits"
+                        );
+                        Physical::Image(
+                            Image::new(
+                                g,
+                                desc,
+                                Image::usage_for(desc.format, plan.image_usage[i]),
+                                tag,
+                            )?,
+                            desc,
+                        )
+                    }
+                    Storage::Acceleration(
+                        shape @ (AccelerationShape::TriangleClusters { .. }
+                        | AccelerationShape::ClusterBottom { .. }),
+                    ) => Physical::Clusters(Box::new(clusters::Allocation::new(g, *shape, tag)?)),
+                    Storage::Acceleration(shape) => {
+                        Physical::Acceleration(Box::new(ray::Acceleration::new(g, *shape, tag)?))
                     }
                 };
-                if i == self.resources.len() {
-                    self.resources.push(item)
-                } else {
-                    self.resources[i] = item;
-                }
+                slot.resources[i] = item;
             }
-            if let Physical::Buffer(b) = &mut self.resources[i] {
-                let history = graph
-                    .histories
-                    .get(&Resource(i))
-                    .map(|&key| (key, graph.extent));
-                if history.is_some() && history != b.history {
-                    b.mapped(|p| {
-                        p.fill(0);
-                        Ok(())
-                    })?;
-                }
-                b.history = history;
-                if let Storage::Buffer {
+            if let Physical::Buffer(b) = &mut slot.resources[i] {
+                if let Some(table) = graph.tables.get(&resource) {
+                    ensure!(!plan.written[i], "snapshot table is immutable");
+                    if !b.table.as_ref().is_some_and(|t| t.identical(table)) {
+                        let old = b.table.take();
+                        let n = b.mapped(|p| Ok(table.upload(old.as_ref(), p)))? as u64;
+                        table_bytes += n;
+                        dynamic_bytes += n;
+                        b.table = Some(table.clone());
+                    }
+                    b.uploaded = None;
+                } else if let Storage::Buffer {
                     initial: Some(data),
                     ..
                 } = s
                 {
+                    b.table = None;
                     let source = Arc::downgrade(data);
                     if !b.uploaded.as_ref().is_some_and(|last| last.ptr_eq(&source)) {
                         b.mapped(|p| {
+                            dynamic_bytes += data.len() as u64;
                             p[..data.len()].copy_from_slice(data);
                             if !graph.append_lists.contains(&Resource(i)) {
                                 p[data.len()..].fill(0);
@@ -320,36 +592,127 @@ impl Backend {
                     }
                     b.uploaded = (!plan.written[i]).then_some(source);
                 } else {
+                    b.table = None;
                     b.uploaded = None;
                 }
-                self.heap.write(g, i, b)?;
+                let Storage::Buffer { bytes, .. } = s else {
+                    unreachable!()
+                };
+                b.use_bytes(*bytes as u64);
+                slot.heap.write(g, i, b, *bytes as u64)?;
             }
+            if let Physical::Image(image, ..) = &slot.resources[i]
+                && image.usage.contains(vk::ImageUsageFlags::SAMPLED)
+            {
+                slot.heap.write_image(g, i, image)?;
+            }
+        }
+        for cache in graph.cluster_caches.values() {
+            let Physical::Clusters(owner) = &mut slot.resources[cache.output.0] else {
+                unreachable!()
+            };
+            let words = owner.cache_parameters(&cache.sources, cache.force_rebuild)?;
+            let Physical::Buffer(params) = &mut slot.resources[cache.parameters.0] else {
+                unreachable!()
+            };
+            params.mapped(|data| {
+                data[..16].copy_from_slice(bytemuck::bytes_of(&words));
+                Ok(())
+            })?;
+            dynamic_bytes += 16;
         }
         for (table, refs) in &graph.addresses {
             let addresses = refs
                 .iter()
-                .map(|r| self.resources[r.0].buffer().address)
+                .map(|r| slot.resources[r.0].buffer().address)
                 .collect::<Vec<_>>();
-            let Physical::Buffer(table) = &mut self.resources[table.0] else {
+            let Physical::Buffer(table) = &mut slot.resources[table.0] else {
                 unreachable!()
             };
             table.mapped(|data| {
                 let src = bytemuck::cast_slice(&addresses);
+                dynamic_bytes += src.len() as u64;
                 data[..src.len()].copy_from_slice(src);
                 Ok(())
             })?;
         }
-        for p in &graph.passes {
+        for step in &plan.steps {
+            let p = &graph.passes[step.index];
+            match p.op {
+                Op::BuildBlas {
+                    vertices,
+                    topology,
+                    output,
+                    ..
+                } => {
+                    let source = |r: Resource| match &graph.resources[r.0].1 {
+                        Storage::Buffer { initial, .. } if graph.resident_inputs.contains(&r) => {
+                            initial.as_ref()
+                        }
+                        _ => None,
+                    };
+                    let Physical::Acceleration(blas) = &mut slot.resources[output.0] else {
+                        unreachable!()
+                    };
+                    blas.prepare_blas(source(vertices), source(topology));
+                }
+                Op::BuildTlas {
+                    ref instances,
+                    output,
+                } => {
+                    let mut rebuild = false;
+                    let mut records = Vec::with_capacity(instances.len());
+                    for instance in instances {
+                        let (address, changed) = match &slot.resources[instance.blas.0] {
+                            Physical::Acceleration(blas) => (blas.address, blas.needs_build),
+                            Physical::Clusters(blas) => (blas.address, true),
+                            _ => unreachable!(),
+                        };
+                        let mut record = [0u32; 16];
+                        record[..12].copy_from_slice(&instance.transform.map(f32::to_bits));
+                        record[12] = 0xff00_0000 | instance.first_triangle;
+                        record[14] = address as u32;
+                        record[15] = (address >> 32) as u32;
+                        records.push(record);
+                        rebuild |= changed;
+                    }
+                    let Physical::Acceleration(tlas) = &mut slot.resources[output.0] else {
+                        unreachable!()
+                    };
+                    tlas.prepare_tlas(records, rebuild)?;
+                }
+                _ => (),
+            }
             if let Some(d) = p.op.program() {
+                let ray_bytes = if matches!(p.op, Op::TraceRays { .. }) {
+                    8
+                } else {
+                    0
+                };
                 ensure!(
-                    d.bindings.len() * 4 + d.push.len() <= g.heap.max_push_data_size as usize
+                    d.bindings.len() * 4 + d.push.len() + ray_bytes
+                        <= g.heap.max_push_data_size as usize
                         && d.push.len() % 4 == 0,
                     "invalid push data size"
                 );
                 let key = (d.shader, d.bindings.len());
                 if let std::collections::hash_map::Entry::Vacant(e) = self.pipes.entry(key) {
-                    e.insert(Pipeline::new(g, d, self.heap.stride)?);
+                    e.insert(Pipeline::new(g, d, slot.heap.stride)?);
                 }
+            }
+            if let Op::TraceRays { extent: [w, h], .. } = p.op {
+                let props = &g
+                    .ray
+                    .as_ref()
+                    .context("RT experiment requires VK_KHR_ray_tracing_pipeline")?
+                    .pipeline;
+                ensure!(
+                    w > 0
+                        && h > 0
+                        && u64::from(w) * u64::from(h)
+                            <= u64::from(props.max_ray_dispatch_invocation_count),
+                    "ray dispatch exceeds device limits"
+                );
             }
             if let Op::Compute { groups, .. } = p.op {
                 ensure!(
@@ -361,44 +724,134 @@ impl Backend {
                 );
             }
         }
-        while self.recorders.len() < plan.steps.len() {
-            self.recorders.push(Recorder::new(g)?);
+        while slot.recorders.len() < plan.steps.len() {
+            slot.recorders.push(Recorder::new(g)?);
         }
-        Ok(())
+        Ok((resident_upload_bytes, dynamic_bytes, table_bytes))
     }
-    pub fn execute(&mut self, plan: Plan, tasks: &rayon::ThreadPool) -> Result<Frame> {
+    pub fn execute(&mut self, plan: FramePlan, tasks: &rayon::ThreadPool) -> Result<Frame> {
         self.execute_to(plan, tasks, None)
     }
     pub(crate) fn execute_to(
         &mut self,
-        plan: Plan,
+        plan: FramePlan,
         tasks: &rayon::ThreadPool,
         window: Option<isize>,
     ) -> Result<Frame> {
-        let result = self.render_frame(plan, tasks, window);
-        if result.is_err() {
-            // Failed recording or partial submission may leave an acquired image or
-            // unsignaled timeline value. Retire submitted work before reusing its storage.
-            unsafe {
-                self.gpu.dev.device_wait_idle()?;
-            }
-            self.surface.take();
-            self.timelines = queues::Timelines::new(&self.gpu)?;
-            for resource in &mut self.resources {
-                if let Physical::Buffer(b) = resource {
-                    b.history = None;
-                    b.uploaded = None;
-                }
-            }
+        let result = self
+            .submit_frame(plan, tasks, window, 0)
+            .and_then(|frame| self.finish_frame(frame));
+        if result
+            .as_ref()
+            .is_err_and(|e| !e.is::<memory::BudgetExceeded>())
+        {
+            self.recover()?;
         }
         result
     }
-    fn render_frame(
+
+    pub(crate) fn enqueue(
         &mut self,
-        plan: Plan,
+        plan: FramePlan,
+        tasks: &rayon::ThreadPool,
+        window: isize,
+    ) -> Result<Option<Frame>> {
+        if self.pending.len() == self.slots.len() {
+            let completed = self.retire_submitted().expect("full frame queue")?;
+            self.completed.push_back(completed);
+        }
+        let slot = (0..self.slots.len())
+            .find(|idx| self.pending.iter().all(|frame| frame.slot != *idx))
+            .unwrap();
+        match self.submit_frame(plan, tasks, Some(window), slot) {
+            Ok(mut frame) => {
+                frame.profile.frames_in_flight = self.pending.len() + 1;
+                self.pending.push_back(frame);
+                Ok(self.completed.pop_front())
+            }
+            Err(error) => {
+                if !error.is::<memory::BudgetExceeded>() {
+                    self.recover()?;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn retire_next(&mut self) -> Option<Result<Frame>> {
+        self.completed
+            .pop_front()
+            .map(Ok)
+            .or_else(|| self.retire_submitted())
+    }
+
+    fn retire_submitted(&mut self) -> Option<Result<Frame>> {
+        self.pending.pop_front().map(|frame| {
+            let result = self.finish_frame(frame);
+            if result.is_err()
+                && let Err(error) = self.recover()
+            {
+                return Err(error);
+            }
+            result
+        })
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.completed.is_empty() || !self.pending.is_empty()
+    }
+
+    fn recover(&mut self) -> Result<()> {
+        unsafe {
+            self.gpu.dev.device_wait_idle()?;
+        }
+        self.pending.clear();
+        self.surface.take();
+        self.timelines = queues::Timelines::new(&self.gpu)?;
+        self.histories.clear();
+        for slot in &mut self.slots {
+            slot.clear();
+        }
+        Ok(())
+    }
+
+    /// Called before acquisition or any GPU submission for the failing frame.
+    fn release_idle_resources(&mut self) {
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            if self.pending.iter().all(|pending| pending.slot != index) {
+                slot.clear();
+            }
+        }
+        self.resident
+            .retain(|_, asset| Arc::strong_count(&asset.buffer) > 1);
+    }
+
+    fn prepare_with_budget(
+        &mut self,
+        plan: &FramePlan,
+        index: usize,
+        reuse: &transient::Reuse,
+    ) -> Result<(u64, u64, u64)> {
+        match self.prepare(plan, index, reuse) {
+            Err(error) if error.is::<memory::BudgetExceeded>() => {
+                self.release_idle_resources();
+                let retry = self.prepare(plan, index, reuse);
+                if retry.is_err() {
+                    self.release_idle_resources();
+                }
+                retry
+            }
+            result => result,
+        }
+    }
+
+    fn submit_frame(
+        &mut self,
+        mut plan: FramePlan,
         tasks: &rayon::ThreadPool,
         window: Option<isize>,
-    ) -> Result<Frame> {
+        index: usize,
+    ) -> Result<Submitted> {
         let frame_start = Instant::now();
         let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.;
         if let Some(hwnd) = window
@@ -406,19 +859,15 @@ impl Backend {
         {
             self.surface = Some(present::Surface::new(&self.gpu, hwnd)?);
         }
-        self.prepare(&plan)?;
-        let output = plan
-            .steps
-            .iter()
-            .rev()
-            .find_map(|s| match plan.graph.passes[s.index].op {
-                Op::HostRead(r) | Op::Present(r) => Some(r),
-                _ => None,
-            })
-            .context("frame needs a viewport output")?;
-        let pixels = plan.graph.extent[0] as usize * plan.graph.extent[1] as usize * 4;
+        let reuse = transient::Reuse::plan(&mut plan, self.gpu.queues.len());
+        let (resident_upload_bytes, dynamic_upload_bytes, scene_table_upload_bytes) =
+            self.prepare_with_budget(&plan, index, &reuse)?;
+        let slot = &mut self.slots[index];
+        let output = plan.output;
+        let pixels =
+            plan.graph.output_extent()[0] as usize * plan.graph.output_extent()[1] as usize * 4;
         ensure!(
-            self.resources[output.0].buffer().size >= pixels as u64,
+            slot.resources[output.0].buffer().size >= pixels as u64,
             "output smaller than viewport"
         );
         ensure!(
@@ -432,21 +881,30 @@ impl Backend {
         let prepare_ms = ms(frame_start);
         let acquire_start = Instant::now();
         let image = if window.is_some() {
-            self.surface.as_mut().unwrap().acquire(plan.graph.extent)?
+            self.surface
+                .as_mut()
+                .unwrap()
+                .acquire(plan.graph.output_extent(), index)?
         } else {
             None
         };
         let acquire_ms = ms(acquire_start);
         let recording_start = Instant::now();
-        let dirs = &self.resources;
-        let heap = self.heap.bind;
+        let dirs = &slot.resources;
+        let heap = slot.heap.bind;
         let pipelines = &self.pipes;
-        let recorders = &mut self.recorders[..plan.steps.len()];
-        let recordings = tasks.install(|| {
+        let recorders = &mut slot.recorders[..plan.steps.len()];
+        let vendor = plan
+            .steps
+            .iter()
+            .position(|step| matches!(plan.graph.passes[step.index].op, Op::Dlss(_)));
+        let mut recordings = tasks.install(|| {
             recorders
                 .par_iter_mut()
                 .zip(&plan.steps)
-                .map(|(rec, step)| {
+                .enumerate()
+                .filter(|(index, _)| Some(*index) != vendor)
+                .map(|(_, (rec, step))| {
                     let start = Instant::now();
                     unsafe {
                         rec.record(&plan, step, dirs, &heap, pipelines, image)?;
@@ -459,9 +917,23 @@ impl Backend {
                 })
                 .collect::<Result<Vec<_>>>()
         })?;
+        // Keep all NGX calls for a device on the RHI thread.
+        if let Some(index) = vendor {
+            let start = Instant::now();
+            unsafe {
+                recorders[index].record(
+                    &plan,
+                    &plan.steps[index],
+                    dirs,
+                    &heap,
+                    pipelines,
+                    image,
+                )?;
+            }
+            recordings.push((tasks.current_num_threads(), start, Instant::now()));
+        }
         let record_ms = ms(recording_start);
         let submit_start = Instant::now();
-        let d = &self.gpu.dev;
         let (submits, timeline_waits) =
             self.timelines.submit(&self.gpu, &plan, recorders, image)?;
         let submit_ms = ms(submit_start);
@@ -470,10 +942,70 @@ impl Backend {
             .map(|frame| self.surface.as_mut().unwrap().present(frame))
             .transpose();
         let present_ms = ms(present_start);
-        let retire_start = Instant::now();
-        self.timelines.retire(&self.gpu)?;
-        let retire_ms = ms(retire_start);
         presented?;
+        let profile = FrameProfile {
+            main_ms: plan.main_ms,
+            extract_ms: plan.extract_ms,
+            build_ms: plan.build_ms,
+            compile_ms: plan.compile_ms,
+            rhi_prepare_ms: prepare_ms,
+            acquire_ms,
+            record_ms,
+            submit_ms,
+            present_ms,
+            task_workers: tasks.current_num_threads(),
+            timeline_waits,
+            timeline_signals: submits,
+            wsi_transitions: 2 * usize::from(image.is_some()),
+            wsi_binary_pairs: usize::from(image.is_some()),
+            frames_in_flight: 1,
+            resident_upload_bytes,
+            transient_reuse_bytes: reuse.saved_bytes,
+            dynamic_upload_bytes,
+            scene_table_upload_bytes,
+            geometry_instance_visits: plan.instance_visits,
+            extracted_entities: plan.extraction.entities_visited,
+            updated_instances: plan.extraction.instances_updated,
+            acceleration_builds: slot.resources.iter().filter(|resource| {
+                matches!(resource, Physical::Clusters(_)) || matches!(resource, Physical::Acceleration(acceleration) if acceleration.needs_build && !acceleration.update)
+            }).count(),
+            acceleration_updates: slot.resources.iter().filter(|r| matches!(r, Physical::Acceleration(a) if a.needs_build && a.update)).count(),
+            ..Default::default()
+        };
+        Ok(Submitted {
+            plan,
+            slot: index,
+            output,
+            managed: self.gpu.allocator.lock().unwrap().snapshot(),
+            retire: self.timelines.targets(),
+            start: frame_start,
+            profile,
+            recordings,
+            presentation: window
+                .and_then(|_| self.surface.as_ref().map(|s| format!("{:?}", s.mode))),
+        })
+    }
+
+    fn finish_frame(&mut self, work: Submitted) -> Result<Frame> {
+        let Submitted {
+            plan,
+            slot,
+            output,
+            retire,
+            start,
+            mut profile,
+            managed,
+            recordings,
+            presentation,
+        } = work;
+        let retire_start = Instant::now();
+        self.timelines.retire(&self.gpu, &retire)?;
+        profile.retire_ms = retire_start.elapsed().as_secs_f64() * 1000.;
+        let slot = &mut self.slots[slot];
+        let recorders = &slot.recorders[..plan.steps.len()];
+        let d = &self.gpu.dev;
+        let pixels =
+            plan.graph.output_extent()[0] as usize * plan.graph.output_extent()[1] as usize * 4;
         let mut rows = vec![0; plan.steps.len()];
         for (row, step) in plan.steps.iter().enumerate() {
             rows[step.index] = row;
@@ -503,6 +1035,12 @@ impl Backend {
             let ticks =
                 pair[1].wrapping_sub(pair[0]) & (u64::MAX >> (64 - self.gpu.timestamp_bits));
             passes.push(PassReport {
+                raster: if matches!(plan.graph.passes[step.index].op, Op::Draw { .. }) {
+                    r.raster.as_ref().map(|q| q.counts()).transpose()?
+                } else {
+                    None
+                },
+                phase: plan.graph.passes[step.index].phase,
                 queue: plan.graph.passes[step.index].queue,
                 name: plan.graph.passes[step.index].name.clone(),
                 parents: step.parents.iter().map(|&i| rows[i]).collect(),
@@ -522,7 +1060,7 @@ impl Backend {
                 ref labels,
             } = pass.op
             {
-                let Physical::Buffer(b) = &mut self.resources[buffer.0] else {
+                let Physical::Buffer(b) = &mut slot.resources[buffer.0] else {
                     unreachable!()
                 };
                 b.mapped(|data| {
@@ -534,27 +1072,39 @@ impl Backend {
                 })?;
             }
         }
-        let mut memory = FrameMemory::default();
-        for allocation in
-            std::iter::once(&self.heap._buffer.allocation).chain(self.resources.iter().map(|r| {
-                match r {
-                    Physical::Buffer(b) => &b.allocation,
-                    Physical::Image(i, ..) => &i.allocation,
-                }
-            }))
-        {
+        let mut memory = FrameMemory {
+            managed,
+            ..Default::default()
+        };
+        let mut account = |allocation: &AllocationInfo| {
             if allocation.device_local {
                 memory.device_local_bytes += allocation.allocated_bytes;
             } else {
                 memory.nonlocal_bytes += allocation.allocated_bytes;
             }
+        };
+        account(&slot.heap._buffer.allocation);
+        let mut shared = std::collections::BTreeSet::new();
+        for r in &slot.resources {
+            match r {
+                Physical::Vacant => unreachable!("submitted frame contains an unbound resource"),
+                Physical::Buffer(b) => account(&b.allocation),
+                Physical::SharedBuffer(b) => {
+                    if shared.insert(b.address) {
+                        account(&b.allocation);
+                    }
+                }
+                Physical::Image(i, ..) => account(&i.allocation),
+                Physical::Clusters(a) => a.allocations().for_each(&mut account),
+                Physical::Acceleration(a) => a.allocations().for_each(&mut account),
+            }
         }
-        if let Some(r) = plan.graph.material_atlas {
-            let atlas = self.resources[r.0].buffer();
+        if let Some(r) = plan.material_atlas {
+            let atlas = slot.resources[r.0].buffer();
             memory.atlas_buffer_bytes = atlas.size;
             memory.atlas = Some(atlas.allocation.clone());
         }
-        let Physical::Buffer(buffer) = &mut self.resources[output.0] else {
+        let Physical::Buffer(buffer) = &mut slot.resources[output.0] else {
             unreachable!()
         };
         let mut events = vec![];
@@ -576,35 +1126,21 @@ impl Backend {
                 *total += n;
             }
         }
-        self.frame_number += u64::from(window.is_none() || image.is_some());
-        let profile = FrameProfile {
-            main_ms: plan.main_ms,
-            build_ms: plan.build_ms,
-            compile_ms: plan.compile_ms,
-            rhi_prepare_ms: prepare_ms,
-            acquire_ms,
-            record_ms,
-            submit_ms,
-            present_ms,
-            retire_ms,
-            rhi_ms: ms(frame_start),
-            gpu_span_ms: self.gpu.common_clock.then(|| {
-                (span[1] - span[0]) as f64 * self.gpu.limits.timestamp_period as f64 * 1e-6
-            }),
-            task_workers: tasks.current_num_threads(),
-            recording_workers: workers.len(),
-            overlapping_recordings: peak as usize,
-            physical_queues: self.gpu.queues.len(),
-            dependency_edges: plan.steps.iter().map(|s| s.parents.len()).sum(),
-            resource_barriers: plan.steps.iter().map(|s| s.barriers.len()).sum(),
-            barrier_calls: barriers[0],
-            memory_barriers: barriers[1],
-            image_barriers: barriers[2],
-            timeline_waits,
-            timeline_signals: submits,
-            wsi_transitions: 2 * usize::from(image.is_some()),
-            wsi_binary_pairs: usize::from(image.is_some()),
-        };
+        self.frame_number += u64::from(presentation.is_none() || profile.wsi_binary_pairs != 0);
+        profile.rhi_ms = start.elapsed().as_secs_f64() * 1000.;
+        profile.gpu_span_ms = self
+            .gpu
+            .common_clock
+            .then(|| (span[1] - span[0]) as f64 * self.gpu.limits.timestamp_period as f64 * 1e-6);
+        profile.recording_workers = workers.len();
+        profile.overlapping_recordings = peak as usize;
+        profile.physical_queues = self.gpu.queues.len();
+        profile.dependency_edges = plan.steps.iter().map(|s| s.parents.len()).sum();
+        profile.resource_barriers = plan.steps.iter().map(|s| s.barriers.len()).sum();
+        profile.barrier_calls = barriers[0];
+        profile.memory_barriers = barriers[1];
+        profile.image_barriers = barriers[2];
+        let submits = profile.timeline_signals;
         let first_profile = self
             .first_profile
             .get_or_insert_with(|| Arc::new(profile.clone()))
@@ -616,9 +1152,8 @@ impl Backend {
             completed: Instant::now(),
             counters,
             submissions: submits,
-            presentation: window
-                .and_then(|_| self.surface.as_ref().map(|s| format!("{:?}", s.mode))),
-            pixels: if window.is_none()
+            presentation: presentation.clone(),
+            pixels: if presentation.is_none()
                 || plan
                     .graph
                     .passes
@@ -629,7 +1164,7 @@ impl Backend {
             } else {
                 vec![]
             },
-            extent: plan.graph.extent,
+            extent: plan.graph.output_extent(),
             passes,
             gpu: self.gpu.name.clone(),
             memory,

@@ -1,0 +1,20 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#define LIGHTING_MATERIAL
+#define RESOLVE_BINDING_BYTES 44
+#include "resolve.glsl"
+#include "restir_types.glsl"
+#define RESTIR_CONFIG 9
+#include "restir_controls.glsl"
+layout(set=0,binding=8,std430) readonly buffer Light { Radiance incidentLight[]; };
+layout(binding=10,std430) readonly buffer Indirect { vec4 indirectLight[]; };
+vec3 shadeLighting(uint pixel, vec3 albedo, vec3 position, vec3 n, vec3 v, Instance obj) {
+    vec3 rgb=obj.params.w==1.0 ? albedo*4.0 : albedo*(incidentLight[pixel].color.rgb+(controls.w>0.?indirectLight[pixel].rgb:vec3(0)));
+    vec3 x=rgb*controls.x;
+#ifdef HDR_OUTPUT
+    return x;
+#else
+    return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0);
+#endif
+}

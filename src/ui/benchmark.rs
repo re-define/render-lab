@@ -61,28 +61,10 @@ impl Benchmark {
         let mut phases = BTreeMap::new();
         for p in &f.passes {
             self.pass_ms.entry(p.name.clone()).or_default().push(p.ms);
-            let phase = if p.name.contains("Hi-Z mip") || p.name.ends_with("Hi-Z depth") {
-                "pyramids"
-            } else if p.name.contains("mesh visibility") {
-                "raster"
-            } else if p.name.starts_with("Shade ") {
-                "shade"
-            } else if ["Classify", "Allocate", "Scatter"]
-                .iter()
-                .any(|s| p.name.starts_with(s))
-            {
-                "bins"
-            } else if ["GPU ", "Main Hi-Z", "Post Hi-Z"]
-                .iter()
-                .any(|s| p.name.starts_with(s))
-            {
-                "culling"
-            } else {
-                "copies_counters_present"
-            };
-            *phases.entry(phase).or_insert(0.) += p.ms;
+            *phases.entry(p.phase).or_insert(0.) += p.ms;
         }
         for (phase, ms) in phases {
+            let phase = phase.key();
             self.series
                 .entry(format!("gpu_{phase}_sum_ms"))
                 .or_default()
@@ -98,7 +80,7 @@ impl Benchmark {
                 .map(|(k, v)| (k, summarize(v)))
                 .collect::<BTreeMap<_, _>>()
         };
-        let rows=f.passes.iter().map(|p|json!({"name":p.name,"queue":format!("{:?}",p.queue),"parents":p.parents,"resource_barriers":p.barriers.len()})).collect::<Vec<_>>();
+        let rows=f.passes.iter().map(|p|json!({"name":p.name,"phase":p.phase.key(),"queue":format!("{:?}",p.queue),"parents":p.parents,"resource_barriers":p.barriers.len()})).collect::<Vec<_>>();
         println!(
             "BENCHMARK {}",
             json!({"gpu":f.gpu,"extent":f.extent,"mode":f.presentation,"profile":if cfg!(debug_assertions){"dev"}else{"release"},"warmup":WARMUP,"samples":self.target,

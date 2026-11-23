@@ -12,6 +12,7 @@ use std::{
 };
 mod bvh;
 mod dragons;
+mod foliage;
 mod gpu;
 pub use dragons::scene;
 pub const VISUALIZE: &str = "lab.cluster_lod.visualize";
@@ -22,6 +23,10 @@ pub const LOD_COLORS: [u32; 10] = [
     0xf9eed5,
 ];
 pub const SETTING: &str = "lab.cluster_lod.pixel_error";
+pub(super) const SNAPSHOT: crate::render::SnapshotComponent = crate::render::SnapshotComponent {
+    related_settings: &[VISUALIZE],
+    ..crate::render::SnapshotComponent::setting(SETTING)
+};
 
 pub fn prepare(world: &mut World) -> Result<()> {
     let mut staged = world.clone();
@@ -38,6 +43,7 @@ pub fn prepare(world: &mut World) -> Result<()> {
         if mesh.indices.is_empty() {
             continue;
         }
+        let source_faces = mesh.indices.len() / 3;
         let config = cl::default_config(64)?;
         let groups = cl::build(
             config,
@@ -94,7 +100,16 @@ pub fn prepare(world: &mut World) -> Result<()> {
             }
             nodes.push(node);
         }
-        let fixed = bvh::repaired(&nodes, &clusters)?;
+        if let Some(plant) = e
+            .plant
+            .as_mut()
+            .filter(|plant| plant.voxel_cell_size.is_some())
+        {
+            let expansion = foliage::preserve_area(mesh, source_faces, &mut nodes, &clusters)?;
+            // Any additional rest-space offset can move by at most twice its length when posed.
+            Arc::make_mut(plant).displacement_bound += 2. * expansion;
+        }
+        let fixed = bvh::repaired(&nodes, &clusters, None)?;
         for (node, fixed) in nodes.iter_mut().zip(fixed) {
             node.center = fixed.center;
             node.radius = fixed.radius;
@@ -103,11 +118,7 @@ pub fn prepare(world: &mut World) -> Result<()> {
         e.meshlets = Some(Arc::new(clusters));
         e.hierarchy = Some(Arc::new(nodes));
     }
-    if !staged
-        .entities
-        .values()
-        .any(|e| e.components.contains_key(SETTING))
-    {
+    if staged.first_raw_component(SETTING).is_none() {
         let mut settings = Entity {
             name: "Cluster LOD".into(),
             ..Default::default()
@@ -160,10 +171,8 @@ pub fn terrain() -> Result<World> {
     world.spawn(Entity {
         name: "Terrain".into(),
         instance: Some(Instance {
-            mesh,
-            material: Some(material),
-            legacy_shading: None,
             outline: true,
+            ..Instance::new(mesh, Some(material))
         }),
         ..Default::default()
     });
@@ -171,28 +180,37 @@ pub fn terrain() -> Result<World> {
     Ok(world)
 }
 pub struct ClusterLod {
-    cache: Mutex<BTreeMap<Id, Arc<bvh::Packed>>>,
+    cache: Mutex<BTreeMap<MeshId, Arc<bvh::Packed>>>,
     history: u64,
+    full_upload: bool,
 }
 impl Default for ClusterLod {
     fn default() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self {
             cache: Mutex::default(),
+            full_upload: false,
             history: NEXT.fetch_add(1, Ordering::Relaxed),
         }
     }
 }
+impl ClusterLod {
+    /// Full CPU packing baseline for image and upload comparisons.
+    pub fn full_upload_reference() -> Self {
+        Self {
+            full_upload: true,
+            ..Default::default()
+        }
+    }
+}
 impl GeometrySelection for ClusterLod {
-    fn triangles(&self, e: &Entity, model: Mat4, s: &Snapshot) -> Result<Vec<u32>> {
+    fn triangles(&self, e: &MeshAsset, model: Mat4, s: &Snapshot) -> Result<Vec<u32>> {
         let (Some(groups), Some(clusters)) = (&e.hierarchy, &e.meshlets) else {
             return AllTriangles.triangles(e, model, s);
         };
         let threshold = s
-            .world
-            .entities
-            .values()
-            .find_map(|e| e.components.get(SETTING))
+            .scene
+            .setting(SETTING)
             .and_then(|x| x.as_f64())
             .unwrap_or(1.) as f32;
         ensure!(

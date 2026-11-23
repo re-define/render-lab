@@ -7,7 +7,7 @@ pub(super) struct Timelines {
     gpu: Arc<Gpu>,
     sems: Vec<vk::Semaphore>,
     values: Vec<u64>,
-    histories: HashMap<u64, (usize, u64)>,
+    histories: HashMap<u64, Vec<u64>>,
 }
 impl Timelines {
     pub fn new(g: &Arc<Gpu>) -> Result<Self> {
@@ -36,20 +36,11 @@ impl Timelines {
         recorders: &[Recorder],
         image: Option<present::Acquired>,
     ) -> Result<(usize, usize)> {
-        let queue = |step: &Step| match p.graph.passes[step.index].queue {
-            Queue::Graphics => 0,
-            Queue::Compute => 1.min(g.queues.len() - 1),
-            Queue::Transfer => {
-                if g.queues.len() > 2 {
-                    2
-                } else {
-                    0
-                }
-            }
-        };
-        let mut previous = std::mem::take(&mut self.histories);
+        let queue = |step: &Step| physical_queue(p.graph.passes[step.index].queue, g.queues.len());
+        let previous = std::mem::take(&mut self.histories);
+        let uses = &p.pass_uses;
         let mut signals = vec![(0, 0u64); p.steps.len()];
-        let mut covered = vec![vec![0u64; g.queues.len()]; g.queues.len()];
+        let mut covered = vec![vec![(0u64, Stage::empty()); g.queues.len()]; g.queues.len()];
         let mut start = 0;
         let mut submits = 0;
         let mut timeline_waits = 0;
@@ -61,50 +52,78 @@ impl Timelines {
             }
             self.values[q] += 1;
             let value = self.values[q];
-            let mut needed = vec![0u64; g.queues.len()];
+            let mut needed = vec![(0u64, Stage::empty()); g.queues.len()];
+            let mut require = |src: usize, value: u64, stage: Stage| {
+                if value != 0 {
+                    needed[src].0 = needed[src].0.max(value);
+                    needed[src].1 |= stage;
+                }
+            };
             let mut present = false;
             for step in &p.steps[start..end] {
                 for &parent in &step.parents {
                     let (src, v) = signals[parent];
                     if src != q {
-                        needed[src] = needed[src].max(v);
+                        let pass = &p.graph.passes[step.index];
+                        let stages = uses[step.index]
+                            .iter()
+                            .filter(|(r, _)| uses[parent].iter().any(|(written, _)| written == r))
+                            .fold(Stage::empty(), |stages, (_, a)| stages | wait_stage(*a));
+                        require(
+                            src,
+                            v,
+                            if stages.is_empty() || pass.after.contains(&parent) {
+                                Stage::ALL_COMMANDS
+                            } else {
+                                stages
+                            },
+                        );
                     }
                 }
-                for (r, a) in p.graph.uses(&p.graph.passes[step.index].op) {
+                for &(r, a) in &uses[step.index] {
                     if let Some(key) = p.graph.histories.get(&r) {
-                        if let Some(&(src, v)) = previous.get(key)
-                            && src != q
-                        {
-                            needed[src] = needed[src].max(v);
+                        if let Some(prior) = previous.get(key) {
+                            for (src, &point) in prior.iter().enumerate() {
+                                require(src, point, wait_stage(a));
+                            }
                         }
-                        if a.writes() {
-                            previous.remove(key);
-                            self.histories.insert(*key, (q, value));
-                        }
+                        self.histories
+                            .entry(*key)
+                            .or_insert_with(|| vec![0; g.queues.len()])[q] = value;
                     }
                 }
                 signals[step.index] = (q, value);
                 present |= matches!(p.graph.passes[step.index].op, Op::Present(_));
             }
-            let sem = |s, v| {
+            let sem = |s, v, stage| {
                 vk::SemaphoreSubmitInfo::builder()
                     .semaphore(s)
                     .value(v)
-                    .stage_mask(Stage::ALL_COMMANDS)
+                    .stage_mask(stage)
                     .build()
             };
             let mut waits = vec![];
-            for (src, &v) in needed.iter().enumerate() {
-                if v > covered[q][src] {
-                    waits.push(sem(self.sems[src], v));
-                    covered[q][src] = v;
+            for (src, &(v, stages)) in needed.iter().enumerate() {
+                let (done, mask) = &mut covered[q][src];
+                if v == 0
+                    || (*done >= v && (mask.contains(stages) || mask.contains(Stage::ALL_COMMANDS)))
+                {
+                    continue;
+                }
+                waits.push(sem(self.sems[src], v, stages));
+                if v > *done {
+                    *mask = stages;
+                    *done = v;
+                } else if v == *done {
+                    *mask |= stages;
                 }
             }
             timeline_waits += waits.len();
-            let mut signal = vec![sem(self.sems[q], value)];
+            let mut signal = vec![sem(self.sems[q], value, Stage::ALL_COMMANDS)];
             if let Some(img) = image.filter(|_| present) {
-                waits.push(sem(img.available, 0));
-                signal.push(sem(img.finished, 0));
+                // The acquire must also order the initial layout transition.
+                waits.push(sem(img.available, 0, Stage::ALL_COMMANDS));
+                signal.push(sem(img.finished, 0, Stage::ALL_COMMANDS));
             }
             let cmds = recorders[start..end]
                 .iter()
@@ -128,16 +147,35 @@ impl Timelines {
         }
         Ok((submits, timeline_waits))
     }
-    pub fn retire(&self, g: &Gpu) -> Result<()> {
+    pub fn targets(&self) -> Vec<u64> {
+        self.values.clone()
+    }
+    pub fn retire(&self, g: &Gpu, values: &[u64]) -> Result<()> {
         unsafe {
             g.dev.wait_semaphores(
                 &vk::SemaphoreWaitInfo::builder()
                     .semaphores(&self.sems)
-                    .values(&self.values),
+                    .values(values),
                 u64::MAX,
             )?;
         }
         Ok(())
+    }
+}
+pub(super) fn physical_queue(queue: Queue, count: usize) -> usize {
+    match queue {
+        Queue::Graphics => 0,
+        Queue::Compute => 1.min(count - 1),
+        Queue::Transfer if count > 2 => 2,
+        Queue::Transfer => 0,
+    }
+}
+fn wait_stage(access: Access) -> Stage {
+    let stage = record::scope(access).0;
+    if stage == Stage::HOST {
+        Stage::ALL_COMMANDS
+    } else {
+        stage
     }
 }
 impl Drop for Timelines {

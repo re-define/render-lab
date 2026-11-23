@@ -1,0 +1,45 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#define POSITION_MATERIAL
+#include "resolve.glsl"
+#include "dissolve_field.glsl"
+vec3 shadePosition(vec3 base,vec3 position,vec3 N,vec3 V,vec2 uv,Instance obj){
+    vec3 L=normalize(vec3(-.37,.82,.44));
+    float diffuse=max(0.,dot(N,L));
+#ifdef WATER
+    float fresnel=.055+.71*pow(1.-max(dot(N,V),0.),3.);
+    vec3 R=reflect(-V,N);
+    vec3 sky=mix(vec3(.23,.44,.49),vec3(.68,.86,.95),smoothstep(-.12,.78,R.y));
+    float ribbons=pow(.5+.5*sin(uv.y*125.+position.z*4.+5.*N.x),7.);
+    float foam=smoothstep(.14,.92,uv.x)*(.73+.27*ribbons);
+    vec3 liquid=mix(base*(.54+.73*diffuse),sky,fresnel);
+    liquid+=vec3(.77,.90,.94)*(.46*pow(max(dot(reflect(-L,N),V),0.),42.)+.028*ribbons);
+    return mix(liquid,vec3(.78,.93,.92),foam);
+#elif defined(STONE)
+    float grain=mineralNoise(position*17.);
+    float mottling=mineralNoise(position*2.1);
+    vec2 tile=position.xz/vec2(1.12,.89);
+    tile.x+=.5*mod(floor(tile.y),2.);
+    vec2 edge=abs(fract(tile)-.5);
+    float seam=smoothstep(.468,.495,max(edge.x,edge.y))*smoothstep(.8,.97,N.y);
+    vec3 stone=base*(.49+.66*diffuse)*(.80+.24*mottling+.105*grain)*(1.-.28*seam);
+    vec3 haze=pow(vec3(32.,44.,56.)/255.,vec3(2.2));
+    return mix(stone,haze,smoothstep(10.,21.,length(position.xz)));
+#else
+    vec3 local=(inverse(obj.model)*vec4(position,1.)).xyz;
+    float band=.5+.5*sin(local.y*12.+local.x*3.+2.5*mineralNoise(local*2.3));
+    float vein=smoothstep(.92,.99,band);
+    float grain=mineralNoise(local*21.);
+    vec3 rock=base*(.62+.28*band+.18*grain)+vec3(.12,.22,.20)*vein;
+    rock=mix(rock,vec3(.36,.47,.43)*(.78+.32*grain),uv.x*.80);
+    rock*=.40+.86*diffuse;
+    rock+=vec3(.45,.68,.69)*(.36*pow(max(dot(normalize(L+V),N),0.),18.)+.13*pow(1.-max(dot(N,V),0.),3.));
+#ifdef DISSOLVE
+    float distanceToEdge=erosion(local)-obj.params.w;
+    float edge=1.-smoothstep(.003,.058,distanceToEdge);
+    rock=mix(rock,mix(vec3(.95,.21,.024),vec3(1.,.86,.39),1.-smoothstep(0.,.015,distanceToEdge)),edge);
+#endif
+    return rock;
+#endif
+}

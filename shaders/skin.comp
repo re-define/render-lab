@@ -1,0 +1,35 @@
+#version 460
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std430) readonly buffer BindVertices { vec4 inputVertices[]; };
+struct Influence { uvec4 joints; vec4 weights; };
+layout(set=0,binding=1,std430) readonly buffer Weights { Influence influences[]; };
+layout(set=0,binding=2,std430) readonly buffer Pose { mat4 fallback; mat4 joints[]; };
+layout(set=0,binding=3,std430) writeonly buffer Vertices { vec4 skinned[]; };
+layout(push_constant) uniform Params { layout(offset=16) uint count; } p;
+
+void main() {
+    uint i=(gl_WorkGroupID.x+32768u*gl_WorkGroupID.y)*64u+gl_LocalInvocationID.x;
+    if(i>=p.count) return;
+    Influence skin=influences[i];
+    mat4 blend=mat4(0);
+    float total=0.0;
+    for(int j=0;j<4;++j){
+        if(skin.weights[j]!=0.0){
+            blend+=joints[skin.joints[j]]*skin.weights[j];
+            total+=skin.weights[j];
+        }
+    }
+    mat4 transform=total>0.0 ? blend*(1.0/total) : fallback;
+    vec4 position=inputVertices[2u*i];
+    vec3 posed=(transform*vec4(position.xyz,1.0)).xyz;
+#ifdef POSITION_ONLY
+    skinned[i]=vec4(posed,1.0);
+#else
+    vec4 normal=inputVertices[2u*i+1u];
+    vec3 n=transpose(inverse(mat3(transform)))*normal.xyz;
+    float scale=inversesqrt(dot(n,n));
+    n=scale>0.0 && !isinf(scale) ? n*scale : vec3(0);
+    skinned[2u*i]=vec4(posed,position.w);
+    skinned[2u*i+1u]=vec4(n,normal.w);
+#endif
+}

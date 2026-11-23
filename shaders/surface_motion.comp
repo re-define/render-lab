@@ -1,0 +1,104 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#include "surface.glsl"
+#include "motion.glsl"
+
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=2) uniform texture2D depthImage;
+layout(set=0,binding=5,std430) writeonly buffer Motion { MotionSample samples[]; };
+layout(set=0,binding=6,std430) readonly buffer MotionView {
+    mat4 inverseVP;
+    mat4 previousVP;
+    vec2 jitter;
+    uint hasPreviousView;
+    uint sameProjection;
+};
+struct PreviousSurface { mat4 transform; uvec4 info; };
+layout(set=0,binding=7,std430) readonly buffer PreviousObjects { PreviousSurface objects[]; };
+layout(set=0,binding=8,std430) readonly buffer PreviousAddresses { uvec2 previousAddr[]; };
+layout(buffer_reference,std430,buffer_reference_align=16) readonly buffer Positions { vec4 v[]; };
+
+const uint RIGID = 1u;
+const uint SKINNED = 2u;
+const uint WIND = 3u;
+const uint UNAVAILABLE = 4u;
+
+void main() {
+    uvec2 xy = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(xy,screen))) return;
+    uint i = xy.y * screen.x + xy.x;
+    vec2 size = vec2(screen);
+    vec2 center = vec2(xy) + 0.5;
+    vec2 ndc = center * 2.0 / size - 1.0;
+    uvec2 id = visibilityAt(xy);
+    float depth = texelFetch(depthImage,ivec2(xy),0).x;
+    vec4 world = inverseVP * vec4(ndc,depth,1.0);
+    MotionSample sampleValue = MotionSample(vec2(0.0), -1.0, 0u, 0u, 0u);
+    if (id.x != 0u) {
+        Item item = items[id.x-1u];
+        PreviousSurface prior = objects[id.x-1u];
+        uint type = SURFACE_ORDINARY;
+        if (item.refs.w != 0u) {
+            Cluster cluster = Meshlets(addr[item.refs.z]).v[id.y>>6];
+            type = (cluster.meta.w & VOXEL_CLUSTER) != 0u ? SURFACE_VOXEL : SURFACE_CLUSTER_TRIANGLE;
+        }
+        sampleValue.currentTag = prior.info.x | type;
+        if ((item.obj.tex.w & TEMPORAL_REACTIVE) != 0u) sampleValue.flags |= MOTION_REACTIVE;
+        uint kind = prior.info.z;
+        if (prior.info.y == 0u || kind == UNAVAILABLE) {
+            samples[i] = sampleValue;
+            return;
+        }
+        sampleValue.previousTag = prior.info.y | type;
+        if (kind == 0u && sameProjection != 0u) {
+            // Exactly zero even on distant static surfaces and across jitter phases.
+            sampleValue.previousDepth = depth;
+            samples[i] = sampleValue;
+            return;
+        } else if (kind == RIGID) {
+            world = prior.transform * world;
+            sampleValue.flags |= MOTION_TRACKED;
+        } else if (kind == SKINNED || kind == WIND) {
+            mat3x4 clip;
+            mat3 positions, normals;
+            mat3x2 uv;
+            uint mask;
+            surfaceTriangle(item,id.y,xy,clip,positions,normals,uv,mask);
+            vec3 b = barycentric(clip,ndc);
+            if (kind == WIND) {
+                item.obj.model = prior.transform;
+                item.obj.tex.w |= WIND_DEFORM;
+                surfaceTriangleWithPalette(item,id.y,xy,previousAddr[prior.info.w],clip,positions,normals,uv,mask);
+                sampleValue.flags |= MOTION_WIND;
+            } else {
+                Words indices = Words(addr[item.refs.y]);
+                Positions previous = Positions(previousAddr[prior.info.w]);
+                for (uint c=0u; c<3u; ++c){
+                    vec4 previousVertex=previous.v[indices.v[4u*id.y+c]];
+                    if(previousVertex.w==0.0){ samples[i]=sampleValue; return; }
+                    positions[c]=previousVertex.xyz;
+                }
+            }
+            world = vec4(positions * b,1.0);
+            sampleValue.flags |= MOTION_TRACKED;
+        }
+    } else {
+        if (hasPreviousView == 0u || sameProjection != 0u) {
+            sampleValue.previousDepth = hasPreviousView != 0u ? 1.0 : -1.0;
+            samples[i] = sampleValue;
+            return;
+        }
+        // A sky sample follows camera rotation around the eye.
+        world = vec4(world.xyz - eye.xyz * world.w,0.0);
+    }
+    vec4 old = previousVP * world;
+    if (old.w > 0.0 && !any(isinf(old)) && !any(isnan(old))) {
+        float z = id.x == 0u ? 1.0 : old.z/old.w;
+        if (z >= 0.0 && z <= 1.000001) {
+            sampleValue.offset = clamp((old.xy/old.w * 0.5 + 0.5) * size - center + jitter,-size,size);
+            sampleValue.previousDepth = min(z,1.0);
+        }
+    }
+    samples[i] = sampleValue;
+}

@@ -1,0 +1,3 @@
+asset,gpu,extent,mode,warmup_frames,measured_frames,median_gpu_ms,p95_gpu_ms,p95_raster_ms,potential_clusters,device_local_bytes
+before,NVIDIA GeForce RTX 5070,816x559,MAILBOX,60,40,4.280736,4.607968,0.8007679999999998,1762643,165326288
+after,NVIDIA GeForce RTX 5070,816x559,MAILBOX,60,40,4.757344,4.938368,1.293056,5440199,326910960

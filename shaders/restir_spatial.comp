@@ -1,0 +1,30 @@
+#version 460
+#include "lighting_scene.glsl"
+#include "restir_types.glsl"
+#define RESTIR_CONFIG 2
+#define RESTIR_HISTORY 3
+#include "restir_controls.glsl"
+#include "restir_history.glsl"
+#include "restir_lights.glsl"
+layout(set=0,binding=0,std430) readonly buffer Current { Surface surfaces[]; };
+layout(set=0,binding=4,std430) readonly buffer Input { Reservoir initial[]; };
+layout(set=0,binding=5,std430) writeonly buffer Output { Reservoir spatial[]; };
+layout(local_size_x=8,local_size_y=8) in;
+void main() {
+    uvec2 xy=gl_GlobalInvocationID.xy;
+    if(any(greaterThanEqual(xy,screenSize))) return;
+    uint i=indexAt(xy), seed=hash(i+hash(frame.x+91033u));
+    Surface surface=surfaces[i];
+    Reservoir r=initial[i];
+    if(surface.id!=0u && options.y!=0u){
+        float angle=TAU*random(seed);
+        for(int j=0;j<5;++j){
+            ivec2 p=ivec2(xy)+ivec2(round(12.0*disk(j,5,angle)));
+            if(!inScreen(p)) continue;
+            uint neighbor=indexAt(uvec2(p));
+            if(!compatible(surface,surfaces[neighbor],0.08+0.03*surface.point.w)) continue;
+            reuse(r,initial[neighbor],surface,options.z*6u,seed);
+        }
+    }
+    spatial[i]=r;
+}

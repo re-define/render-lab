@@ -1,0 +1,27 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#include "surface.glsl"
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=2,std430) buffer Count { uint totals[3]; };
+shared uint groupCounts[3];
+void main() {
+    uint lane=gl_LocalInvocationIndex;
+    if(lane<3u) groupCounts[lane]=0u;
+    barrier();
+    uvec2 xy=gl_GlobalInvocationID.xy;
+    if(all(lessThan(xy,screen))) {
+        uvec2 id=visibilityAt(xy);
+        if(id.x!=0u) {
+            Item item=items[id.x-1u];
+            uint category=0u;
+            if(item.refs.w!=0u) {
+                Cluster c=Meshlets(addr[item.refs.z]).v[id.y>>6u];
+                category=(c.meta.w&VOXEL_CLUSTER)!=0u?2u:1u;
+            }
+            atomicAdd(groupCounts[category],1u);
+        }
+    }
+    barrier();
+    if(lane<3u && groupCounts[lane]!=0u) atomicAdd(totals[lane],groupCounts[lane]);
+}

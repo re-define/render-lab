@@ -1,0 +1,57 @@
+#version 460
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0,std430) readonly buffer Channel {
+    uvec4 dimensions; // lanes, ages, stair count, previous-position mode
+    vec4 bed;         // first Z, tread run, riser height, tailrace floor
+    vec4 timing;      // playback seconds, rewind seconds, maximum parcel age
+    mat4 model;
+};
+layout(set=0,binding=1,std430) writeonly buffer Parcels { vec4 parcels[]; };
+const float tau=6.28318530718;
+
+float floorHeight(float z) {
+    float level=clamp(floor((z-bed.x)/bed.y),0.,float(dimensions.z));
+    return bed.w+(float(dimensions.z)-level)*bed.z;
+}
+void main() {
+    uvec2 cell=gl_GlobalInvocationID.xy;
+    if(any(greaterThanEqual(cell,dimensions.xy))) return;
+    float lane=2.*float(cell.x)/float(dimensions.x-1u)-1.;
+    float age=timing.z*float(cell.y)/float(dimensions.y-1u);
+    // Wave phases are periodic across the CPU clock's 256-second wrap.
+    float emitted=(timing.x-age)*tau/256.;
+    float pulse=sin(emitted*77.+lane*5.)+0.46*sin(emitted*189.-lane*9.3);
+    float finish=max(0.,age-timing.y);
+    float z=bed.x-0.105, y=floorHeight(z)+0.085, vy=0.;
+    float speed=1.98+0.045*pulse+0.08*(1.-lane*lane);
+    float foam=0., impactAge=10.;
+    const float stepTime=1./90.;
+    int steps=int(ceil(finish/stepTime));
+    for(int i=0;i<steps;++i){
+        float dt=min(stepTime,finish-float(i)*stepTime);
+        z+=speed*dt;
+        y+=(vy-0.5*9.81*dt)*dt;
+        vy-=9.81*dt;
+        float h=floorHeight(z)+0.065;
+        if(y<=h){
+            if(vy < -1.5){foam=min(1.,-vy*0.32);impactAge=0.;}
+            y=h;
+            vy=0.;
+        }
+        impactAge+=dt;
+    }
+    foam*=exp(-impactAge*3.8);
+    float tail=smoothstep(bed.x+float(dimensions.z)*bed.y,bed.x+float(dimensions.z)*bed.y+2.,z);
+    float pool=smoothstep(bed.x+float(dimensions.z)*bed.y+0.57,timing.w-0.5,z);
+    float x=lane*(1.05+0.31*tail+0.048*sin(z*3.+lane*4.));
+    x+=0.042*sin(emitted*129.+z*1.6+lane*7.)*(1.-0.55*abs(lane));
+    float streak=0.5+0.5*sin(lane*31.+pulse*2.+sin(z*3.-lane*11.));
+    y+=0.022*pulse+0.017*sin(lane*28.+emitted*173.)+foam*(0.025+0.052*streak);
+    // Spread into the receiving channel; its outlet fixes the terminal section.
+    x=mix(x,lane*1.64,pool);
+    z=mix(z,bed.x-0.105+(timing.w-bed.x+0.105)*finish/timing.z,pool);
+    y=mix(y,bed.w+0.07+0.009*sin(emitted*141.+lane*9.),pool);
+    vec3 pos=vec3(x,y,z);
+    parcels[cell.y*dimensions.x+cell.x]= dimensions.w!=0u
+        ? model*vec4(pos,1.) : vec4(pos,foam*(0.25+0.75*streak));
+}

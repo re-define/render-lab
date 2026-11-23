@@ -1,0 +1,36 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#define LIGHTING_MATERIAL
+#ifndef LDR_OUTPUT
+#define HDR_OUTPUT
+#endif
+#define RESOLVE_BINDING_BYTES 52
+#include "resolve.glsl"
+#include "restir_types.glsl"
+#define IBL_TABLES 8
+#define IBL_CONFIG 9
+#include "ibl.glsl"
+#include "ibl_brdf.glsl"
+layout(set=0,binding=10,std430) readonly buffer Direct { Radiance direct[]; };
+layout(set=0,binding=11,std430) readonly buffer PointLightControls {
+    vec4 directReprojection;
+    uvec4 directOptions;
+    uvec4 directViewport;
+    vec4 directControls;
+};
+
+layout(binding=12,std430) readonly buffer Indirect { vec4 indirectLight[]; };
+vec3 shadeLighting(uint pixel, vec3 albedo, vec3 position, vec3 n, vec3 v, Instance obj) {
+    if(obj.params.w==1.0) return albedo*4.0;
+    vec3 bounce=directControls.w>0. ? indirectLight[pixel].rgb*directControls.x : vec3(0);
+    vec3 lighting=directControls.x>0.0 ? direct[pixel].color.rgb*directControls.x : vec3(0);
+#ifdef CEL
+    float energy=luma(lighting);
+    float band=energy<0.18 ? 0.07 : energy<0.65 ? 0.40 : 0.84;
+    lighting *= band/max(0.04,energy);
+    return albedo*(lighting+bounce)+(controls.x>0.0 ? environmentLighting(albedo,n,v,vec2(0.0,0.85))*controls.x : vec3(0));
+#else
+    return albedo*(1.0-obj.params.x)*(lighting+bounce)+(controls.x>0.0 ? environmentLighting(albedo,n,v,obj.params.xy)*controls.x : vec3(0));
+#endif
+}

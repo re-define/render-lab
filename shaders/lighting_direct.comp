@@ -1,0 +1,109 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#include "surface.glsl"
+#define LIGHTING_CONFIG 5
+#define LIGHTING_NODES 2
+#define LIGHTING_TRIANGLES 6
+#include "lighting_scene.glsl"
+#include "lighting_rays.glsl"
+layout(set=0,binding=7,std430) writeonly buffer DirectLight { LightingPixel lightPixels[]; };
+layout(set=0,binding=8) uniform texture2D shadowDepth;
+layout(local_size_x=8,local_size_y=8) in;
+
+float linearDepth(float d) {
+    return lens.x * lens.y / (lens.y - (lens.y-lens.x)*d);
+}
+float depthAt(vec2 uv, vec3 receiver, vec3 n, float depth, out float expected) {
+    expected=depth;
+    if(any(lessThan(uv,vec2(0))) || any(greaterThanEqual(uv,vec2(1)))) return 1.0;
+    vec2 extent=vec2(textureSize(shadowDepth,0));
+    ivec2 xy=ivec2(uv*extent);
+    vec2 center=(vec2(xy)+0.5)*2.0/extent-1.0;
+    vec3 ray=lightForward.xyz+lens.z*(center.x*lightRight.xyz-center.y*lightUp.xyz);
+    float denominator=dot(ray,n);
+    // Compare on the tangent plane at each sampled texel, especially on
+    // sloped receivers where the center depth causes self-shadowing.
+    if(denominator<-0.015){
+        float z=dot(receiver-lightPosition.xyz,n)/denominator;
+        if(z>0.0) expected=z;
+    }
+    return texelFetch(shadowDepth,xy,0).x;
+}
+float compareDepth(vec2 uv, vec3 receiver, vec3 n, float depth) {
+    float expected;
+    float sampled=depthAt(uv,receiver,n,depth,expected);
+    return step(expected,linearDepth(sampled));
+}
+float shadowMap(vec3 p, vec3 n) {
+    vec3 biased=p+n*lens.w;
+    vec4 projected = lightVP * vec4(biased,1.0);
+    vec3 ndc = projected.xyz / projected.w;
+    vec2 uv = ndc.xy*0.5+0.5;
+    if(projected.w<=0.0 || ndc.z<=0.0 || ndc.z>=1.0) return 1.0;
+    float receiver = projected.w;
+    if(modes.z==0u || (modes.z==2u && lightRight.w==0.0))
+        return compareDepth(uv,biased,n,receiver);
+    if(modes.z==1u){
+        float sum = 0.0;
+        for(int y=-1; y<=1; ++y) for(int x=-1; x<=1; ++x)
+            sum += compareDepth(uv+vec2(x,y)/vec2(textureSize(shadowDepth,0)),biased,n,receiver);
+        return sum/9.0;
+    }
+    // A perspective light projects an area emitter's world half-width to UV.
+    // The search plane is in front of the receiver. The final kernel is
+    // proportional to the blocker/receiver separation.
+    float searchRadius = min(0.09,lightRight.w / (2.0*lens.z*receiver));
+    float blockers = 0.0, sum = 0.0;
+    for(int i=0;i<16;++i){
+        float expected;
+        float z = linearDepth(depthAt(uv + searchRadius * (i==0 ? vec2(0) : disk(i,16,0.0)),biased,n,receiver,expected));
+        if(z<expected){ sum += z; blockers += 1.0; }
+    }
+    if(blockers==0.0) return 1.0;
+    float blocker = sum/blockers;
+    float radius = min(0.12, searchRadius * max(receiver-blocker,0.0)/max(blocker,lens.x));
+    float visible = 0.0;
+    for(int i=0;i<24;++i) visible += compareDepth(uv+radius*disk(i,24,0.83),biased,n,receiver);
+    return visible/24.0;
+}
+
+void main() {
+    uvec2 xy = gl_GlobalInvocationID.xy;
+    if(any(greaterThanEqual(xy,screen))) return;
+    uint pixel = xy.y*screen.x+xy.x;
+    uvec2 vis = visibilityAt(xy);
+    if(vis.x==0u){
+        lightPixels[pixel] = LightingPixel(vec4(0),vec4(0),vec4(0));
+        return;
+    }
+    Item item = items[vis.x-1u];
+    mat3x4 clip; mat3 positions,normals; mat3x2 uv; uint mask;
+    surfaceTriangle(item,vis.y,xy,clip,positions,normals,uv,mask);
+    vec3 b = barycentric(clip,(vec2(xy)+0.5)*2.0/vec2(screen)-1.0);
+    vec3 p = positions*b, n = normals*b;
+    if(dot(n,n)<1e-10) n=cross(positions[1]-positions[0],positions[2]-positions[0]);
+    n=normalize(n);
+    if(dot(n,eye.xyz-p)<0.0) n=-n;
+    float visibility, direct;
+    if(item.obj.params.w==1.0){
+        visibility=1.0;
+        direct=2.0;
+    }else if(modes.z==3u){
+        visibility=direct=0.0;
+        int samples = lightRight.w==0.0 ? 1 : 16;
+        for(int i=0;i<samples;++i){
+            vec2 uv=vec2(float(i%4)+0.5,float(i/4)+0.5)*0.25;
+            vec3 target=lightSample(uv);
+            float v=sampleVisibility(p,n,target);
+            visibility+=v;
+            direct+=v*illumination(p,n,target);
+        }
+        visibility/=float(samples);
+        direct/=float(samples);
+    }else{
+        visibility=shadowMap(p,n);
+        direct=visibility*illumination(p,n,lightPosition.xyz);
+    }
+    lightPixels[pixel]=LightingPixel(vec4(p,(vp*vec4(p,1.0)).w),vec4(n,visibility),vec4(vec3(direct),0));
+}

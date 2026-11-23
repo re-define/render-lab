@@ -1,0 +1,52 @@
+#version 460
+#include "restir_types.glsl"
+#include "gi12_types.glsl"
+#define RESTIR_CONFIG 0
+#include "restir_controls.glsl"
+layout(binding=1,std430) readonly buffer Visible { Surface surfaces[]; };
+layout(binding=2,std430) readonly buffer Paths { Path paths[]; };
+layout(binding=3,std430) buffer World { Cell cells[]; };
+layout(binding=4,std430) readonly buffer Correspondence { uint previousPixels[]; };
+layout(binding=5,std430) readonly buffer Last { Probe last[]; };
+layout(binding=6,std430) writeonly buffer Current { Probe probes[]; };
+layout(local_size_x=64) in;
+void main() {
+    uint i=gl_GlobalInvocationID.x;
+    if(i>=probes.length()) return;
+    uint anchor=paths[i*RAYS].address.z;
+    Probe q=Probe(Surface(vec4(0),vec2(0),0.,0u),vec4(0));
+    if(anchor!=INVALID){
+        q.anchor=surfaces[anchor];
+        vec3 sum=vec3(0);
+        for(uint j=0u;j<RAYS;j++) {
+            Path p=paths[i*RAYS+j];
+            uint x=p.address.x,y=p.address.y;
+            vec3 d1=x==INVALID ? p.first.rgb : cells[x].firstDirect.rgb;
+            if(controls.w>1.5 && p.first.w>0.) {
+                vec3 d2=y==INVALID ? p.second.rgb : cells[y].secondDirect.rgb;
+                vec3 transported=d2*p.weight.rgb;
+                if(x!=INVALID) {
+                    uvec3 v=encodeLight(transported);
+                    if(atomicAdd(cells[x].pending.w,1u)<SAMPLE_CAP) {
+                        atomicAdd(cells[x].pending.x,v.x); atomicAdd(cells[x].pending.y,v.y);
+                        atomicAdd(cells[x].pending.z,v.z);
+                    }
+                    d1+=cells[x].indirect.rgb;
+                } else d1+=transported;
+            }
+            sum+=d1;
+        }
+        vec4 previous=vec4(0);
+        if(viewport.w!=0u) {
+            uint pixel=previousPixels[anchor];
+            if(pixel!=INVALID) {
+                uvec2 tile=uvec2(pixel%screenSize.x,pixel/screenSize.x)/TILE;
+                Probe old=last[tile.y*((screenSize.x+TILE-1u)/TILE)+tile.x];
+                float radius=max(0.06,q.anchor.point.w*0.035);
+                if(compatible(q.anchor,old.anchor,radius)) previous=old.light;
+            }
+        }
+        q.light=accumulate(previous,sum/float(RAYS),1.,20.);
+    }
+    probes[i]=q;
+}

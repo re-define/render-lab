@@ -1,0 +1,21 @@
+#version 460
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0,std430) readonly buffer Parcels {vec4 parcels[];};
+layout(set=0,binding=1,std430) writeonly buffer Vertices {vec4 vertices[];};
+layout(push_constant) uniform Grid {layout(offset=8) uvec2 shape;} grid;
+vec4 samplePoint(ivec2 at) {
+    ivec2 p=clamp(at,ivec2(0),ivec2(grid.shape)-1);
+    return parcels[p.y*grid.shape.x+p.x];
+}
+void main() {
+    uvec2 cell=gl_GlobalInvocationID.xy;
+    if(any(greaterThanEqual(cell,grid.shape))) return;
+    ivec2 p=ivec2(cell);
+    vec3 across=samplePoint(p+ivec2(1,0)).xyz-samplePoint(p-ivec2(1,0)).xyz;
+    vec3 along=samplePoint(p+ivec2(0,1)).xyz-samplePoint(p-ivec2(0,1)).xyz;
+    vec3 normal=normalize(cross(along,across));
+    vec4 parcel=samplePoint(p);
+    uint id=2u*(cell.y*grid.shape.x+cell.x);
+    vertices[id]=vec4(parcel.xyz,parcel.w);
+    vertices[id+1u]=vec4(normal,float(cell.x)/float(grid.shape.x-1u));
+}

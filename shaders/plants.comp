@@ -1,0 +1,71 @@
+#version 460
+#include "cluster_scene.glsl"
+layout(local_size_x=64) in;
+layout(set=0,binding=2,std430) readonly buffer Camera { View view; };
+layout(set=0,binding=3,std430) buffer JointPalettes { mat4 transforms[]; };
+#ifdef PREVIOUS
+struct PreviousPlant { mat4 model; vec4 scale; };
+layout(set=0,binding=4,std430) readonly buffer PreviousModels { PreviousPlant models[]; };
+#else
+layout(set=0,binding=4,std430) buffer Stats { uint counters[]; };
+#endif
+layout(push_constant) uniform Params {
+    layout(offset=20) uint count;
+#ifndef PREVIOUS
+    uint includeOffscreen;
+#endif
+} p;
+
+mat4 sway(vec3 pivot, float angle, float heading) {
+    float s = sin(angle), c = cos(angle), k = 1.0 - c;
+    float x = cos(heading), z = sin(heading);
+    mat3 orientation = mat3(
+        c+x*x*k, z*s, z*x*k,
+        -z*s, c, x*s,
+        x*z*k, -x*s, c+z*z*k
+    );
+    mat4 bone = mat4(orientation);
+    bone[3].xyz = pivot - orientation * pivot;
+    return bone;
+}
+
+void main() {
+    uint index = workIndex();
+    if (index >= p.count) return;
+    Instance obj = instances[index];
+    if ((obj.tex.w & PLANT) == 0u) return;
+    Asset asset = assets[obj.routing.z];
+    vec4 bounds = asset.tree.data[0].geometry;
+    // The palette is read by the currently visible geometry.
+#ifndef PREVIOUS
+    if (p.includeOffscreen == 0u)
+#endif
+        if (outsideFrustum(view.vp * obj.model, bounds)) return;
+#ifdef PREVIOUS
+    obj.model = models[index].model;
+    obj.params.z = models[index].scale.x;
+#endif
+    float wind = plantWindWeight(obj, bounds, view);
+    bool windy = wind > 0.0;
+    uint count = asset.bones.count.x;
+#ifndef PREVIOUS
+    if (windy) {
+        atomicAdd(counters[0], 1u);
+        atomicAdd(counters[1], count);
+    }
+#endif
+    vec3 origin = obj.model[3].xyz;
+    float time = view.settings.z, phase = dot(origin.xz, vec2(0.27, 0.34));
+    for (uint i = 0; i < count; ++i) {
+        Bone bone = asset.bones.data[i];
+        uint parent = floatBitsToUint(bone.pivotParent.w);
+        mat4 pose = mat4(1.0);
+        if (windy) {
+            float gust = 0.72*sin(time*1.83 + phase + 0.38*float(i))
+                       + 0.28*sin(time*3.83 + phase*0.65 + 0.63*float(i));
+            pose = sway(bone.pivotParent.xyz, wind * bone.motion.x * gust, 0.55 + phase*0.15);
+            if (parent != NONE) pose = transforms[obj.routing.w + parent] * pose;
+        }
+        transforms[obj.routing.w + i] = pose;
+    }
+}

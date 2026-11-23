@@ -1,0 +1,20 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#define POSITION_MATERIAL
+#include "resolve.glsl"
+vec3 shadePosition(vec3 base,vec3 pos,vec3 normal,vec3 V,vec2 uv,Instance obj){
+    float s=uv.x, u=uv.y;
+    float detail=1.-smoothstep(15.,95.,length(eye.xyz-pos));
+    float eddy=sin(s*.63+6.*u)+.49*cos(s*.91-9.*u);
+    float wave=sin(s*3.8+18.*u+2.2*eddy);
+    vec3 N=normalize(normal+detail*vec3(.036*wave,0.,.042*cos(s*3.1-16.*u+eddy)));
+    vec3 R=reflect(-V,N);
+    float fresnel=.06+.80*pow(1.-max(dot(N,V),0.),4.);
+    vec3 reflected=mix(vec3(.15,.24,.19),vec3(.43,.64,.76),smoothstep(.08,.53,R.y+.07*eddy));
+    float shelf=smoothstep(.59,.98,abs(u));
+    vec3 bed=mix(base*(.73+.14*eddy),vec3(.18,.235,.149),shelf*.79);
+    float glint=pow(max(0.,dot(reflect(-normalize(vec3(-.42,.73,.55)),N),V)),70.);
+    float streak=smoothstep(.70,1.,wave)*smoothstep(.79,1.38,eddy)*(.05+.22*shelf)*detail;
+    return mix(mix(bed,reflected,fresnel)+vec3(.73,.74,.59)*glint,vec3(.76,.81,.69),streak);
+}

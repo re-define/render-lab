@@ -1,0 +1,56 @@
+#version 460
+#include "restir_types.glsl"
+#define RESTIR_CONFIG 1
+#define RESTIR_HISTORY 2
+#include "restir_controls.glsl"
+#include "restir_history.glsl"
+#include "motion.glsl"
+layout(set=0,binding=0,std430) readonly buffer Current { Surface surfaces[]; };
+layout(set=0,binding=3,std430) readonly buffer Motion { MotionSample motion[]; };
+layout(set=0,binding=4,std430) writeonly buffer Correspondence { uint oldPixels[]; };
+#ifdef REPROJECTION_STATS
+layout(set=0,binding=5,std430) buffer Counts { uint counts[4]; };
+#endif
+layout(local_size_x=8,local_size_y=8) in;
+
+uint historyPixel(uvec2 xy, Surface surface, MotionSample sampleValue) {
+    if (frame.x==0u || surface.id==0u || sampleValue.previousTag==0u || sampleValue.previousDepth<0.0)
+        return 0xffffffffu;
+    // Reservoir and SVGF histories are stored at the jittered visibility samples.
+    vec2 old=vec2(xy)+sampleValue.offset+reprojection.xy;
+    if(any(lessThan(old,vec2(-0.5))) || any(greaterThanEqual(old,vec2(screenSize)-0.5))) return 0xffffffffu;
+    ivec2 base=ivec2(floor(old));
+    float best=1.0;
+    uint result=0xffffffffu;
+    for(int y=0;y<2;++y) for(int x=0;x<2;++x) {
+        ivec2 p=base+ivec2(x,y);
+        if(!inScreen(p)) continue;
+        vec2 delta=vec2(p)-old;
+        float distance2=dot(delta,delta);
+        if(distance2>=best) continue;
+        uint i=indexAt(uvec2(p));
+        if(previous[i].tag!=sampleValue.previousTag || dot(previous[i].normal,surfaceNormal(surface))<0.93) continue;
+        if(abs(previous[i].depth-sampleValue.previousDepth)>max(2e-6,0.03*(1.0-sampleValue.previousDepth))) continue;
+        best=distance2;
+        result=i;
+    }
+    return result;
+}
+void main(){
+    uvec2 xy=gl_GlobalInvocationID.xy;
+    if(any(greaterThanEqual(xy,screenSize))) return;
+    uint i=indexAt(xy);
+    MotionSample m=motion[i];
+    uint old=historyPixel(xy,surfaces[i],m);
+    oldPixels[i]=old;
+#ifdef REPROJECTION_STATS
+    if(surfaces[i].id!=0u){
+        atomicAdd(counts[0],1u);
+        if(old!=0xffffffffu) atomicAdd(counts[1],1u);
+        if((m.flags&MOTION_TRACKED)!=0u && length(m.offset)>=1.0){
+            atomicAdd(counts[2],1u);
+            if(old!=0xffffffffu) atomicAdd(counts[3],1u);
+        }
+    }
+#endif
+}

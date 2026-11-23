@@ -1,0 +1,20 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#define LIGHTING_CONFIG 1
+#include "lighting_scene.glsl"
+layout(set=0,binding=0,std430) readonly buffer Geometry { Triangle triangles[]; };
+layout(local_size_x=32) in;
+layout(triangles,max_vertices=96,max_primitives=32) out;
+layout(location=0) perprimitiveEXT flat out uvec2 id[];
+
+void main(){
+    uint base=(gl_WorkGroupID.x+32768u*gl_WorkGroupID.y)*32u;
+    uint activeCount=min(32u,uint(triangles.length())-base);
+    SetMeshOutputsEXT(3u*activeCount,activeCount);
+    uint lane=gl_LocalInvocationID.x;
+    if(lane>=activeCount) return;
+    for(uint j=0u;j<3u;++j)
+        gl_MeshVerticesEXT[3u*lane+j].gl_Position=lightVP*vec4(triangles[base+lane].point[j].xyz,1.0);
+    gl_PrimitiveTriangleIndicesEXT[lane]=uvec3(3u*lane)+uvec3(0,1,2);
+    id[lane]=uvec2(0);
+}

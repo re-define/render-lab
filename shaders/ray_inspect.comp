@@ -1,0 +1,25 @@
+#version 460
+#include "lighting_scene.glsl"
+#define LIGHTING_NODES 0
+#define LIGHTING_TRIANGLES 1
+#include "lighting_rays.glsl"
+layout(local_size_x=64) in;
+layout(binding=2,std430) readonly buffer Camera {mat4 inverseVP;vec4 eye;};
+layout(binding=3,std430) writeonly buffer Pixels {uint pixels[];};
+layout(push_constant) uniform Params {layout(offset=16)uint w;uint h;} p;
+void main(){
+    uint i=gl_GlobalInvocationID.x+32768u*64u*gl_WorkGroupID.y;
+    if(i>=p.w*p.h)return;
+    vec2 uv=(vec2(i%p.w,i/p.w)+.5)/vec2(p.w,p.h)*2.-1.;
+    vec4 farPoint=inverseVP*vec4(uv,.99,1.);
+    vec3 dir=normalize(farPoint.xyz/farPoint.w-eye.xyz);
+    Hit hit=traceScene(eye.xyz,dir,90.,false);
+    float v=.02;
+    if(hit.id!=0xffffffffu){
+        vec3 pos=eye.xyz+dir*hit.distance, n=triangleNormal(triangles[hit.id],hit.uv);
+        if(dot(n,dir)>0.)n=-n;
+        vec3 delta=vec3(-3.6,6.4,3.5)-pos;
+        v=traceScene(pos+n*.006,normalize(delta),length(delta)-.01,true).id!=0xffffffffu?.13:.85;
+    }
+    pixels[i]=packUnorm4x8(vec4(vec3(v),1));
+}

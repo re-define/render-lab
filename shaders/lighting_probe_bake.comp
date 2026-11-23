@@ -1,0 +1,35 @@
+#version 460
+#define GI_MATERIALS 4
+#define GI_TEXELS 5
+#define LIGHTING_CONFIG 0
+#define LIGHTING_NODES 1
+#define LIGHTING_TRIANGLES 2
+#include "lighting_scene.glsl"
+#include "lighting_rays.glsl"
+#include "lighting_probes.glsl"
+layout(set=0,binding=3,std430) writeonly buffer Probes { Probe probes[]; };
+layout(local_size_x=4,local_size_y=4,local_size_z=4) in;
+void main() {
+    ivec3 i=ivec3(gl_GlobalInvocationID);
+    if(any(greaterThanEqual(i,probeDims))) return;
+    uint id=probeIndex(i);
+    uint seed=hash(id+419u);
+    vec3 position=probeMin+vec3(i)*probeStep;
+    vec4 sum[6];
+    for(int face=0;face<6;++face) sum[face]=vec4(0);
+    const int count=96;
+    float shift=random(seed)*TAU;
+    for(int ray=0;ray<count;++ray){
+        float y=1.0-2.0*(float(ray)+0.5)/float(count);
+        float azimuth=float(ray)*2.39996323+shift;
+        float r=sqrt(1.0-y*y);
+        vec3 dir=vec3(cos(azimuth)*r,y,sin(azimuth)*r);
+        vec3 incoming=worldBounce(position,dir,seed);
+        for(int face=0;face<6;++face){
+            float weight=max(0.0,dot(axes[face],dir));
+            sum[face]+=vec4(incoming*weight,weight);
+        }
+    }
+    for(int face=0;face<6;++face)
+        probes[id].lobe[face]=vec4(sum[face].rgb/max(sum[face].w,0.0001),0);
+}

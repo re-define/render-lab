@@ -7,6 +7,14 @@ use std::{
     path::Path,
     sync::Arc,
 };
+mod changes;
+pub(crate) use changes::{Cursor as ChangeCursor, Write as EntityWrite};
+pub use changes::{Entities, LocalPose};
+mod components;
+mod gi;
+mod light;
+pub use gi::{GiHitMaterial, GiHitModel, GiNode, GiTexture};
+pub use light::{Light, LightKind};
 
 pub type Id = u64;
 
@@ -54,13 +62,56 @@ pub struct Edge {
     pub vertices: [u32; 2],
     pub faces: Vec<u32>,
 }
+/// Rest-space rig for procedural foliage and its optional distant representation.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(from = "PlantGeometryData")]
+pub struct PlantGeometry {
+    pub bones: Vec<PlantBone>,
+    pub displacement_bound: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voxel_cell_size: Option<f32>,
+}
+
+#[derive(Deserialize)]
+struct PlantGeometryData {
+    bones: Vec<PlantBone>,
+    displacement_bound: f32,
+    voxel_cell_size: Option<f32>,
+    // Older scenes stored a part-wide occupancy grid. Its cell size carries
+    // over as the starting scale for building local voxel candidates.
+    voxels: Option<LegacyVoxelGrid>,
+}
+
+impl From<PlantGeometryData> for PlantGeometry {
+    fn from(data: PlantGeometryData) -> Self {
+        Self {
+            bones: data.bones,
+            displacement_bound: data.displacement_bound,
+            voxel_cell_size: data
+                .voxel_cell_size
+                .or_else(|| data.voxels.map(|v| v.cell_size)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct PlantBone {
+    pub parent: Option<u16>,
+    pub pivot: [f32; 3],
+    pub bend: f32,
+}
+
+#[derive(Deserialize)]
+struct LegacyVoxelGrid {
+    cell_size: f32,
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Texture {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Material {
     #[serde(default)]
     pub shading: Shading,
@@ -68,7 +119,10 @@ pub struct Material {
     pub metallic: f32,
     pub roughness: f32,
     pub texture: Option<Id>,
+    #[serde(default, skip_serializing_if = "GiHitMaterial::is_default")]
+    pub gi_hit: GiHitMaterial,
 }
+
 impl Default for Material {
     fn default() -> Self {
         Self {
@@ -76,6 +130,7 @@ impl Default for Material {
             base_color: [0.75, 0.76, 0.8, 1.0],
             metallic: 0.0,
             roughness: 0.55,
+            gi_hit: Default::default(),
             texture: None,
         }
     }
@@ -132,12 +187,16 @@ pub struct Entity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gaussian_payload: Option<Arc<Vec<u8>>>,
     pub material: Option<Material>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub light: Option<Light>,
     pub skin: Option<Skin>,
     pub skin_binding: Option<Id>,
     pub animation: Option<Arc<Vec<Track>>>,
     pub meshlets: Option<Arc<Vec<Meshlet>>>,
     pub hierarchy: Option<Arc<Vec<ClusterNode>>>,
     pub topology: Option<Arc<Vec<Edge>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plant: Option<Arc<PlantGeometry>>,
     // Namespaced plugin components round-trip even when their systems are absent.
     pub components: BTreeMap<String, Value>,
 }
@@ -162,26 +221,31 @@ impl Default for Entity {
             texture: None,
             gaussian_payload: None,
             material: None,
+            light: None,
             skin: None,
             skin_binding: None,
             animation: None,
             meshlets: None,
             hierarchy: None,
             topology: None,
+            plant: None,
             components: BTreeMap::new(),
         }
     }
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct World {
     version: u32,
-    pub entities: BTreeMap<Id, Entity>,
+    pub entities: Entities,
+    #[serde(skip)]
+    runtime: components::RuntimeComponents,
 }
 impl Default for World {
     fn default() -> Self {
         Self {
             version: 1,
-            entities: BTreeMap::new(),
+            entities: Entities::default(),
+            runtime: Default::default(),
         }
     }
 }
@@ -192,6 +256,7 @@ impl World {
             .last_key_value()
             .map_or(1, |(k, _)| k.checked_add(1).expect("entity IDs exhausted"));
         self.entities.insert(id, e);
+        self.runtime.remove_entity(id);
         id
     }
     pub fn validate(&self) -> Result<()> {
@@ -200,8 +265,13 @@ impl World {
             "unsupported scene version {}",
             self.version
         );
-        self.transforms()?;
+        let transforms = self.transforms()?;
         for (&id, e) in &self.entities {
+            if let Some(light) = e.light {
+                light
+                    .validate(transforms[&id])
+                    .with_context(|| format!("light entity {id}"))?;
+            }
             if let Some(i) = &e.instance {
                 ensure!(
                     self.entities.get(&i.mesh).is_some_and(|e| e.mesh.is_some()),
@@ -213,6 +283,11 @@ impl World {
                         "entity {id}: missing material"
                     );
                 }
+            }
+            if let Some(m) = &e.material {
+                m.gi_hit
+                    .validate(self)
+                    .with_context(|| format!("entity {id} GI material"))?;
             }
             if let Some(t) = e.material.as_ref().and_then(|m| m.texture) {
                 ensure!(
@@ -250,6 +325,40 @@ impl World {
                     s.joints.len() == s.inverse_bind.len()
                         && s.joints.iter().all(|j| self.entities.contains_key(j)),
                     "entity {id}: invalid skin"
+                );
+            }
+            if let Some(plant) = &e.plant {
+                let mesh = e.mesh.as_ref().context("plant rig requires a mesh")?;
+                ensure!(
+                    !plant.bones.is_empty()
+                        && plant.bones.len() <= 64
+                        && (0. ..=64.).contains(&plant.displacement_bound)
+                        && plant.bones.iter().enumerate().all(|(i, b)| b
+                            .parent
+                            .is_none_or(|p| usize::from(p) < i)
+                            && b.pivot.iter().all(|v| v.is_finite())
+                            && (0. ..=0.5).contains(&b.bend)),
+                    "entity {id}: invalid plant rig"
+                );
+                ensure!(
+                    mesh.joints.len() == mesh.positions.len()
+                        && mesh
+                            .joints
+                            .iter()
+                            .zip(&mesh.weights)
+                            .all(
+                                |(j, w)| j.iter().zip(w).all(|(&joint, &weight)| weight == 0.
+                                    || ((0. ..=1.).contains(&weight)
+                                        && usize::from(joint) < plant.bones.len()))
+                                    && (w.iter().sum::<f32>() - 1.).abs() < 0.0001
+                            ),
+                    "entity {id}: invalid plant weights"
+                );
+                ensure!(
+                    plant
+                        .voxel_cell_size
+                        .is_none_or(|size| (0.001..=16.).contains(&size)),
+                    "entity {id}: invalid plant voxel size"
                 );
             }
             if let Some(s) = e.skin_binding {
@@ -328,14 +437,22 @@ impl World {
     }
     pub fn transforms(&self) -> Result<BTreeMap<Id, Mat4>> {
         let mut output = BTreeMap::new();
+        for id in self.transform_order()? {
+            let entity = &self.entities[&id];
+            let parent = entity.parent.map_or(Mat4::IDENTITY, |p| output[&p]);
+            output.insert(id, parent * entity.local);
+        }
+        Ok(output)
+    }
+    pub(crate) fn transform_order(&self) -> Result<Vec<Id>> {
+        let mut order = Vec::with_capacity(self.entities.len());
+        let mut placed = BTreeSet::new();
         for &id in self.entities.keys() {
             let mut path = Vec::new();
             let mut seen = BTreeSet::new();
             let mut at = Some(id);
-            let mut world = Mat4::IDENTITY;
             while let Some(i) = at {
-                if let Some(&m) = output.get(&i) {
-                    world = m;
+                if placed.contains(&i) {
                     break;
                 }
                 ensure!(seen.insert(i), "transform hierarchy cycle at {i}");
@@ -344,11 +461,11 @@ impl World {
                 at = e.parent;
             }
             for i in path.into_iter().rev() {
-                world *= self.entities[&i].local;
-                output.insert(i, world);
+                placed.insert(i);
+                order.push(i);
             }
         }
-        Ok(output)
+        Ok(order)
     }
     pub fn save(&self, path: &Path) -> Result<()> {
         self.validate()?;
@@ -448,10 +565,8 @@ impl World {
                 name: "Specimen".into(),
                 local: Mat4::from_translation(Vec3::X * x),
                 instance: Some(Instance {
-                    mesh,
-                    material: Some(material),
-                    legacy_shading: None,
                     outline: shading == Shading::Toon,
+                    ..Instance::new(mesh, Some(material))
                 }),
                 ..Default::default()
             });

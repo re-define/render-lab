@@ -1,0 +1,130 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#ifdef SCENE_LIGHTING
+#define SCENE_LIGHT_BINDING 8
+#include "scene_lights.glsl"
+#define RESOLVE_BINDING_BYTES 36
+#endif
+#ifdef RIVER_GROUND
+#define FILTERED_BASE_COLOR
+#endif
+#ifdef GI_STUDY
+#include "restir_types.glsl"
+#define RESTIR_CONFIG 9
+#include "restir_controls.glsl"
+layout(binding=8,std430) readonly buffer Direct { Radiance directLight[]; };
+layout(binding=10,std430) readonly buffer GI { vec4 indirectLight[]; };
+#define RESOLVE_BINDING_BYTES 44
+#define PIXEL_POSITION_MATERIAL
+#else
+#define POSITION_MATERIAL
+#endif
+#include "resolve.glsl"
+#include "leaf_light.glsl"
+
+#if defined(BARK) || defined(GROUND)
+float hash2(vec2 p) {
+    vec3 q=fract(vec3(p.x,p.y,p.x)*0.1031);
+    q+=dot(q,q.yzx+33.33);
+    return fract((q.x+q.y)*q.z);
+}
+float noise2(vec2 p) {
+    vec2 i=floor(p), f=fract(p);
+    f=f*f*(3.0-2.0*f);
+    return mix(mix(hash2(i),hash2(i+vec2(1,0)),f.x),
+        mix(hash2(i+vec2(0,1)),hash2(i+vec2(1,1)),f.x),f.y);
+}
+#endif
+#if defined(LIMESTONE) || defined(KARST_SOIL)
+#include "karst_material.glsl"
+#endif
+vec3 lightFoliage(vec3 normal,vec3 L) {
+    float facing = dot(normal,L);
+#if defined(BARK) || defined(GROUND)
+    return vec3(0.45 * max(0.0,facing));
+#else
+    return 0.52 * leafResponse(facing);
+#endif
+}
+
+vec3 shadePosition(
+#ifdef GI_STUDY
+uint pixel,
+#endif
+vec3 albedo, vec3 position, vec3 normal, vec3 V, vec2 uv, Instance obj) {
+    float skyWeight = 0.48 + 0.52 * max(normal.y,0.0);
+#ifdef GROUND
+    float groundVariation = noise2(position.xz * 0.29 + vec2(4.2,1.6));
+    float detail = noise2(position.xz * 5.7) - 0.5;
+    float dry = noise2(position.xz * 0.91 + vec2(5.0));
+#if defined(LIMESTONE) || defined(KARST_SOIL)
+    albedo=obj.color.rgb*karstAlbedo(position,normal,obj.tex.xyz);
+#elif defined(RIVER_GROUND)
+    float stones=noise2(position.xz*25.0+noise2(position.xz*4.0)*1.8);
+    float sod=noise2(position.xz*3.7+2.*groundVariation);
+    albedo *= (0.78+groundVariation*0.21+sod*0.21+detail*0.20);
+    albedo += vec3(.036,.031,.020)*smoothstep(.65,.91,stones)/(1.+length(eye.xyz-position)*.10);
+#else
+    float trail = 1.9*sin(position.z*0.055)+0.75*sin(position.z*0.029);
+    float track = 1.0-smoothstep(0.70,1.48,abs(position.x-trail)+(dry-0.5)*0.67);
+    vec3 meadow = mix(vec3(0.064,0.132,0.024),vec3(0.167,0.217,0.052),groundVariation);
+    vec3 earth = mix(vec3(0.139,0.093,0.042),vec3(0.267,0.193,0.103),dry);
+    albedo *= mix(meadow,earth,track*0.86)*(0.86+dry*0.30+detail*0.23/(1.0+length(eye.xyz-position)*0.018));
+#endif
+#elif defined(BARK)
+    // UV height is measured on the undeformed branch, keeping the grain attached in wind.
+    vec2 grain=vec2(uv.x*22.0, uv.y*1.48);
+    float ridges=noise2(grain+vec2(noise2(grain*0.23)*3.2,0.0));
+    float detail=noise2(vec2(uv.x*15.0,uv.y*9.0));
+    if (uv.x>1.5) {
+        float lenticels=smoothstep(0.60,0.78,noise2(vec2(uv.x*8.0,uv.y*24.0)));
+        albedo*=mix(vec3(0.93,0.96,1.0),vec3(0.27,0.24,0.21),lenticels)*(0.85+0.22*detail);
+    } else {
+        float fissures=smoothstep(0.24,0.65,ridges);
+        albedo*=mix(vec3(0.33,0.38,0.42),vec3(1.06,0.98,0.85),fissures)*(0.77+0.34*detail);
+    }
+#else
+    float tip = clamp(uv.y,0.0,1.0);
+    if (uv.x>1.5) {
+        float sky=clamp(uv.x-2.0,0.0,1.0);
+        float exposed=smoothstep(0.18,0.97,sky);
+        float grove = 0.5+0.5*sin(dot(obj.model[3].xz,vec2(0.19,0.11))
+                                    +1.8*sin(obj.model[3].z*0.12));
+        albedo*=mix(vec3(0.69,0.79,0.78),vec3(1.13,1.12,0.99),exposed);
+        albedo*=mix(vec3(0.84,0.94,1.03),vec3(1.14,1.04,0.86),0.62*grove+0.38*tip);
+        skyWeight=mix(0.22,1.0,sky);
+    } else if (uv.x<0.) {
+        float patchTone=0.5+0.5*sin(dot(obj.model[3].xz,vec2(0.19,0.27))+1.7*sin(obj.model[3].z*0.15));
+        if (uv.x < -2.7) albedo=mix(vec3(0.24,0.19,0.074),vec3(0.49,0.40,0.19),patchTone)*clamp(albedo.g/0.24,0.4,1.1);
+        else {
+            float mature=clamp(-1.0-uv.x,0.0,1.0);
+            albedo*=mix(vec3(0.33,0.40,0.28),vec3(1.24,1.12,0.74),smoothstep(0.0,0.79,tip));
+            albedo*=mix(vec3(0.86,0.97,1.05),vec3(1.26,1.09,0.79),0.55*patchTone+0.45*mature);
+        }
+        normal=normalize(normal*0.66+vec3(0.0,0.46,0.0));
+    } else {
+        float tone = fract(uv.x);
+        albedo *= mix(vec3(0.63,0.85,1.06),vec3(1.13,1.10,0.67),tone*0.80+tip*0.19);
+        albedo *= 0.78+0.22*tip;
+    }
+#endif
+#ifdef GI_STUDY
+    vec3 incident=directLight[pixel].color.rgb;
+    if(controls.w>0.) incident+=indirectLight[pixel].rgb;
+    return albedo * incident * controls.x;
+#else
+    vec3 illumination = mix(vec3(0.20,0.24,0.26),vec3(0.38,0.41,0.43),max(normal.y,0.0)) * skyWeight;
+#ifdef SCENE_LIGHTING
+    for(uint i=0u;i<lightHeader.x;++i) {
+        vec3 L; float distanceToLight;
+        vec3 energy=lightAt(lights[i],position,L,distanceToLight);
+        illumination += skyEnergy(lights[i])*skyWeight;
+        illumination += energy * lightFoliage(normal,L);
+    }
+#else
+    illumination += vec3(1.35,1.16,0.87) * lightFoliage(normal,normalize(vec3(-0.42,0.73,0.55)));
+#endif
+    return albedo * illumination;
+#endif
+}

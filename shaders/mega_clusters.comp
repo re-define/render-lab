@@ -1,0 +1,100 @@
+#version 460
+#include "cluster_scene.glsl"
+#include "plant_geometry.glsl"
+layout(binding=2,std430) readonly buffer Camera {View view;};
+layout(binding=3,std430) readonly buffer Jobs {uvec4 head;uvec2 jobs[];};
+layout(binding=4,std430) readonly buffer Palette {mat4 jointPalette[];};
+#include "cluster_pose.glsl"
+#include "scene_slots.glsl"
+layout(binding=5,std430) buffer Points {float points[];};
+layout(binding=6,std430) buffer Faces {uint faces[];};
+layout(binding=7,std430) buffer Records {uvec4 words[];};
+layout(binding=8,std430) buffer Fades {uvec4 metadata[];};
+layout(binding=9,std430) buffer Stats {uint counters[];};
+layout(binding=10,std430) readonly buffer Addresses {uvec2 ptr[];};
+layout(binding=11,std430) readonly buffer Ranges {uvec4 ranges[];};
+layout(binding=12,std430) readonly buffer Layout {uvec4 slots[];};
+layout(binding=13,std430) readonly buffer Models {SceneModel models[];};
+struct Stamp {uvec4 geometry; uvec4 epoch;};
+layout(binding=14,std430) buffer Versions {Stamp stamps[];};
+layout(binding=15,std430) readonly buffer Cache {uvec2 base; uint stride; uint generation;};
+layout(binding=16,std430) buffer Destinations {uvec2 destinations[];};
+layout(binding=17,std430) buffer Selected {uvec2 selected[];};
+layout(binding=18,std430) buffer Changes {uint builds; uint vertexHead; uint faceHead;};
+#ifdef FINALIZE
+layout(binding=19,std430) writeonly buffer BottomRecord {uvec4 bottom;};
+#endif
+uvec2 advance(uvec2 address,uint offset) {uint low=address.x+offset;return uvec2(low,address.y+uint(low<address.x));}
+uvec2 addressFor(uint id){
+    uint high, low;
+    umulExtended(id,stride,high,low);
+    return advance(base,low)+uvec2(0u,high);
+}
+void record(uint slot,uint id,uint triangles,uint vertices,uint face,uint vertex){
+    // VkClusterAccelerationStructureBuildTriangleClusterInfoNV, 64 bytes.
+    words[4u*slot]=uvec4(id,0,triangles|(vertices<<9u)|0x11000000u,0u);
+    words[4u*slot+1u]=uvec4(1u|(12u<<16u),0,advance(ptr[1],4u*face));
+    words[4u*slot+2u]=uvec4(advance(ptr[0],12u*vertex),0,0);
+    words[4u*slot+3u]=uvec4(0);
+    destinations[slot]=addressFor(id);
+}
+layout(local_size_x=64) in;
+void main(){
+#ifdef FINALIZE
+    if(gl_GlobalInvocationID.x!=0u)return;
+    // A single degenerate triangle makes an entirely empty shadow cut legal.
+    points[0]=0.;points[1]=0.;points[2]=0.;faces[0]=0u;
+    record(0u,0u,1u,1u,0u,0u);
+    selected[0]=addressFor(0u);
+    metadata[0]=uvec4(0xffff0000u,0u,0u,0u);
+    counters[0]=head.x+1u;
+    bottom=uvec4(head.x+1u,8u,ptr[2]);
+#else
+    uint i=workIndex();
+    if(i>=head.x)return;
+    uvec2 job=jobs[i];
+    Instance obj=instances[job.x]; Asset asset=assets[obj.routing.z];
+    Cluster cluster=asset.clusters.data[job.y];
+    uvec4 span=cluster.span;
+    bool voxel=(cluster.meta.w&VOXEL_CLUSTER)!=0u;
+    uvec4 range=ranges[obj.routing.z];
+    uint id=1u+range.y+(job.x-range.x)*range.z+job.y;
+    uvec2 transition=clusterFade(asset,obj,cluster,view);
+    metadata[id]=uvec4(transition,job.y,slots[2u*job.x].z);
+    selected[i+1u]=addressFor(id);
+    atomicAdd(counters[1],span.y);
+    atomicAdd(counters[2],span.w);
+    if(outsideFrustum(view.vp*obj.model,cluster.sphere))atomicAdd(counters[3],1u);
+    if(transition.x!=0xffff0000u)atomicAdd(counters[4],1u);
+    if(voxel)atomicAdd(counters[5],1u);
+    float wind=0.;
+    if((obj.tex.w&WIND_DEFORM)!=0u)wind=plantWindWeight(obj,asset.tree.data[0].geometry,view);
+    uvec2 transform=models[slots[job.x*2u].x].data.yz;
+    uvec4 version=uvec4(transform,floatBitsToUint(wind),wind>0.?floatBitsToUint(view.settings.z):0u);
+    Stamp old=stamps[id];
+    bool valid=old.epoch.x==generation;
+    uint deform=obj.tex.w&WIND_DEFORM;
+    if(valid && version==old.geometry && old.epoch.y==deform){atomicAdd(counters[6],1u);return;}
+    atomicAdd(counters[!valid?7u:(old.geometry.xy!=transform?8u:9u)],1u);
+    stamps[id]=Stamp(version,uvec4(generation,deform,0,0));
+    uint dstRecord=atomicAdd(builds,1u);
+    uint v=atomicAdd(vertexHead,span.y), f=atomicAdd(faceHead,span.w);
+    record(dstRecord,id,span.w,span.y,f,v);
+    for(uint j=0u;j<span.y;j++){
+        vec3 p=(obj.model*clusterPosition(asset,obj,cluster,voxel,j)).xyz;
+        points[3u*(v+j)]=p.x;points[3u*(v+j)+1u]=p.y;points[3u*(v+j)+2u]=p.z;
+    }
+    // Native indexBufferStride is per INDEX. Pack three consecutive bytes per
+    // triangle; each cluster owns an aligned region, including the last partial word.
+    uint word=0u, shift=0u, dst=f;
+    for(uint j=0u;j<span.w;j++){
+        uvec3 t=clusterIndices(asset,cluster,voxel,j);
+        for(uint k=0u;k<3u;k++){
+            word|=t[k]<<shift;
+            shift+=8u;
+            if(shift==32u){faces[dst++]=word;word=0u;shift=0u;}
+        }
+    }
+    if(shift!=0u) faces[dst]=word;
+#endif
+}

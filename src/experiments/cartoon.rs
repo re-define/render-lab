@@ -8,6 +8,18 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 pub const SETTING: &str = "lab.cartoon";
+pub(super) const SNAPSHOT: crate::render::SnapshotComponent = crate::render::SnapshotComponent {
+    extract: Some(|context| {
+        let head = context
+            .raw()
+            .get("head")
+            .and_then(serde_json::Value::as_u64);
+        Ok(head
+            .and_then(|id| context.transform(id))
+            .map(|m| Arc::new(m) as crate::render::SnapshotValue))
+    }),
+    ..crate::render::SnapshotComponent::setting(SETTING)
+};
 const PROGRAM: &str = "Character cel pixels";
 const SDF_SIZE: u32 = 128;
 
@@ -34,13 +46,15 @@ struct Settings {
 impl Settings {
     fn read(world: &World) -> Result<(Id, Self)> {
         let (id, value) = world
-            .entities
-            .iter()
-            .find_map(|(&id, e)| Some((id, e.components.get(SETTING)?)))
+            .first_raw_component(SETTING)
             .context("open the toon experiment first")?;
-        let settings: Self = serde_json::from_value(value.clone())?;
+        Ok((id, Self::decode(value)?))
+    }
+
+    fn decode(value: &serde_json::Value) -> Result<Self> {
+        let settings = Self::deserialize(value)?;
         settings.validate()?;
-        Ok((id, settings))
+        Ok(settings)
     }
     fn validate(&self) -> Result<()> {
         ensure!(
@@ -303,29 +317,27 @@ mod tests {
     #[ignore = "requires the Silver Wolf glTF and Vulkan mesh shaders"]
     fn character_techniques_render_distinct_outlines_and_local_face_shadows() -> Result<()> {
         use crate::{
-            render::{MaterialPrograms, Snapshot, Technique},
+            render::{MaterialPrograms, SceneExtractor, Technique},
             rhi::Backend,
         };
-        let world = scene()?;
+        let mut world = scene()?;
         let (settings_id, mut settings) = Settings::read(&world)?;
         let mut registry = MaterialPrograms::default();
         Cartoon::register(&mut registry)?;
-        let mut shot = Snapshot {
-            camera: camera(&world, "face")?,
-            world: Arc::new(world),
-            materials: Arc::new(registry),
-            extent: [384, 256],
-        };
+        let camera = camera(&world, "face")?;
+        let materials = Arc::new(registry);
+        let mut extractor = SceneExtractor::default();
         let renderer = Cartoon::default();
         let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build()?;
         let mut gpu = Backend::open()?;
         let mut draw = |cfg: &Settings| -> Result<_> {
-            Arc::make_mut(&mut shot.world)
+            world
                 .entities
                 .get_mut(&settings_id)
                 .unwrap()
                 .components
                 .insert(SETTING.into(), serde_json::to_value(cfg)?);
+            let shot = extractor.snapshot(&world, camera, [384, 256], materials.clone())?;
             gpu.execute(renderer.build(&shot)?.compile()?, &pool)
         };
         let changed = |a: &[u8], b: &[u8]| {

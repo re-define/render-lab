@@ -1,0 +1,7 @@
+#version 460
+#include "restir_types.glsl"
+#include "gi12_types.glsl"
+layout(binding=0,std430) readonly buffer Current { Probe probes[]; };
+layout(binding=1,std430) writeonly buffer History { Probe last[]; };
+layout(local_size_x=64) in;
+void main() { uint i=gl_GlobalInvocationID.x; if(i<last.length()) last[i]=probes[i]; }

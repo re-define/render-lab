@@ -1,0 +1,28 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+#include "restir_types.glsl"
+#define RESTIR_CONFIG 1
+#define RESTIR_HISTORY 4
+#define WRITE_HISTORY
+#include "restir_controls.glsl"
+#include "restir_history.glsl"
+layout(set=0,binding=0,std430) readonly buffer Current { Surface surfaces[]; };
+layout(set=0,binding=2,std430) readonly buffer Reservoirs { Reservoir reservoirs[]; };
+layout(set=0,binding=3,std430) readonly buffer CurrentLight { Radiance radiance[]; };
+#include "motion.glsl"
+layout(set=0,binding=5,std430) readonly buffer Motion { MotionSample motion[]; };
+layout(set=0,binding=6) uniform texture2D depthImage;
+layout(local_size_x=8,local_size_y=8) in;
+void main() {
+    uvec2 xy=gl_GlobalInvocationID.xy;
+    if(any(greaterThanEqual(xy,screenSize))) return;
+    uint i=indexAt(xy);
+    if(i==0u){
+        frame.x=frame.x==0xffffffffu ? 1u : frame.x+1u;
+    }
+    if(viewport.w!=0u){
+        Reservoir r=options.x==2u ? reservoirs[i] : emptyReservoir();
+        previous[i]=Previous(surfaceNormal(surfaces[i]), surfaces[i].id==0u ? 0u : motion[i].currentTag,
+            r,radiance[i].color,radiance[i].moments.xyz,texelFetch(depthImage,ivec2(xy),0).x);
+    }
+}

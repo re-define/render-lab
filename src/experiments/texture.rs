@@ -2,19 +2,13 @@
 use crate::{
     engine::Engine,
     import,
-    rdg::Graph,
-    render::{
-        Atlas, Camera, Forward, MaterialPrograms, Snapshot, Technique, build_frame_with_post,
-    },
+    render::FrameGraph,
+    render::{AtlasCache, Camera, Forward, MaterialPrograms, Snapshot, Technique},
     scene::{Entity, Id, Shading, World},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 pub const SETTING: &str = "lab.texture_compression";
 const NEURAL: &str = "Neural base color";
@@ -43,9 +37,7 @@ struct Settings {
 impl Settings {
     fn read(w: &World) -> Result<(Id, Self)> {
         let (id, raw) = w
-            .entities
-            .iter()
-            .find_map(|(&id, e)| Some((id, e.components.get(SETTING)?)))
+            .first_raw_component(SETTING)
             .context("open the texture experiment first")?;
         Ok((id, serde_json::from_value(raw.clone())?))
     }
@@ -130,7 +122,7 @@ pub fn register(materials: &mut MaterialPrograms) -> Result<()> {
 
 pub struct TextureCompression {
     encoded: BTreeMap<Id, &'static [u8]>,
-    atlas: MaterialAtlas,
+    atlas: AtlasCache,
 }
 impl TextureCompression {
     pub fn new(w: &World) -> Result<Self> {
@@ -162,38 +154,18 @@ impl TextureCompression {
         }
         Ok(Self {
             encoded,
-            atlas: MaterialAtlas::default(),
+            atlas: AtlasCache::default(),
         })
     }
 }
 impl Technique for TextureCompression {
-    fn build(&self, s: &Snapshot) -> Result<Graph> {
-        self.atlas
-            .frame(s, &self.encoded, "Texture feature grids and MLP weights")
-    }
-}
-#[derive(Default)]
-pub(crate) struct MaterialAtlas(Mutex<Option<Arc<Atlas>>>);
-impl MaterialAtlas {
-    pub(crate) fn frame(
-        &self,
-        s: &Snapshot,
-        payloads: &BTreeMap<Id, &[u8]>,
-        label: &'static str,
-    ) -> Result<Graph> {
-        let atlas = {
-            let mut cache = self.0.lock().unwrap();
-            if !cache.as_ref().is_some_and(|a| a.matches(&s.world)) {
-                *cache = Some(Arc::new(Atlas::with_payloads(&s.world, payloads, label)?));
-            }
-            cache.as_ref().unwrap().clone()
-        };
-        build_frame_with_post(
-            s,
-            atlas,
-            |g, t, transforms| Forward::default().draw_subset(g, t, s, transforms, |_, _| true),
-            |_, _, _, _| Ok(()),
-        )
+    fn build(&self, s: &Snapshot) -> Result<FrameGraph> {
+        let atlas = self.atlas.get(
+            &s.scene,
+            &self.encoded,
+            "Texture feature grids and MLP weights",
+        )?;
+        Forward::default().build_with_atlas(s, atlas)
     }
 }
 pub fn command(engine: &mut Engine, arg: &str) -> Result<String> {
@@ -248,12 +220,9 @@ mod tests {
         let (id, mut settings) = Settings::read(&w)?;
         let mut materials = MaterialPrograms::default();
         register(&mut materials)?;
-        let mut snapshot = Snapshot {
-            camera: camera(&w)?,
-            materials: Arc::new(materials),
-            world: Arc::new(w.clone()),
-            extent: [320, 200],
-        };
+        let camera = camera(&w)?;
+        let materials = Arc::new(materials);
+        let mut extractor = crate::render::SceneExtractor::default();
         let mut gpu = Backend::open()?;
         let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
         let mut render = |neural: bool, prefer_local: bool| -> Result<_> {
@@ -264,11 +233,11 @@ mod tests {
                 .unwrap()
                 .components
                 .insert(SETTING.into(), serde_json::to_value(&settings)?);
-            snapshot.world = Arc::new(w.clone());
+            let snapshot = extractor.snapshot(&w, camera, [320, 200], materials.clone())?;
             let mut graph = TextureCompression::new(&w)?.build(&snapshot)?;
             if !prefer_local {
                 // Exercise the RHI's original placement policy for the same buffer at the same slot.
-                graph.material_atlas = None;
+                graph.products.material_atlas = None;
             }
             let size = if neural {
                 assert!(

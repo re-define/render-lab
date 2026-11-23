@@ -1,0 +1,27 @@
+#version 460
+#include "visibility_image.glsl"
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=1) uniform texture2D hardwareDepth;
+layout(binding=2,std430) readonly buffer Previous { uvec2 before[]; };
+layout(binding=3,std430) readonly buffer SoftwareIds { uvec2 ids[]; };
+layout(binding=4,std430) readonly buffer SoftwareDepth { float depth[]; };
+layout(binding=5,std430) buffer Metrics { uint stats[]; };
+void main() {
+    uvec2 xy=gl_GlobalInvocationID.xy,size=uvec2(textureSize(visibilityImage,0));
+    if(any(greaterThanEqual(xy,size))) return;
+    uint i=xy.x+xy.y*size.x;
+    uvec2 hw=visibilityAt(xy),sw=ids[i];
+    bool a=any(notEqual(hw,before[i])),b=any(notEqual(sw,before[i]));
+    if(a) atomicAdd(stats[6],1u);
+    if(b) atomicAdd(stats[7],1u);
+    if(a!=b) atomicAdd(stats[8],1u);
+    float hwDepth=texelFetch(hardwareDepth,ivec2(xy),0).x;
+    if(any(notEqual(hw,sw))) {
+        atomicAdd(stats[9],1u);
+        uint aBits=floatBitsToUint(hwDepth), bBits=floatBitsToUint(depth[i]);
+        if(max(aBits,bBits)-min(aBits,bBits)<=1u) atomicAdd(stats[12],1u);
+    }
+    float diff=abs(hwDepth-depth[i]);
+    if(diff>0.00001) atomicAdd(stats[10],1u);
+    if(diff>0.) atomicMax(stats[11],floatBitsToUint(diff));
+}

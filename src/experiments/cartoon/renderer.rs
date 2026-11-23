@@ -1,7 +1,12 @@
 use super::*;
+use crate::rdg::PassPhase;
+use crate::render::FrameGraph;
 use crate::{
     rdg::*,
-    render::{Atlas, Forward, Snapshot, SurfaceBuffers, Targets, Technique, build_frame_with_post},
+    render::{
+        Atlas, Forward, MaterialId, MeshId, Snapshot, SurfaceBuffers, Targets, Technique,
+        build_frame_with_post,
+    },
 };
 use glam::Mat4;
 use std::sync::Mutex;
@@ -40,8 +45,7 @@ impl UploadedEdges {
 
 #[derive(Default)]
 pub struct Cartoon {
-    atlas: Mutex<Option<Arc<Atlas>>>,
-    edges: Mutex<BTreeMap<Id, UploadedEdges>>,
+    edges: Mutex<BTreeMap<MeshId, UploadedEdges>>,
 }
 impl Cartoon {
     pub fn register(materials: &mut crate::render::MaterialPrograms) -> Result<()> {
@@ -52,15 +56,24 @@ impl Cartoon {
     }
     fn draw_outline(
         &self,
-        g: &mut Graph,
+        g: &mut FrameGraph,
         t: &Targets,
         view: Resource,
         s: &Snapshot,
-        (mesh, surface): (Id, SurfaceBuffers),
+        (mesh, surface): (MeshId, SurfaceBuffers),
         mode: Outline,
     ) -> Result<()> {
         use Access::Mesh as M;
-        let mut bindings = vec![(surface.vertices, M), (surface.faces, M), (view, M)];
+        let model = g.input(
+            "Outline instance transform",
+            bytemuck::bytes_of(&surface.model.to_cols_array()).to_vec(),
+        );
+        let mut bindings = vec![
+            (surface.vertices, M),
+            (surface.faces, M),
+            (view, M),
+            (model, M),
+        ];
         let (name, shader, count): (&str, &'static [u8], u32) = match mode {
             Outline::Hull => (
                 "Normal-extruded backfaces",
@@ -68,7 +81,7 @@ impl Cartoon {
                 surface.count,
             ),
             Outline::Quad => {
-                let Some(topology) = s.world.entities[&mesh].topology.as_ref() else {
+                let Some(topology) = s.scene.meshes[&mesh].topology.as_ref() else {
                     return Ok(());
                 };
                 if topology.is_empty() {
@@ -106,7 +119,8 @@ impl Cartoon {
             _ => return Ok(()),
         };
         let groups = count.div_ceil(32);
-        g.pass(
+        g.pass_in(
+            PassPhase::Overlay,
             name,
             Op::Draw {
                 program: Dispatch {
@@ -124,101 +138,113 @@ impl Cartoon {
     }
 }
 
-impl Technique for Cartoon {
-    fn build(&self, s: &Snapshot) -> Result<Graph> {
-        let (_, cfg) = Settings::read(&s.world)?;
+impl Cartoon {
+    pub(in crate::experiments) fn draw(
+        &self,
+        g: &mut FrameGraph,
+        t: &mut Targets,
+        s: &Snapshot,
+        surfaces: Vec<crate::render::PosedSurface<'_>>,
+    ) -> Result<()> {
+        let cfg = Settings::decode(
+            s.scene
+                .setting(SETTING)
+                .context("open the toon experiment first")?,
+        )?;
         let azimuth = cfg.azimuth.to_radians();
         let light = Vec3::new(azimuth.sin(), 0.45, azimuth.cos()).normalize();
-        let atlas = {
-            let mut cached = self.atlas.lock().unwrap();
-            if !cached.as_ref().is_some_and(|a| a.matches(&s.world)) {
-                *cached = Some(Arc::new(Atlas::from(&s.world)?));
-            }
-            cached.as_ref().unwrap().clone()
-        };
         let bin = s.materials.bin(&Shading::Custom(PROGRAM.into()))?;
+        let head = s
+            .scene
+            .derived::<Mat4>(SETTING)
+            .context("missing head joint")?;
+        let local = head.inverse().transform_vector3(light);
+        let signed_angle = local.x.atan2(local.z) / std::f32::consts::PI;
+        let sdf = t
+            .texture_region(cfg.sdf)
+            .context("missing face SDF texture")?;
+        ensure!(
+            sdf[1] == 7 * sdf[2] && sdf[2] > 0,
+            "face SDF requires seven square tiles"
+        );
+        let mut outlines = vec![];
+        for surface in surfaces {
+            let i = surface.instance;
+            let mut obj = t.material(s, i, Mat4::IDENTITY)?;
+            let cartoon = obj.routing[0] == bin;
+            if i.emitter {
+                obj.params[3] = 1.;
+            }
+            if cartoon {
+                obj.params = [light.x, light.y, light.z, cfg.threshold];
+                if cfg.face_shadow && i.material == Some(MaterialId(cfg.face_material)) {
+                    obj.routing[1..].copy_from_slice(&[sdf[0], signed_angle.to_bits(), sdf[2]]);
+                }
+            }
+            let surface = surface.draw(g, t, s, obj)?;
+            if cartoon && matches!(cfg.outline, Outline::Hull | Outline::Quad) {
+                outlines.push((i.mesh, surface));
+            }
+        }
+        if !outlines.is_empty() {
+            let mut camera = s.view_projection().to_cols_array().to_vec();
+            camera.extend(s.camera.eye().extend(1.).to_array());
+            camera.extend([s.extent[0] as f32, s.extent[1] as f32, cfg.width, 0.]);
+            let view = g.input("Outline view", bytemuck::cast_slice(&camera).to_vec());
+            for surface in outlines {
+                self.draw_outline(g, t, view, s, surface, cfg.outline)?;
+            }
+        }
+        Ok(())
+    }
+    pub(in crate::experiments) fn overlay(
+        g: &mut FrameGraph,
+        s: &Snapshot,
+        ids: Resource,
+        depth: Resource,
+        color: Resource,
+    ) -> Result<()> {
+        let cfg = Settings::decode(
+            s.scene
+                .setting(SETTING)
+                .context("open the toon experiment first")?,
+        )?;
+        crate::experiments::draw_visibility_overlays(g, s, ids, color)?;
+        if cfg.outline == Outline::Image {
+            let [w, h] = s.extent;
+            // Descriptor indices take 12 bytes. The following uvec2 is 8-byte aligned.
+            let push = bytemuck::bytes_of(&[0u32, w, h, cfg.width.to_bits()]).to_vec();
+            g.pass_in(
+                PassPhase::Overlay,
+                "Image-space outlines",
+                Op::Compute {
+                    program: Dispatch {
+                        shader: Shader::Compute(spirv!("outline_image.comp")),
+                        bindings: vec![
+                            (ids, Access::ComputeSample),
+                            (depth, Access::ComputeSample),
+                            (color, Access::ComputeReadWrite),
+                        ],
+                        push,
+                    },
+                    groups: [w.div_ceil(8), h.div_ceil(8), 1],
+                },
+            );
+        }
+        Ok(())
+    }
+}
+impl Technique for Cartoon {
+    fn build(&self, s: &Snapshot) -> Result<FrameGraph> {
         build_frame_with_post(
             s,
-            atlas,
-            |g, t, transforms| {
-                t.background = 0xffe4e5ebu32;
-                let head = transforms.get(&cfg.head).context("missing head joint")?;
-                let local = head.inverse().transform_vector3(light);
-                let signed_angle = local.x.atan2(local.z) / std::f32::consts::PI;
-                let sdf = t
-                    .texture_region(cfg.sdf)
-                    .context("missing face SDF texture")?;
-                ensure!(
-                    sdf[1] == 7 * sdf[2] && sdf[2] > 0,
-                    "face SDF requires seven square tiles"
-                );
-                let mut outlines = vec![];
-                for (i, posed) in Forward::default().posed_surfaces(s, transforms, |_, _| true)? {
-                    let mut obj = t.material(s, i, Mat4::IDENTITY)?;
-                    let cartoon = obj.routing[0] == bin;
-                    if cartoon {
-                        obj.params = [light.x, light.y, light.z, cfg.threshold];
-                        if cfg.face_shadow && i.material == Some(cfg.face_material) {
-                            obj.routing[1..].copy_from_slice(&[
-                                sdf[0],
-                                signed_angle.to_bits(),
-                                sdf[2],
-                            ]);
-                        }
-                    }
-                    let surface = posed.draw(g, t, s, obj)?;
-                    if cartoon && matches!(cfg.outline, Outline::Hull | Outline::Quad) {
-                        outlines.push((i.mesh, surface));
-                    }
-                }
-                if !outlines.is_empty() {
-                    let mut camera = s.camera.view_projection(s.extent).to_cols_array().to_vec();
-                    camera.extend(s.camera.eye().extend(1.).to_array());
-                    camera.extend([s.extent[0] as f32, s.extent[1] as f32, cfg.width, 0.]);
-                    let view = g.input("Outline view", bytemuck::cast_slice(&camera).to_vec());
-                    for surface in outlines {
-                        self.draw_outline(g, t, view, s, surface, cfg.outline)?;
-                    }
-                }
-                Ok(())
+            Atlas::cached(&s.scene)?,
+            |g, t| {
+                g.products.instance_visits += s.scene.instances.len();
+                t.background = 0xffe4e5eb;
+                self.draw(g, t, s, Forward::default().posed_surfaces(s, |_| true)?)
             },
-            |g, ids, depth, color| {
-                if cfg.outline == Outline::Image {
-                    let [w, h] = s.extent;
-                    let z = g.resource(
-                        "Outline depth samples",
-                        Storage::Buffer {
-                            bytes: w as usize * h as usize * 4,
-                            initial: None,
-                        },
-                    );
-                    g.pass(
-                        "Read outline depth on GPU",
-                        Op::ReadPixels {
-                            image: depth,
-                            buffer: z,
-                        },
-                    );
-                    // Descriptor indices take 12 bytes. The following uvec2 is 8-byte aligned.
-                    let push = bytemuck::bytes_of(&[0u32, w, h, cfg.width.to_bits()]).to_vec();
-                    g.pass(
-                        "Image-space outlines",
-                        Op::Compute {
-                            program: Dispatch {
-                                shader: Shader::Compute(spirv!("outline_image.comp")),
-                                bindings: vec![
-                                    (ids, Access::ComputeRead),
-                                    (z, Access::ComputeRead),
-                                    (color, Access::ComputeReadWrite),
-                                ],
-                                push,
-                            },
-                            groups: [w.div_ceil(8), h.div_ceil(8), 1],
-                        },
-                    );
-                }
-                Ok(())
-            },
+            |g, ids, depth, color| Self::overlay(g, s, ids, depth, color),
         )
     }
 }

@@ -1,0 +1,7 @@
+pose,sun,pixels,identical_rgb,max_channel_delta_ge_1,max_channel_delta_ge_4,max_channel_delta_ge_8,max_channel_delta,mean_abs_channel_delta
+overview,hard,2073600,2073241,359,117,79,60,0.00070489
+overview,soft,2073600,2073201,399,136,91,58,0.00078045
+close,hard,2073600,2073537,63,21,19,38,0.00013809
+close,soft,2073600,2073543,57,18,10,26,8.584e-05
+distant,hard,2073600,2072948,652,237,138,84,0.00138246
+distant,soft,2073600,2073008,592,226,130,68,0.00117525

@@ -1,9 +1,8 @@
-mod support;
 use anyhow::Result;
 use render_lab::{
     engine::{Edit, Engine, Schedule, System},
     rdg::*,
-    render::{Camera, Forward, Snapshot, Technique},
+    render::{Camera, Forward, SceneExtractor, Snapshot, Technique},
     scene::*,
 };
 use std::{
@@ -65,7 +64,7 @@ fn invalid_graphs_fail_before_recording() {
 }
 #[test]
 fn scene_round_trip_is_self_contained() -> Result<()> {
-    let dir = support::tempdir()?;
+    let dir = tempfile::tempdir()?;
     let path = dir.path().join("scene.json");
     let mut w = World::demo();
     let id = w.spawn(Entity::default());
@@ -80,6 +79,118 @@ fn scene_round_trip_is_self_contained() -> Result<()> {
     w.entities.get_mut(&id).unwrap().parent = Some(id);
     assert!(w.save(&path).is_err());
     World::load(&path)?;
+    Ok(())
+}
+
+#[test]
+fn light_instances_follow_scene_hierarchy_and_round_trip() -> Result<()> {
+    use glam::{Mat4, Vec3};
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("lights.json");
+    let mut world = World::demo();
+    let parent = world.spawn(Entity {
+        local: Mat4::from_translation(Vec3::new(1., 2., 3.)),
+        ..Default::default()
+    });
+    let mesh = world
+        .entities
+        .values()
+        .find_map(|e| e.instance.as_ref())
+        .unwrap()
+        .mesh;
+    let id = world.spawn(Entity {
+        parent: Some(parent),
+        local: Mat4::from_translation(Vec3::X),
+        instance: Some(Instance::new(mesh, None)),
+        light: Some(Light::point([1., 0.5, 0.25], 4., 12.)),
+        ..Default::default()
+    });
+    world.save(&path)?;
+    let mut restored = World::load(&path)?;
+    let mut extractor = SceneExtractor::default();
+    let mut view =
+        |world: &World| extractor.snapshot(world, Camera::default(), [40, 30], Default::default());
+    let first = view(&restored)?;
+    assert!(
+        first
+            .scene
+            .instances()
+            .iter()
+            .any(|instance| instance.id == id)
+    );
+    let light = first.scene.lights()[0];
+    assert_eq!(light.id, id);
+    assert_eq!(light.position, Vec3::new(2., 2., 3.));
+    assert_eq!(light.radiance, [4., 2., 1.]);
+    restored.entities.get_mut(&parent).unwrap().local =
+        Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2);
+    assert!(
+        view(&restored)?.scene.lights()[0]
+            .position
+            .abs_diff_eq(Vec3::NEG_Z, 1e-5)
+    );
+    let entity = restored.entities.get_mut(&id).unwrap();
+    entity.light.as_mut().unwrap().enabled = false;
+    assert!(view(&restored)?.scene.lights().is_empty());
+    let graph = Forward::default().build(&view(&restored)?)?;
+    assert!(
+        graph
+            .resources
+            .iter()
+            .any(|(name, _)| name == "Scene light instances")
+    );
+    restored
+        .entities
+        .get_mut(&id)
+        .unwrap()
+        .light
+        .as_mut()
+        .unwrap()
+        .intensity = -1.;
+    assert!(restored.validate().is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Vulkan 1.4 and VK_EXT_descriptor_heap"]
+fn point_light_edits_change_material_shading() -> Result<()> {
+    let mut engine = Engine::new(World::demo(), Arc::new(Forward::default()))?;
+    let mut console = render_lab::console::Console::default();
+    let position = engine.camera.eye();
+    let created = console.execute(
+        &mut engine,
+        &[],
+        &format!(
+            "light point {} {} {} 180 30 1 0.18 0.04",
+            position.x, position.y, position.z
+        ),
+    )?;
+    let id = created.rsplit('#').next().unwrap();
+    let mut device = render_lab::rhi::Backend::open()?;
+    let mut draw = |engine: &Engine| {
+        let view = Snapshot::new(&engine.world, engine.camera, [160, 100], Default::default())?;
+        device.execute(engine.technique.build(&view)?.compile()?, &engine.tasks)
+    };
+    let lit = draw(&engine)?;
+    assert!(
+        console
+            .execute(&mut engine, &[], &format!("light power {id} -1"))
+            .is_err()
+    );
+    let unedited = draw(&engine)?;
+    assert_eq!(lit.pixels, unedited.pixels);
+    console.execute(&mut engine, &[], &format!("light enable {id} off"))?;
+    let dark = draw(&engine)?;
+    let changed = lit
+        .pixels
+        .chunks_exact(4)
+        .zip(dark.pixels.chunks_exact(4))
+        .filter(|(bright, dim)| bright[2] > dim[2].saturating_add(8))
+        .count();
+    assert!(changed > 100, "{changed} pixels changed");
+    console.execute(&mut engine, &[], &format!("light enable {id} on"))?;
+    console.execute(&mut engine, &[], &format!("light move {id} 999 999 999"))?;
+    assert_eq!(dark.pixels, draw(&engine)?.pixels);
     Ok(())
 }
 struct Add;
@@ -114,14 +225,35 @@ fn systems_read_stage_snapshots_and_commit_in_order() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn fixed_stages_accumulate_and_cap_catch_up() -> Result<()> {
+    let mut world = Arc::new(World::default());
+    let mut schedule = Schedule::default();
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+    schedule.fixed_stage(Duration::from_millis(125), 2, vec![Arc::new(Add)])?;
+    for (dt, expected) in [(0.0625, 0), (0.0625, 1), (0.0, 1), (1.0, 3), (0.0, 3)] {
+        schedule.tick(&mut world, dt, &pool)?;
+        assert_eq!(world.entities.len(), expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn history_keys_cannot_alias_within_a_frame() {
+    let mut graph = Graph::new([32, 32]);
+    graph.history_buffer("first", 17, 16);
+    graph.history_buffer("second", 17, 16);
+    assert!(graph.compile().is_err());
+}
 #[test]
 fn forward_graph_declares_all_viewport_passes() -> Result<()> {
-    let snapshot = Snapshot {
-        materials: Default::default(),
-        world: Arc::new(World::demo()),
-        camera: Camera::default(),
-        extent: [160, 100],
-    };
+    let snapshot = Snapshot::new(
+        &World::demo(),
+        Camera::default(),
+        [160, 100],
+        Default::default(),
+    )?;
     let p = Forward::default().build(&snapshot)?.compile()?;
     assert!(
         p.graph()
@@ -144,11 +276,16 @@ fn forward_graph_declares_all_viewport_passes() -> Result<()> {
 fn threaded_gpu_frame_and_resize() -> Result<()> {
     let mut e = Engine::new(World::demo(), Arc::new(Forward::default()))?;
     let mut console = render_lab::console::Console::default();
+    assert!(
+        console
+            .execute(&mut e, &[], "memory idle")?
+            .contains("第一帧")
+    );
     console.execute(&mut e, &[], "pause")?;
     assert!(console.paused);
     console.execute(&mut e, &[], "rdg")?;
     assert!(!console.show_graph);
-    let dir = support::tempdir()?;
+    let dir = tempfile::tempdir()?;
     let path = dir.path().join("console round trip.json");
     console.execute(&mut e, &[], &format!("save \"{}\"", path.display()))?;
     console.execute(&mut e, &[], &format!("load \"{}\"", path.display()))?;
@@ -173,8 +310,135 @@ fn threaded_gpu_frame_and_resize() -> Result<()> {
                 > 100
         );
         assert!(f.passes.iter().all(|p| p.ms >= 0.));
+        assert_eq!(
+            e.last_memory().unwrap().submission,
+            f.memory.managed.submission
+        );
+        for mode in ["idle", "alloc", "driver"] {
+            let summary =
+                console.execute(&mut e, &[], &format!("memory {mode} resource descriptor"))?;
+            assert!(summary.contains("Resource descriptor heap") && summary.contains("最近扩容"));
+        }
         assert!(f.counters["PBR pixels"] > 0 && f.counters["Toon pixels"] > 0);
     }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Vulkan 1.4 and VK_EXT_descriptor_heap"]
+fn mixed_lighting_combines_material_bins_and_keeps_live_scene_on_failed_load() -> Result<()> {
+    let mut engine = render_lab::experiments::open(render_lab::experiments::mixed::scene()?)?;
+    render_lab::console::Console::default().execute(&mut engine, &[], "ibl sky on")?;
+    let world = engine.world.clone();
+    let technique = engine.technique.clone();
+    let camera = engine.camera.eye();
+    let mut invalid = (*world).clone();
+    let env = invalid
+        .entities
+        .values_mut()
+        .find_map(|entity| {
+            entity
+                .components
+                .get_mut(render_lab::experiments::ibl::SETTING)
+        })
+        .unwrap();
+    *env = serde_json::json!("invalid environment settings");
+    assert!(render_lab::experiments::replace(&mut engine, invalid).is_err());
+    assert!(Arc::ptr_eq(&engine.world, &world));
+    assert!(Arc::ptr_eq(&engine.technique, &technique));
+    assert_eq!(engine.camera.eye(), camera);
+
+    let mut extractor = SceneExtractor::default();
+    let snapshot =
+        extractor.snapshot(&world, engine.camera, [160, 100], engine.materials.clone())?;
+    let mut gpu = render_lab::rhi::Backend::open()?;
+    let frame = gpu.execute(technique.build(&snapshot)?.compile()?, &engine.tasks)?;
+    use render_lab::rdg::PassPhase;
+    assert!(frame.passes.iter().any(|p| p.phase == PassPhase::Denoise));
+    assert!(frame.passes.iter().any(|p| p.phase == PassPhase::Lighting));
+    assert!(frame.passes.iter().any(|p| p.phase == PassPhase::Shade));
+    assert!(frame.counters["PBR pixels"] > 0 && frame.counters["Toon pixels"] > 0);
+    let tonemap = frame
+        .passes
+        .iter()
+        .position(|p| p.name == "Tone map linear scene color")
+        .unwrap();
+    assert_eq!(
+        frame
+            .passes
+            .iter()
+            .filter(|p| p.name.starts_with("Tone map"))
+            .count(),
+        1
+    );
+    assert!(
+        frame.passes[..tonemap]
+            .iter()
+            .any(|p| p.name.contains("ReSTIR"))
+    );
+    let sky = frame
+        .passes
+        .iter()
+        .position(|p| p.name == "Environment backdrop")
+        .unwrap();
+    assert!(frame.passes[tonemap].parents.contains(&sky));
+    assert!(
+        frame
+            .pixels
+            .chunks_exact(4)
+            .any(|p| p != &frame.pixels[..4])
+    );
+    render_lab::console::Console::default().execute(&mut engine, &[], "ibl ev 0")?;
+    let brighter = extractor.snapshot(
+        &engine.world,
+        engine.camera,
+        snapshot.extent,
+        engine.materials.clone(),
+    )?;
+    let brighter = gpu.execute(technique.build(&brighter)?.compile()?, &engine.tasks)?;
+    let sky_row = |data: &[u8]| {
+        data[..160 * 4]
+            .chunks_exact(4)
+            .flat_map(|pixel| &pixel[..3])
+            .map(|&channel| u32::from(channel))
+            .sum::<u32>()
+    };
+    assert!(sky_row(&brighter.pixels) > sky_row(&frame.pixels));
+    // Remove each producer in turn while preserving the mixed scene's camera and materials.
+    let mut variants = Vec::new();
+    let saved = tempfile::tempdir()?;
+    let path = saved.path().join("lighting.scene");
+    for (remove, expected_direct) in [
+        (render_lab::experiments::ibl::SETTING, true),
+        (render_lab::experiments::restir::SETTING, false),
+    ] {
+        let mut candidate = (*world).clone();
+        for entity in candidate.entities.values_mut() {
+            entity.components.remove(remove);
+        }
+        candidate.save(&path)?;
+        let restored = World::load(&path)?;
+        assert!(restored.first_raw_component(remove).is_none());
+        render_lab::experiments::replace(&mut engine, restored)?;
+        let view = extractor.snapshot(
+            &engine.world,
+            snapshot.camera,
+            snapshot.extent,
+            engine.materials.clone(),
+        )?;
+        let image = gpu.execute(engine.technique.build(&view)?.compile()?, &engine.tasks)?;
+        assert_eq!(
+            image
+                .passes
+                .iter()
+                .any(|pass| pass.phase == PassPhase::Denoise),
+            expected_direct
+        );
+        assert!(image.counters["PBR pixels"] > 0 && image.counters["Toon pixels"] > 0);
+        assert_ne!(image.pixels, frame.pixels);
+        variants.push(image.pixels);
+    }
+    assert_ne!(variants[0], variants[1]);
     Ok(())
 }
 
@@ -196,45 +460,49 @@ fn mouse_look_preserves_eye_and_wasd_translates_camera() {
 #[test]
 #[ignore = "requires Vulkan 1.4"]
 fn material_selects_pixel_shader_for_every_bound_instance() -> Result<()> {
-    let mut s = Snapshot {
-        materials: Default::default(),
-        world: Arc::new(World::demo()),
-        camera: Camera::default(),
-        extent: [160, 101],
+    let mut world = World::demo();
+    let mut extract = SceneExtractor::default();
+    let mut view = |world: &World, materials| {
+        extract.snapshot(world, Camera::default(), [160, 101], materials)
     };
+    let mut materials = Arc::<render_lab::render::MaterialPrograms>::default();
     let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
     let mut gpu = render_lab::rhi::Backend::open()?;
     let mut draw = |s: &Snapshot| gpu.execute(Forward::default().build(s)?.compile()?, &pool);
-    let first = draw(&s)?;
+    let first = draw(&view(&world, materials.clone())?)?;
     let n = first.counters["PBR pixels"] + first.counters["Toon pixels"];
     assert!(first.counters["PBR pixels"] > 0 && first.counters["Toon pixels"] > 0);
-    for m in Arc::make_mut(&mut s.world)
+    for m in world
         .entities
         .values_mut()
         .filter_map(|e| e.material.as_mut())
     {
         m.shading = Shading::Toon;
     }
-    let changed = draw(&s)?;
+    let changed = draw(&view(&world, materials.clone())?)?;
     assert_eq!(changed.counters["PBR pixels"], 0);
     assert_eq!(changed.counters["Toon pixels"], n);
     assert_ne!(first.pixels, changed.pixels);
     let ink = Shading::Custom("test.ink".into());
-    for m in Arc::make_mut(&mut s.world)
+    for m in world
         .entities
         .values_mut()
         .filter_map(|e| e.material.as_mut())
     {
         m.shading = ink.clone();
     }
-    assert!(Forward::default().build(&s).is_err());
+    assert!(
+        Forward::default()
+            .build(&view(&world, materials.clone())?)
+            .is_err()
+    );
     // A plugin can reuse the Toon kernel under a distinct stable key.
-    let key = Arc::make_mut(&mut s.materials).register(
+    let key = Arc::make_mut(&mut materials).register(
         "test.ink",
         include_bytes!(concat!(env!("OUT_DIR"), "/toon.comp.spv")),
     )?;
     assert_eq!(key, ink);
-    let plugin = draw(&s)?;
+    let plugin = draw(&view(&world, materials)?)?;
     assert_eq!(plugin.counters["test.ink"], n);
     assert_eq!(plugin.counters["Toon pixels"], 0);
     assert_eq!(plugin.pixels, changed.pixels);
@@ -266,7 +534,7 @@ fn old_instance_shading_migrates_to_shared_material_variants() -> Result<()> {
             count += 1;
         }
     }
-    let dir = support::tempdir()?;
+    let dir = tempfile::tempdir()?;
     let path = dir.path().join("legacy.json");
     std::fs::write(&path, serde_json::to_vec(&json)?)?;
     let w = World::load(&path)?;

@@ -1,0 +1,38 @@
+#version 460
+layout(local_size_x=8,local_size_y=8) in;
+
+#ifdef OUTPUT
+layout(set=0,binding=0,std430) readonly buffer Source { vec4 packed[]; };
+layout(set=0,binding=1,std430) writeonly buffer Destination { uint color[]; };
+layout(push_constant) uniform Viewport { layout(offset=8) uvec2 extent; };
+void main() {
+    uvec2 xy = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(xy, extent))) return;
+    uint i = xy.y*extent.x + xy.x;
+    color[i] = packUnorm4x8(vec4(packed[i].bgr, 1.0));
+}
+#else
+#include "motion.glsl"
+#ifdef HDR
+layout(set=0,binding=0,std430) readonly buffer Source { vec4 color[]; };
+#else
+layout(set=0,binding=0,std430) readonly buffer Source { uint color[]; };
+#endif
+layout(set=0,binding=1,std430) readonly buffer SceneMotion { MotionSample samples[]; };
+layout(set=0,binding=2,std430) writeonly buffer Destination { vec4 packed[]; };
+layout(set=0,binding=3,std430) writeonly buffer Motion { uint vectors[]; };
+layout(push_constant) uniform Viewport { layout(offset=16) uvec2 extent; };
+void main() {
+    uvec2 xy = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(xy, extent))) return;
+    uint i = xy.y*extent.x + xy.x;
+#ifdef HDR
+    vec3 rgb = max(color[i].rgb, 0.0);
+#else
+    vec3 rgb = unpackUnorm4x8(color[i]).bgr;
+#endif
+    packed[i] = vec4(rgb, 1.0);
+    vec2 velocity = samples[i].previousDepth >= 0.0 ? samples[i].offset : vec2(0.0);
+    vectors[i] = packHalf2x16(velocity);
+}
+#endif

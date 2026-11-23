@@ -1,0 +1,11 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=0) uniform texture2D hardwareDepth;
+layout(binding=1,std430) writeonly buffer Winners { uvec2 winners[]; };
+void main() {
+    uvec2 xy=gl_GlobalInvocationID.xy, size=uvec2(textureSize(hardwareDepth,0));
+    if(any(greaterThanEqual(xy,size))) return;
+    float depth=texelFetch(hardwareDepth,ivec2(xy),0).x;
+    winners[xy.x+xy.y*size.x]=uvec2(0u,~floatBitsToUint(depth));
+}

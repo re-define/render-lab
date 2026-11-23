@@ -1,0 +1,25 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#define LIGHTING_MATERIAL
+#define RESOLVE_BINDING_BYTES 44
+#include "resolve.glsl"
+#define LIGHTING_CONFIG 10
+#include "lighting_scene.glsl"
+layout(set=0,binding=8,std430) readonly buffer DirectLight { LightingPixel lightPixels[]; };
+layout(set=0,binding=9,std430) readonly buffer IndirectLight { vec4 bounce[]; };
+
+vec3 shadeLighting(uint pixel, vec3 albedo, vec3 position, vec3 normal, vec3 view, Instance obj) {
+    if(modes.w==3u) return albedo;
+    if(modes.w==4u) return vec3(lightPixels[pixel].normal.w);
+    if(obj.params.w==1.0) return modes.w==2u ? vec3(0) : vec3(1);
+    if(obj.params.w==2.0 && normal.y>0.5){
+        vec2 offset=abs(fract(position.xz*2.0+0.5)-0.5);
+        albedo*=mix(0.62,1.0,smoothstep(0.013,0.045,min(offset.x,offset.y)));
+    }
+    vec3 direct=albedo*lightPixels[pixel].direct.rgb;
+    vec3 indirect=modes.y==0u ? vec3(0) : albedo*bounce[pixel].rgb;
+    if(modes.w==1u) return direct;
+    if(modes.w==2u) return indirect;
+    return direct+indirect;
+}

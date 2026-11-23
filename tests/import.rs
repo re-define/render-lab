@@ -1,4 +1,3 @@
-mod support;
 use anyhow::Result;
 use render_lab::{import, scene::*};
 use serde_json::json;
@@ -24,7 +23,7 @@ fn fixture(path: &Path) -> Result<()> {
 }
 #[test]
 fn gltf_assets_are_shared_and_survive_removal_of_source() -> Result<()> {
-    let root = support::tempdir()?;
+    let root = tempfile::tempdir()?;
     let data = root.path().join("source");
     fs::create_dir(&data)?;
     fixture(&data)?;

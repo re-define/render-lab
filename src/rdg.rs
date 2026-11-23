@@ -1,3 +1,4 @@
+mod validate;
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -11,16 +12,96 @@ pub enum Storage {
     },
     Color,
     Depth,
+    Image(ImageDesc),
+    Acceleration(AccelerationShape),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccelerationShape {
+    Triangles {
+        count: u32,
+        vertices: u32,
+    },
+    Instances {
+        count: u32,
+    },
+    TriangleClusters {
+        count: u32,
+        vertices: u32,
+        triangles: u32,
+    },
+    ClusterBottom {
+        count: u32,
+    },
+}
+impl AccelerationShape {
+    pub(crate) fn count(self) -> u32 {
+        match self {
+            Self::TriangleClusters { count, .. }
+            | Self::ClusterBottom { count }
+            | Self::Triangles { count, .. }
+            | Self::Instances { count } => count,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct RayInstance {
+    pub blas: Resource,
+    pub transform: [f32; 12],
+    pub first_triangle: u32,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageFormat {
+    Visibility,
+    Depth,
+    Rgba32Float,
+    Rg16Float,
+}
+
+impl ImageFormat {
+    fn bytes_per_pixel(self) -> u64 {
+        match self {
+            Self::Depth | Self::Rg16Float => 4,
+            Self::Visibility => 8,
+            Self::Rgba32Float => 16,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageDesc {
+    pub extent: [u32; 2],
+    pub format: ImageFormat,
+}
+
+impl Storage {
+    pub(crate) fn image(&self, extent: [u32; 2]) -> Option<ImageDesc> {
+        match self {
+            Self::Color => Some(ImageDesc {
+                extent,
+                format: ImageFormat::Visibility,
+            }),
+            Self::Depth => Some(ImageDesc {
+                extent,
+                format: ImageFormat::Depth,
+            }),
+            Self::Image(image) => Some(*image),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
     Upload,
     Vertex,
     Mesh,
+    MeshFragment,
     Fragment,
     ComputeRead,
+    ComputeSample,
     ComputeWrite,
     ComputeReadWrite,
+    SdkImageRead,
+    SdkImageWrite,
     Indirect,
     ColorClear,
     ColorLoad,
@@ -29,6 +110,14 @@ pub enum Access {
     CopySrc,
     CopyDst,
     HostRead,
+    AccelerationInput,
+    ClusterBuildInput,
+    AccelerationRead,
+    AccelerationWrite,
+    RayAcceleration,
+    RayRead,
+    RayWrite,
+    RayReadWrite,
 }
 impl Access {
     pub fn writes(self) -> bool {
@@ -37,17 +126,28 @@ impl Access {
             Self::Upload
                 | Self::ComputeWrite
                 | Self::ComputeReadWrite
+                | Self::SdkImageWrite
                 | Self::ColorClear
                 | Self::ColorLoad
                 | Self::DepthClear
                 | Self::DepthLoad
                 | Self::CopyDst
+                | Self::AccelerationWrite
+                | Self::RayWrite
+                | Self::RayReadWrite
         )
     }
     fn reads(self) -> bool {
         !matches!(
             self,
-            Self::Upload | Self::ComputeWrite | Self::ColorClear | Self::DepthClear | Self::CopyDst
+            Self::Upload
+                | Self::ComputeWrite
+                | Self::SdkImageWrite
+                | Self::ColorClear
+                | Self::DepthClear
+                | Self::CopyDst
+                | Self::AccelerationWrite
+                | Self::RayWrite
         )
     }
 }
@@ -56,6 +156,15 @@ pub enum Shader {
     Graphics(&'static [u8], &'static [u8]),
     Compute(&'static [u8]),
     Mesh(&'static [u8], &'static [u8]),
+    ClusterShadows(&'static [u8], &'static [u8], &'static [u8]),
+    /// Generation, miss, cluster coverage any-hit, and material closest-hit.
+    ClusterRays(&'static [u8], &'static [u8], &'static [u8], &'static [u8]),
+    RayTracing(&'static [u8], &'static [u8], &'static [u8]),
+}
+impl Shader {
+    pub(crate) fn supports_clusters(self) -> bool {
+        matches!(self, Self::ClusterShadows(..) | Self::ClusterRays(..))
+    }
 }
 /// Binding n maps to the heap slot in word n of push data. User bytes follow the slots.
 #[derive(Clone, Debug)]
@@ -93,6 +202,41 @@ pub enum Op {
         image: Resource,
         buffer: Resource,
     },
+    WritePixels {
+        buffer: Resource,
+        image: Resource,
+    },
+    Dlss(Dlss),
+    BuildClusters {
+        records: Resource,
+        count: Resource,
+        vertices: Resource,
+        indices: Resource,
+        addresses: Resource,
+        output: Resource,
+    },
+    BuildClusterBottom {
+        record: Resource,
+        addresses: Resource,
+        clusters: Resource,
+        output: Resource,
+    },
+    BuildBlas {
+        vertices: Resource,
+        indices: Resource,
+        topology: Resource,
+        output: Resource,
+    },
+    BuildTlas {
+        instances: Vec<RayInstance>,
+        output: Resource,
+    },
+    TraceRays {
+        extent: [u32; 2],
+        program: Dispatch,
+        tlas: Resource,
+        blases: Vec<Resource>,
+    },
     HostRead(Resource),
     Present(Resource),
     Counters {
@@ -101,12 +245,24 @@ pub enum Op {
         labels: Vec<&'static str>,
     },
 }
+
+#[derive(Clone, Copy, Debug)]
+pub struct Dlss {
+    pub color: Resource,
+    pub depth: Resource,
+    pub motion: Resource,
+    pub output: Resource,
+    pub jitter: [f32; 2],
+    pub hdr: bool,
+    pub reset: bool,
+}
 impl Op {
     pub fn program(&self) -> Option<&Dispatch> {
         match self {
             Self::Draw { program, .. }
             | Self::Compute { program, .. }
-            | Self::ComputeIndirect { program, .. } => Some(program),
+            | Self::ComputeIndirect { program, .. }
+            | Self::TraceRays { program, .. } => Some(program),
             _ => None,
         }
     }
@@ -144,6 +300,71 @@ impl Op {
             Self::ReadPixels { image, buffer } => {
                 out.extend([(image, Access::CopySrc), (buffer, Access::CopyDst)])
             }
+            Self::WritePixels { buffer, image } => {
+                out.extend([(buffer, Access::CopySrc), (image, Access::CopyDst)])
+            }
+            Self::Dlss(dlss) => out.extend([
+                (dlss.color, Access::SdkImageRead),
+                (dlss.depth, Access::SdkImageRead),
+                (dlss.motion, Access::SdkImageRead),
+                (dlss.output, Access::SdkImageWrite),
+            ]),
+            Self::BuildClusters {
+                records,
+                count,
+                vertices,
+                indices,
+                addresses,
+                output,
+            } => out.extend([
+                (records, Access::ClusterBuildInput),
+                (count, Access::ClusterBuildInput),
+                (vertices, Access::AccelerationInput),
+                (indices, Access::AccelerationInput),
+                (addresses, Access::ClusterBuildInput),
+                (output, Access::AccelerationWrite),
+            ]),
+            Self::BuildClusterBottom {
+                record,
+                addresses,
+                clusters,
+                output,
+            } => out.extend([
+                (record, Access::ClusterBuildInput),
+                (addresses, Access::ClusterBuildInput),
+                (clusters, Access::AccelerationRead),
+                (output, Access::AccelerationWrite),
+            ]),
+            Self::BuildBlas {
+                vertices,
+                indices,
+                output,
+                ..
+            } => out.extend([
+                (vertices, Access::AccelerationInput),
+                (indices, Access::AccelerationInput),
+                (output, Access::AccelerationWrite),
+            ]),
+            Self::BuildTlas {
+                ref instances,
+                output,
+            } => {
+                out.extend(
+                    instances
+                        .iter()
+                        .map(|i| i.blas)
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .map(|r| (r, Access::AccelerationRead)),
+                );
+                out.push((output, Access::AccelerationWrite));
+            }
+            Self::TraceRays {
+                tlas, ref blases, ..
+            } => {
+                out.push((tlas, Access::RayAcceleration));
+                out.extend(blases.iter().map(|r| (*r, Access::RayAcceleration)));
+            }
             Self::Present(r) => out.push((r, Access::CopySrc)),
             Self::HostRead(r) | Self::Counters { buffer: r, .. } => out.push((r, Access::HostRead)),
             _ => (),
@@ -157,15 +378,74 @@ pub enum Queue {
     Compute,
     Transfer,
 }
+/// Stable profiling category, independent of queue, command type and display name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PassPhase {
+    Culling,
+    Pyramids,
+    Raster,
+    Bins,
+    Shade,
+    Lighting,
+    Denoise,
+    Motion,
+    Animation,
+    Post,
+    Overlay,
+    RayTracing,
+    Transfer,
+    Counters,
+    Present,
+    Compute,
+}
+impl PassPhase {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Culling => "culling",
+            Self::Pyramids => "pyramids",
+            Self::Raster => "raster",
+            Self::Bins => "bins",
+            Self::Shade => "shade",
+            Self::Lighting => "lighting",
+            Self::Denoise => "denoise",
+            Self::Motion => "motion",
+            Self::Animation => "animation",
+            Self::Post => "post",
+            Self::Overlay => "overlay",
+            Self::RayTracing => "ray_tracing",
+            Self::Transfer => "transfer",
+            Self::Counters => "counters",
+            Self::Present => "present",
+            Self::Compute => "compute",
+        }
+    }
+}
 pub struct Pass {
+    pub phase: PassPhase,
     pub queue: Queue,
     pub name: String,
     pub op: Op,
     pub after: Vec<usize>,
 }
+pub(crate) mod rows;
+use rows::Rows;
+pub(crate) struct ClusterCache {
+    pub output: Resource,
+    pub parameters: Resource,
+    pub sources: Vec<Arc<[u8]>>,
+    pub force_rebuild: bool,
+}
 pub struct Graph {
+    pub(crate) cluster_caches: std::collections::BTreeMap<Resource, ClusterCache>,
+    address_values_only: BTreeSet<Resource>,
+    cluster_children: std::collections::BTreeMap<Resource, Resource>,
+    pub(crate) tables: std::collections::BTreeMap<Resource, Rows>,
     pub extent: [u32; 2],
-    pub(crate) material_atlas: Option<Resource>,
+    pub(crate) display_extent: Option<[u32; 2]>,
+    pub(crate) local_buffers: BTreeSet<Resource>,
+    /// A frame-local work buffer keeps its allocation by name and owner across retired frames.
+    pub(crate) scratch_owners: std::collections::BTreeMap<Resource, u64>,
+    pub(crate) resident_inputs: BTreeSet<Resource>,
     pub resources: Vec<(String, Storage)>,
     pub passes: Vec<Pass>,
     pub(crate) addresses: std::collections::BTreeMap<Resource, Vec<Resource>>,
@@ -184,12 +464,21 @@ pub struct Step {
     pub barriers: Vec<Barrier>,
 }
 pub struct Plan {
-    pub(crate) build_ms: f64,
     pub(crate) compile_ms: f64,
-    pub(crate) main_ms: f64,
     pub(crate) graph: Graph,
     pub(crate) steps: Vec<Step>,
     pub(crate) written: Vec<bool>,
+    pub(crate) image_usage: Vec<ImageUsage>,
+    /// Expanded descriptor and address-table uses in original pass order.
+    pub(crate) pass_uses: Vec<Vec<(Resource, Access)>>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ImageUsage {
+    pub sampled: bool,
+    pub copy_source: bool,
+    pub copy_destination: bool,
+    pub storage: bool,
 }
 impl Plan {
     pub fn graph(&self) -> &Graph {
@@ -200,10 +489,24 @@ impl Plan {
     }
 }
 impl Graph {
+    pub fn output_extent(&self) -> [u32; 2] {
+        self.display_extent.unwrap_or(self.extent)
+    }
+
+    pub(crate) fn image_desc(&self, resource: Resource) -> Option<ImageDesc> {
+        self.resources.get(resource.0)?.1.image(self.extent)
+    }
     pub fn new(extent: [u32; 2]) -> Self {
         Self {
             extent,
-            material_atlas: None,
+            address_values_only: BTreeSet::new(),
+            cluster_children: Default::default(),
+            cluster_caches: Default::default(),
+            tables: Default::default(),
+            display_extent: None,
+            local_buffers: Default::default(),
+            scratch_owners: Default::default(),
+            resident_inputs: Default::default(),
             resources: vec![],
             passes: vec![],
             histories: Default::default(),
@@ -211,19 +514,72 @@ impl Graph {
             addresses: Default::default(),
         }
     }
+    pub(crate) fn host_readable_buffer(&self, resource: Resource) -> bool {
+        matches!(
+            self.resources.get(resource.0),
+            Some((_, Storage::Buffer { .. }))
+        ) && !self.histories.contains_key(&resource)
+            && !self.resident_inputs.contains(&resource)
+            && !self.cluster_caches.contains_key(&resource)
+            && !self.scratch_owners.contains_key(&resource)
+    }
+
+    pub(crate) fn table(&mut self, name: &str, rows: &Rows) -> Resource {
+        let r = self.resource(
+            name,
+            Storage::Buffer {
+                bytes: rows.bytes().max(16),
+                initial: Some(Arc::from([])),
+            },
+        );
+        self.tables.insert(r, rows.clone());
+        self.prefer_local_buffer(r);
+        r
+    }
     pub fn resource(&mut self, name: &str, storage: Storage) -> Resource {
         let r = Resource(self.resources.len());
         self.resources.push((name.into(), storage));
         r
     }
     pub fn input(&mut self, name: &str, data: Vec<u8>) -> Resource {
+        self.frame_input(name, data.into())
+    }
+    pub(crate) fn frame_input(&mut self, name: &str, data: Arc<[u8]>) -> Resource {
         self.resource(
             name,
             Storage::Buffer {
                 bytes: data.len().max(16),
-                initial: Some(data.into()),
+                initial: Some(data),
             },
         )
+    }
+    /// Only the declared byte range is visible to shaders. The contents start undefined each frame.
+    pub(crate) fn scratch_buffer(&mut self, name: &str, owner: u64, bytes: usize) -> Resource {
+        let r = self.resource(
+            name,
+            Storage::Buffer {
+                bytes: bytes.max(16),
+                initial: None,
+            },
+        );
+        self.scratch_owners.insert(r, owner);
+        self.prefer_local_buffer(r);
+        r
+    }
+    /// Prefer mapped device-local memory for buffers that receive many GPU accesses.
+    pub(crate) fn prefer_local_buffer(&mut self, buffer: Resource) {
+        self.local_buffers.insert(buffer);
+    }
+    pub(crate) fn resident_input(&mut self, name: &str, data: Arc<[u8]>) -> Resource {
+        let resource = self.resource(
+            name,
+            Storage::Buffer {
+                bytes: data.len().max(16),
+                initial: Some(data),
+            },
+        );
+        self.resident_inputs.insert(resource);
+        resource
     }
     /// The first four words are reset each frame. A consumer may only read
     /// entries emitted by the producer up to the count in that header.
@@ -243,10 +599,25 @@ impl Graph {
         self.addresses.insert(r, refs);
         r
     }
-    pub(crate) fn uses(&self, op: &Op) -> Vec<(Resource, Access)> {
+    /// This pass copies address values into native indirect records. Consumers declare the eventual accesses.
+    pub(crate) fn build_addresses(&mut self, refs: Vec<Resource>) -> Resource {
+        let table = self.address_table(refs);
+        self.address_values_only.insert(table);
+        table
+    }
+    fn uses(&self, op: &Op) -> Vec<(Resource, Access)> {
         let mut uses = op.uses();
-        for (r, a) in op.uses() {
-            if let Some(refs) = self.addresses.get(&r) {
+        for index in 0..uses.len() {
+            let (r, a) = uses[index];
+            if a == Access::RayAcceleration
+                && let Some(&child) = self.cluster_children.get(&r)
+                && !uses.contains(&(child, a))
+            {
+                uses.push((child, a));
+            }
+            if !self.address_values_only.contains(&r)
+                && let Some(refs) = self.addresses.get(&r)
+            {
                 for &src in refs {
                     if !uses.contains(&(src, a)) {
                         uses.push((src, a));
@@ -268,13 +639,43 @@ impl Graph {
         r
     }
     pub fn pass(&mut self, name: &str, op: Op) -> usize {
+        let phase = match &op {
+            Op::Draw { .. } => PassPhase::Raster,
+            Op::Compute { .. } | Op::ComputeIndirect { .. } => PassPhase::Compute,
+            Op::BuildClusters { .. }
+            | Op::BuildClusterBottom { .. }
+            | Op::BuildBlas { .. }
+            | Op::BuildTlas { .. }
+            | Op::TraceRays { .. } => PassPhase::RayTracing,
+            Op::Counters { .. } => PassPhase::Counters,
+            Op::Present(_) => PassPhase::Present,
+            Op::Dlss(_) => PassPhase::Post,
+            Op::HostRead(_) | Op::WritePixels { .. } | Op::ReadPixels { .. } => PassPhase::Transfer,
+        };
+        self.pass_in(phase, name, op)
+    }
+    pub fn pass_in(&mut self, phase: PassPhase, name: &str, op: Op) -> usize {
         let i = self.passes.len();
+        if let Op::BuildClusterBottom {
+            output, clusters, ..
+        } = op
+        {
+            self.cluster_children.insert(output, clusters);
+        }
         let queue = match &op {
-            Op::Draw { .. } | Op::Present(..) => Queue::Graphics,
-            Op::Compute { .. } | Op::ComputeIndirect { .. } | Op::Counters { .. } => Queue::Compute,
+            Op::Draw { .. } | Op::Present(..) | Op::Dlss(_) => Queue::Graphics,
+            Op::Compute { .. }
+            | Op::ComputeIndirect { .. }
+            | Op::Counters { .. }
+            | Op::BuildClusters { .. }
+            | Op::BuildClusterBottom { .. }
+            | Op::BuildBlas { .. }
+            | Op::BuildTlas { .. }
+            | Op::TraceRays { .. } => Queue::Compute,
             _ => Queue::Transfer,
         };
         self.passes.push(Pass {
+            phase,
             queue,
             name: name.into(),
             op,
@@ -282,24 +683,30 @@ impl Graph {
         });
         i
     }
-    pub fn present(&mut self) -> Result<Resource> {
-        let (pass, resource) = self
-            .passes
-            .iter_mut()
-            .rev()
-            .find_map(|p| match p.op {
-                Op::HostRead(resource) => Some((p, resource)),
-                _ => None,
-            })
-            .context("missing viewport output")?;
-        pass.op = Op::Present(resource);
-        pass.queue = Queue::Graphics;
-        pass.name = "Present swapchain image".into();
-        Ok(resource)
-    }
     pub fn compile(self) -> Result<Plan> {
         let started = std::time::Instant::now();
-        ensure!(self.extent.iter().all(|&v| v > 0), "empty viewport");
+        ensure!(
+            self.extent
+                .iter()
+                .chain(&self.output_extent())
+                .all(|&v| v > 0),
+            "empty viewport"
+        );
+        ensure!(
+            self.histories
+                .values()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len()
+                == self.histories.len(),
+            "a history key may be declared only once per graph"
+        );
+        ensure!(
+            self.local_buffers
+                .iter()
+                .all(|r| { matches!(self.resources.get(r.0), Some((_, Storage::Buffer { .. }))) }),
+            "only buffers can request device-local placement"
+        );
         let mut deps = vec![BTreeSet::new(); self.passes.len()];
         let mut writers = vec![None; self.resources.len()];
         let mut readers = vec![BTreeSet::new(); self.resources.len()];
@@ -316,7 +723,7 @@ impl Graph {
                 )
             })
             .collect::<Vec<_>>();
-        for r in self.histories.keys() {
+        for r in self.histories.keys().chain(self.cluster_caches.keys()) {
             defined[r.0] = true;
         }
         for refs in self.addresses.values() {
@@ -335,127 +742,44 @@ impl Graph {
                 );
             }
         }
+        let pass_uses: Vec<_> = self.passes.iter().map(|pass| self.uses(&pass.op)).collect();
+        let mut tlas_sources = std::collections::BTreeMap::new();
+        let mut last_image = vec![None; self.resources.len()];
+        let mut image_usage = vec![ImageUsage::default(); self.resources.len()];
         for (i, p) in self.passes.iter().enumerate() {
-            if let Some(d) = p.op.program() {
-                ensure!(
-                    matches!(
-                        (&p.op, d.shader),
-                        (Op::Draw { .. }, Shader::Graphics(..) | Shader::Mesh(..))
-                            | (
-                                Op::Compute { .. } | Op::ComputeIndirect { .. },
-                                Shader::Compute(_)
-                            )
-                    ),
-                    "shader kind differs from pass"
-                );
-                ensure!(
-                    d.bindings.iter().all(|(_, a)| match p.op {
-                        Op::Draw { .. } =>
-                            matches!(a, Access::Vertex | Access::Mesh | Access::Fragment),
-                        _ => matches!(
-                            a,
-                            Access::ComputeRead | Access::ComputeWrite | Access::ComputeReadWrite
-                        ),
-                    }),
-                    "invalid shader binding access"
-                );
-            }
-            if let Op::Draw {
-                count: DrawCount::Indirect(r),
-                ..
-            } = p.op
-            {
-                ensure!(
-                    matches!(self.resources.get(r.0),Some((_,Storage::Buffer{bytes,..})) if *bytes>=16),
-                    "invalid indirect draw buffer"
-                );
-            }
-            if let Op::ComputeIndirect { args, offset, .. }
-            | Op::Draw {
-                count: DrawCount::MeshIndirect { args, offset },
-                ..
-            } = p.op
-            {
-                ensure!(
-                    matches!(self.resources.get(args.0),Some((_,Storage::Buffer{bytes,..})) if offset.is_multiple_of(4) && offset.checked_add(12).is_some_and(|end|end<=*bytes as u64)),
-                    "invalid indirect argument range"
-                );
-            }
-            if let Op::Draw {
-                ref program, count, ..
-            } = p.op
-            {
-                ensure!(
-                    matches!(
-                        (program.shader, count),
-                        (_, DrawCount::Indirect(_))
-                            | (Shader::Mesh(..), DrawCount::MeshIndirect { .. })
-                            | (Shader::Mesh(..), DrawCount::Mesh(_))
-                            | (Shader::Graphics(..), DrawCount::Vertices(_))
-                    ),
-                    "draw arguments do not match shader"
-                );
-            }
-            if let Op::Present(r) = p.op {
-                ensure!(
-                    matches!(self.resources.get(r.0), Some((_, Storage::Buffer { .. }))),
-                    "presentation needs a pixel buffer"
-                );
-            }
-            if let Op::Counters {
-                buffer,
-                first,
-                ref labels,
-            } = p.op
-            {
-                ensure!(
-                    matches!(self.resources.get(buffer.0),Some((_,Storage::Buffer{bytes,..})) if first.checked_add(labels.len()).is_some_and(|words|words<=bytes/4)),
-                    "invalid counter range"
-                );
-            }
-            if let Op::ReadPixels { image, buffer } = p.op {
-                ensure!(
-                    matches!(
-                        self.resources.get(image.0),
-                        Some((_, Storage::Color | Storage::Depth))
-                    ),
-                    "image copy needs an image source"
-                );
-                let bytes = u64::from(self.extent[0]) * u64::from(self.extent[1]);
-                ensure!(
-                    matches!(self.resources.get(buffer.0),Some((_,Storage::Buffer{bytes:n,..})) if *n as u64/(if matches!(self.resources.get(image.0),Some((_,Storage::Color))){8}else{4})>=bytes),
-                    "undersized readback"
-                );
-            }
+            self.validate_pass(p, &defined, &mut tlas_sources)?;
             let mut seen = BTreeSet::new();
-            for (r, a) in self.uses(&p.op) {
+            for &(r, a) in &pass_uses[i] {
                 let (name, s) = self.resources.get(r.0).context("unknown resource")?;
                 ensure!(
                     seen.insert(r),
                     "{}: duplicate access to {name}, declare one read/write use",
                     p.name
                 );
+                ensure!(s.permits(a), "incompatible access to {name}");
                 ensure!(
-                    match s {
-                        Storage::Color =>
-                            matches!(a, Access::ColorClear | Access::ColorLoad | Access::CopySrc),
-                        Storage::Depth =>
-                            matches!(a, Access::DepthClear | Access::DepthLoad | Access::CopySrc),
-                        Storage::Buffer { .. } => !matches!(
-                            a,
-                            Access::ColorLoad
-                                | Access::ColorClear
-                                | Access::DepthLoad
-                                | Access::DepthClear
-                        ),
-                    },
-                    "incompatible access to {name}"
+                    !a.writes() || !self.tables.contains_key(&r),
+                    "write to read-only scene table {name}"
                 );
                 ensure!(
                     !a.reads() || defined[r.0],
                     "{} reads uninitialized {name}",
                     p.name
                 );
+                if s.image(self.extent).is_some() {
+                    image_usage[r.0].sampled |=
+                        matches!(a, Access::ComputeSample | Access::SdkImageRead);
+                    image_usage[r.0].copy_source |= a == Access::CopySrc;
+                    image_usage[r.0].copy_destination |=
+                        matches!(a, Access::CopyDst | Access::SdkImageWrite);
+                    image_usage[r.0].storage |= a == Access::SdkImageWrite;
+                    if last_image[r.0]
+                        .replace(a)
+                        .is_some_and(|previous| previous != a)
+                    {
+                        deps[i].extend(readers[r.0].iter().copied());
+                    }
+                }
                 if (!a.writes() || readers[r.0].is_empty())
                     && let Some(w) = writers[r.0]
                 {
@@ -494,6 +818,11 @@ impl Graph {
         for r in self.histories.keys() {
             history[r.0] = vec![Access::Upload, Access::CopyDst, Access::ComputeWrite];
         }
+        // Each version table belongs to its retired frame-slot CLAS allocation.
+        for (versions, cache) in &self.cluster_caches {
+            history[versions.0] = vec![Access::Upload, Access::ComputeWrite];
+            history[cache.output.0] = vec![Access::AccelerationWrite, Access::RayAcceleration];
+        }
         let mut dependents = vec![Vec::new(); deps.len()];
         let mut remaining = Vec::with_capacity(deps.len());
         let mut ready = BTreeSet::new();
@@ -507,11 +836,19 @@ impl Graph {
             }
         }
         let mut steps = Vec::with_capacity(deps.len());
-        while let Some(i) = ready.pop_first() {
+        let mut previous_queue = None;
+        while !ready.is_empty() {
+            let i = ready
+                .iter()
+                .copied()
+                .find(|&i| Some(self.passes[i].queue) == previous_queue)
+                .unwrap_or_else(|| *ready.first().unwrap());
+            ready.remove(&i);
+            previous_queue = Some(self.passes[i].queue);
             let mut barriers = Vec::new();
-            for (r, a) in self.uses(&self.passes[i].op) {
+            for &(r, a) in &pass_uses[i] {
                 let prev = &mut history[r.0];
-                let image = !matches!(self.resources[r.0].1, Storage::Buffer { .. });
+                let image = self.image_desc(r).is_some();
                 // Preserve the writer for fan-out to readers at different stages.
                 let hazard = !prev.is_empty()
                     && (a.writes() || !prev.contains(&a) && prev.iter().any(|p| p.writes()));
@@ -542,13 +879,17 @@ impl Graph {
             });
         }
         ensure!(steps.len() == self.passes.len(), "cyclic pass dependencies");
+        ensure!(
+            self.resident_inputs.iter().all(|r| writers[r.0].is_none()),
+            "resident input may not be written by a pass"
+        );
         Ok(Plan {
-            build_ms: 0.,
-            main_ms: 0.,
             compile_ms: started.elapsed().as_secs_f64() * 1000.,
             graph: self,
             steps,
             written: writers.iter().map(Option::is_some).collect(),
+            image_usage,
+            pass_uses,
         })
     }
 }

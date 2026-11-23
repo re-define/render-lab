@@ -1,6 +1,6 @@
 //! Brute-force motion matching reference. All distances and velocities are in character space.
 use crate::{
-    engine::{Edit, System},
+    engine::{Edit, SimulationData, System, SystemAccess},
     scene::*,
 };
 use anyhow::{Context, Result, ensure};
@@ -197,58 +197,51 @@ impl Matcher {
     }
 }
 impl System for Matcher {
+    fn access(&self) -> SystemAccess {
+        use SimulationData::{Component, LocalTransform};
+        SystemAccess {
+            name: "Motion matcher",
+            reads: &[Component(PLAYER)],
+            writes: &[Component(PLAYER), LocalTransform],
+        }
+    }
     fn update(&self, w: &World, dt: f32) -> Result<Edit> {
         let mut changes = vec![];
-        for (&id, e) in &w.entities {
-            if let Some(raw) = e.components.get(PLAYER) {
-                let mut p: Player = serde_json::from_value(raw.clone())?;
-                ensure!(
-                    p.bones.iter().all(|i| w.entities.contains_key(i)),
-                    "motion player refers to missing bones"
-                );
-                self.advance(&mut p, dt)?;
-                let transforms = p
-                    .bones
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, j)| {
-                        (
-                            j,
-                            Mat4::from_rotation_translation(
-                                Quat::from_rotation_x(p.angles[i]),
-                                OFFSETS[i],
-                            ),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                changes.push((id, serde_json::to_value(p)?, transforms));
-            }
+        for &id in w.entities.component_owners(PLAYER) {
+            let raw = &w.entities[&id].components[PLAYER];
+            let mut p: Player = serde_json::from_value(raw.clone())?;
+            self.advance(&mut p, dt)?;
+            let transforms = LocalPose::prepare(
+                w,
+                p.bones.into_iter().enumerate().map(|(i, j)| {
+                    (
+                        j,
+                        Mat4::from_rotation_translation(
+                            Quat::from_rotation_x(p.angles[i]),
+                            OFFSETS[i],
+                        ),
+                    )
+                }),
+            )?;
+            changes.push((id, serde_json::to_value(p)?, transforms));
         }
         Ok(Box::new(move |w| {
             for (id, state, transforms) in changes {
-                for (bone, local) in transforms {
-                    if let Some(e) = w.entities.get_mut(&bone) {
-                        e.local = local;
-                    }
-                }
-                if let Some(e) = w.entities.get_mut(&id) {
-                    e.components.insert(PLAYER.into(), state);
-                }
+                transforms.apply(w);
+                w.set_setting_if_present(id, PLAYER, state);
             }
         }))
     }
 }
 pub fn set_goal(w: &mut World, speed: f32, turn: f32) -> Result<()> {
     ensure!(speed.is_finite() && turn.is_finite(), "invalid motion goal");
-    let raw = w
-        .entities
-        .values_mut()
-        .find_map(|e| e.components.get_mut(PLAYER))
+    let (id, raw) = w
+        .first_raw_component(PLAYER)
         .context("this scene has no motion player")?;
     let mut player: Player = serde_json::from_value(raw.clone())?;
     player.speed = speed;
     player.turn = turn;
-    *raw = serde_json::to_value(player)?;
+    w.set_setting(id, PLAYER, serde_json::to_value(player)?);
     Ok(())
 }
 pub fn scene() -> World {
@@ -337,12 +330,7 @@ pub fn scene() -> World {
     });
     let mut actor = Entity {
         name: "Motion matching mannequin".into(),
-        instance: Some(Instance {
-            mesh: geometry,
-            material: Some(material),
-            legacy_shading: None,
-            outline: false,
-        }),
+        instance: Some(Instance::new(geometry, Some(material))),
         skin_binding: Some(skin),
         ..Default::default()
     };

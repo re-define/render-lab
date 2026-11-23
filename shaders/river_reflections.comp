@@ -1,0 +1,66 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#include "visibility_image.glsl"
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=1) uniform texture2D surfaceDepth;
+layout(set=0,binding=2,std430) buffer SceneColor {uint pixels[];};
+struct Reflector {mat4 inverseModel;uvec4 info;};
+layout(set=0,binding=3,std430) readonly buffer View {mat4 vp;mat4 invVP;vec4 eye;uvec4 config;Reflector rivers[];};
+layout(buffer_reference,std430,buffer_reference_align=16) readonly buffer Vertices {vec4 v[];};
+layout(buffer_reference,std430,buffer_reference_align=16) readonly buffer Faces {uvec4 f[];};
+struct Streams {Vertices vertices;Faces faces;};
+layout(set=0,binding=4,std430) readonly buffer Geometry {Streams streams[];};
+int water(uint id){
+    for(uint i=0;i<config.x;++i)if(id==rivers[i].info.x)return int(i);
+    return -1;
+}
+vec3 world(ivec2 q,ivec2 size){
+    vec2 ndc=2.*(vec2(q)+.5)/vec2(size)-1.;
+    vec4 h=invVP*vec4(ndc,texelFetch(surfaceDepth,q,0).x,1.);
+    return h.xyz/h.w;
+}
+void main(){
+    ivec2 q=ivec2(gl_GlobalInvocationID.xy), size=textureSize(surfaceDepth,0);
+    if(any(greaterThanEqual(q,size)))return;
+    uvec2 surface=visibilityAt(uvec2(q));
+    int owner=water(surface.x);
+    if(owner<0)return;
+    vec3 pos=world(q,size);
+    mat4 invModel=rivers[owner].inverseModel;
+    vec2 local=(invModel*vec4(pos,1.)).xz;
+    Streams geometry=streams[owner];
+    uvec3 tri=geometry.faces.f[surface.y].xyz;
+    vec2 a=geometry.vertices.v[2*tri.x].xz;
+    vec2 b=geometry.vertices.v[2*tri.y].xz-a,c=geometry.vertices.v[2*tri.z].xz-a,delta=local-a;
+    float det=b.x*c.y-b.y*c.x;
+    vec2 weights=clamp(vec2(delta.x*c.y-delta.y*c.x,b.x*delta.y-b.y*delta.x)/det,0.,1.);
+    vec3 n=normalize(transpose(mat3(invModel))*(geometry.vertices.v[2*tri.x+1].xyz*(1.-weights.x-weights.y)
+            +geometry.vertices.v[2*tri.y+1].xyz*weights.x+geometry.vertices.v[2*tri.z+1].xyz*weights.y));
+    vec3 incident=normalize(pos-eye.xyz),ray=reflect(incident,n);
+    float grazing=pow(1.-clamp(-dot(incident,n),0.,1.),2.);
+    float distance=.30;
+    for(int i=0;i<42;++i){
+        vec3 at=pos+n*.09+ray*distance;
+        vec4 clip=vp*vec4(at,1.);
+        if(clip.w<=0.)return;
+        vec2 uv=.5+.5*clip.xy/clip.w;
+        if(any(lessThan(uv,vec2(.001))) || any(greaterThan(uv,vec2(.999))))return;
+        ivec2 hit=ivec2(uv*vec2(size));
+        uint target=visibilityAt(uvec2(hit)).x;
+        if(target!=0u && water(target)<0){
+            float delta=length(at-eye.xyz)-length(world(hit,size)-eye.xyz);
+            if(delta>=0. && delta<.55+.14*distance){
+                float edge=min(min(uv.x,uv.y),min(1.-uv.x,1.-uv.y));
+                float confidence=(1.-smoothstep(.08,.55+.14*distance,delta));
+                float alpha=(.13+.43*grazing)*confidence*smoothstep(.0,.07,edge)*(1.-smoothstep(50.,100.,distance));
+                uint pixel=q.y*size.x+q.x;
+                vec3 original=unpackUnorm4x8(pixels[pixel]).rgb;
+                vec3 reflected=unpackUnorm4x8(pixels[hit.y*size.x+hit.x]).rgb;
+                pixels[pixel]=packUnorm4x8(vec4(mix(original,reflected*vec3(.91,.94,.91),alpha),1.));
+                return;
+            }
+        }
+        distance=distance*1.085+.27;
+    }
+}

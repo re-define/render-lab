@@ -3,14 +3,35 @@
 layout(local_size_x=8,local_size_y=8) in;
 layout(set=0,binding=0,std430) buffer Hierarchy{float z[];};
 layout(set=0,binding=1,std430) readonly buffer Camera{View view;};
-layout(push_constant) uniform Params{layout(offset=8) uvec2 srcSize;uint src;uint dst;}p;
+#ifdef SOURCE_DEPTH
+#extension GL_EXT_samplerless_texture_functions : require
+layout(set=0,binding=2) uniform texture2D sceneDepth;
+#define START 12
+#elif defined(SOURCE_VOXELS)
+layout(set=0,binding=2,std430) readonly buffer RasterDepth { uvec2 winners[]; };
+#define START 12
+#else
+#define START 8
+#endif
+layout(push_constant) uniform Params{layout(offset=START) uint width;uint height;uint src;uint dst;}p;
 void main(){
-    uvec2 dstSize=(p.srcSize+1)/2,xy=gl_GlobalInvocationID.xy;
+    uvec2 srcSize=uvec2(p.width,p.height);
+    uvec2 dstSize=(srcSize+1)/2,xy=gl_GlobalInvocationID.xy;
     if(any(greaterThanEqual(xy,dstSize)))return;
     float farthest=0;
     for(uint y=0;y<2;y++)for(uint x=0;x<2;x++){
-        uvec2 src=min(xy*2+uvec2(x,y),p.srcSize-1);
-        farthest=max(farthest,z[p.src+src.y*p.srcSize.x+src.x]);
+        uvec2 src=min(xy*2+uvec2(x,y),srcSize-1);
+        uint index=p.src+src.y*p.width+src.x;
+#ifdef SOURCE_DEPTH
+        float depth=texelFetch(sceneDepth,ivec2(src),0).x;
+        z[index]=depth;
+#elif defined(SOURCE_VOXELS)
+        float depth=uintBitsToFloat(~winners[index].y);
+        z[index]=depth;
+#else
+        float depth=z[index];
+#endif
+        farthest=max(farthest,depth);
     }
     z[p.dst+xy.y*dstSize.x+xy.x]=farthest;
     if(all(equal(dstSize,uvec2(1)))){

@@ -1,0 +1,28 @@
+#version 460
+#define IBL_TABLES 2
+#define IBL_CONFIG 3
+#include "ibl.glsl"
+#include "visibility_image.glsl"
+#ifdef HDR
+layout(set=0,binding=1,std430) buffer Color { vec4 pixels[]; };
+#else
+layout(set=0,binding=1,std430) buffer Color { uint pixels[]; };
+#endif
+layout(local_size_x=8,local_size_y=8) in;
+
+void main() {
+    uvec2 p=gl_GlobalInvocationID.xy, size=dimensions.xy;
+    if(any(greaterThanEqual(p,size))) return;
+    uint index=p.y*size.x+p.x;
+    if(visibilityAt(p).x!=0u) return;
+    vec2 ndc=(vec2(p)+0.5)*2.0/vec2(size)-1.0;
+    vec4 world=inverseVP*vec4(ndc,0.99,1.0);
+    vec3 direction=normalize(world.xyz/world.w-cameraEye.xyz);
+    vec3 hdr=iblSample(4u,direction);
+#ifdef HDR
+    pixels[index]=vec4(hdr*controls.x,1.0);
+#else
+    vec3 color=pow(iblToneMap(hdr),vec3(1.0/2.2));
+    pixels[index]=packUnorm4x8(vec4(color.bgr,1.0));
+#endif
+}

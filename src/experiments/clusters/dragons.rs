@@ -58,12 +58,7 @@ pub fn scene() -> Result<World> {
                     0.,
                     (z as f32 - 2.5) * 25.,
                 )) * Mat4::from_rotation_y((x + z) as f32 * 0.19),
-                instance: Some(Instance {
-                    mesh: dragon,
-                    material: Some(jade),
-                    legacy_shading: None,
-                    outline: false,
-                }),
+                instance: Some(Instance::new(dragon, Some(jade))),
                 ..Default::default()
             });
         }
@@ -105,12 +100,7 @@ pub fn scene() -> Result<World> {
     w.spawn(Entity {
         name: "Ordinary block".into(),
         local: Mat4::from_translation(Vec3::new(0., 0., 55.)),
-        instance: Some(Instance {
-            mesh: cube,
-            material: Some(clay),
-            legacy_shading: None,
-            outline: false,
-        }),
+        instance: Some(Instance::new(cube, Some(clay))),
         ..Default::default()
     });
     prepare(&mut w)?;

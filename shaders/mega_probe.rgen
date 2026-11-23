@@ -1,0 +1,31 @@
+// Regression probe: query the exact raster-visible triangle near its reconstructed position.
+#version 460
+#extension GL_EXT_ray_tracing : require
+#include "cluster.glsl"
+#include "restir_types.glsl"
+layout(binding=0,std430) readonly buffer Ids {uvec2 ids[];};
+layout(binding=1,std430) readonly buffer Positions {Surface surfaces[];};
+layout(binding=3,std430) readonly buffer Camera {View view;};
+layout(binding=4,std430) buffer Results {uint counts[];};
+layout(push_constant) uniform Params {layout(offset=20) uint tlasLo; uint tlasHi;} p;
+layout(location=0) rayPayloadEXT uint missed;
+void main(){
+    uint i=gl_LaunchIDEXT.x+gl_LaunchSizeEXT.x*gl_LaunchIDEXT.y;
+    if(ids[i].x==0u)return;
+    vec3 delta=surfaces[i].point.xyz-view.eyeFocal.xyz;
+    float d=length(delta), tolerance=max(.0005,.0001*d);
+    if(d<=tolerance)return;
+    missed=1u;
+    traceRayEXT(accelerationStructureEXT(uvec2(p.tlasLo,p.tlasHi)),gl_RayFlagsNoOpaqueEXT|gl_RayFlagsSkipClosestHitShaderEXT,
+        255,0,0,0,view.eyeFocal.xyz,d-tolerance,delta/d,d+tolerance,0);
+    atomicAdd(counts[0],1u);
+    if(missed==0u)atomicAdd(counts[1],1u);
+    vec2 xy=surfaces[i].normalOct; // The probe specialization stores unencoded barycentrics.
+    vec3 b=vec3(xy,1.-xy.x-xy.y);
+    // Raster setup snaps vertices to a subpixel grid. The analytic center of a
+    // covered edge pixel can lie outside the unsnapped hardware RT triangle.
+    if(min(b.x,min(b.y,b.z))>0.0001){
+        atomicAdd(counts[2],1u);
+        if(missed==0u)atomicAdd(counts[3],1u);
+    }
+}

@@ -3,9 +3,9 @@
 layout(local_size_x=32) in;
 layout(triangles, max_vertices=128, max_primitives=64) out;
 #include "outline.glsl"
-layout(set=0, binding=3, std430) readonly buffer Edges { uvec4 edges[]; };
-layout(set=0, binding=4, std430) readonly buffer Incidence { uint faceIds[]; };
-layout(push_constant) uniform Params { layout(offset=20) uint count; } p;
+layout(set=0, binding=4, std430) readonly buffer Edges { uvec4 edges[]; };
+layout(set=0, binding=5, std430) readonly buffer Incidence { uint faceIds[]; };
+layout(push_constant) uniform Params { layout(offset=24) uint count; } p;
 void main() {
     uint first = 32u * groupIndex(), n = min(p.count - min(first, p.count), 32u);
     SetMeshOutputsEXT(4u * n, 2u * n);

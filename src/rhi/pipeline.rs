@@ -1,12 +1,13 @@
 use super::*;
 use device::{COLOR, DEPTH, Gpu};
+use vulkanalia::vk::KhrRayTracingPipelineExtensionDeviceCommands;
 struct Module<'a>(&'a vulkanalia::Device, vk::ShaderModule);
 impl Drop for Module<'_> {
     fn drop(&mut self) {
         unsafe { self.0.destroy_shader_module(self.1, None) }
     }
 }
-pub(super) struct Pipeline(pub Arc<Gpu>, pub vk::Pipeline);
+pub(super) struct Pipeline(pub Arc<Gpu>, pub vk::Pipeline, pub Option<ray::ShaderTable>);
 impl Drop for Pipeline {
     fn drop(&mut self) {
         unsafe { self.0.dev.destroy_pipeline(self.1, None) }
@@ -52,6 +53,22 @@ impl Pipeline {
                 Shader::Graphics(v, f) => vec![
                     (vk::ShaderStageFlags::VERTEX, v),
                     (vk::ShaderStageFlags::FRAGMENT, f),
+                ],
+                Shader::ClusterShadows(generation, miss, any) => vec![
+                    (vk::ShaderStageFlags::RAYGEN_KHR, generation),
+                    (vk::ShaderStageFlags::MISS_KHR, miss),
+                    (vk::ShaderStageFlags::ANY_HIT_KHR, any),
+                ],
+                Shader::ClusterRays(generation, miss, any, closest) => vec![
+                    (vk::ShaderStageFlags::RAYGEN_KHR, generation),
+                    (vk::ShaderStageFlags::MISS_KHR, miss),
+                    (vk::ShaderStageFlags::ANY_HIT_KHR, any),
+                    (vk::ShaderStageFlags::CLOSEST_HIT_KHR, closest),
+                ],
+                Shader::RayTracing(generation, miss, closest) => vec![
+                    (vk::ShaderStageFlags::RAYGEN_KHR, generation),
+                    (vk::ShaderStageFlags::MISS_KHR, miss),
+                    (vk::ShaderStageFlags::CLOSEST_HIT_KHR, closest),
                 ],
             };
             let mut modules = vec![];
@@ -137,8 +154,63 @@ impl Pipeline {
                     d.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)?
                         .0[0]
                 }
+                Shader::RayTracing(..) | Shader::ClusterShadows(..) | Shader::ClusterRays(..) => {
+                    ensure!(
+                        g.ray.is_some(),
+                        "RT experiment requires VK_KHR_ray_tracing_pipeline"
+                    );
+                    let unused = vk::SHADER_UNUSED_KHR;
+                    let closest = match program.shader {
+                        Shader::RayTracing(..) => 2,
+                        Shader::ClusterRays(..) => 3,
+                        _ => unused,
+                    };
+                    let groups = [0, 1, 2].map(|index| {
+                        let hit = index == 2;
+                        vk::RayTracingShaderGroupCreateInfoKHR::builder()
+                            .type_(if hit {
+                                vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP
+                            } else {
+                                vk::RayTracingShaderGroupTypeKHR::GENERAL
+                            })
+                            .general_shader(if hit { unused } else { index })
+                            .closest_hit_shader(if hit { closest } else { unused })
+                            .any_hit_shader(if hit && program.shader.supports_clusters() {
+                                index
+                            } else {
+                                unused
+                            })
+                            .intersection_shader(unused)
+                            .build()
+                    });
+                    let mut info = vk::RayTracingPipelineCreateInfoKHR::builder()
+                        .stages(&stages)
+                        .groups(&groups)
+                        .max_pipeline_ray_recursion_depth(1)
+                        .push_next(&mut flags);
+                    let mut cluster =
+                        vk::RayTracingPipelineClusterAccelerationStructureCreateInfoNV::builder()
+                            .allow_cluster_acceleration_structure(true);
+                    if program.shader.supports_clusters() {
+                        info = info.push_next(&mut cluster);
+                    }
+                    d.create_ray_tracing_pipelines_khr(
+                        vk::DeferredOperationKHR::null(),
+                        vk::PipelineCache::null(),
+                        &[info],
+                        None,
+                    )?
+                    .0[0]
+                }
             };
-            Ok(Self(g.clone(), pipe))
+            let mut result = Self(g.clone(), pipe, None);
+            if matches!(
+                program.shader,
+                Shader::RayTracing(..) | Shader::ClusterShadows(..) | Shader::ClusterRays(..)
+            ) {
+                result.2 = Some(ray::ShaderTable::new(g, pipe)?);
+            }
+            Ok(result)
         }
     }
 }

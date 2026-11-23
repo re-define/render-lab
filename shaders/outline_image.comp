@@ -1,7 +1,7 @@
 #version 460
 layout(local_size_x=8,local_size_y=8) in;
-layout(set=0,binding=0,std430) readonly buffer Visibility { uvec2 ids[]; };
-layout(set=0,binding=1,std430) readonly buffer Depth { float z[]; };
+#include "visibility_image.glsl"
+layout(set=0,binding=1) uniform texture2D sceneDepth;
 layout(set=0,binding=2,std430) buffer Shaded { uint pixels[]; };
 layout(push_constant) uniform Params { layout(offset=16) uvec2 size; float width; } p;
 const ivec2 offsets[8] = ivec2[](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1),
@@ -10,16 +10,19 @@ void main() {
     ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(xy, ivec2(p.size)))) return;
     uint i = uint(xy.y) * p.size.x + uint(xy.x);
+    uint current=visibilityAt(uvec2(xy)).x;
+    float depth=texelFetch(sceneDepth,xy,0).x;
     float edge = 0.0;
     for (int j = 0; j < 8; ++j) {
         for (int r = 1; r <= int(ceil(p.width)); ++r) {
             ivec2 q = clamp(xy + offsets[j] * r, ivec2(0), ivec2(p.size)-1);
-            uint n = uint(q.y) * p.size.x + uint(q.x);
+            uint neighbor=visibilityAt(uvec2(q)).x;
             // Ink the farther side of an occlusion step. Normalize by inverse
             // depth so moving the camera does not require a new threshold.
-            bool silhouette = ids[i].x == 0u && ids[n].x != 0u;
-            bool depthEdge = ids[i].x != 0u && ids[n].x != 0u &&
-                z[i] - z[n] > 0.023 * max(1e-6, 1.0 - z[n]);
+            bool silhouette = current == 0u && neighbor != 0u;
+            float nearDepth=texelFetch(sceneDepth,q,0).x;
+            bool depthEdge=current != 0u && neighbor != 0u &&
+                depth-nearDepth > 0.023 * max(1e-6, 1.0 - nearDepth);
             if (silhouette || depthEdge)
                 edge = max(edge, clamp(p.width + 1.0 - length(vec2(offsets[j] * r)), 0.0, 1.0));
         }

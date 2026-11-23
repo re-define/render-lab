@@ -1,0 +1,32 @@
+#version 460
+#include "cluster.glsl"
+#include "visibility_image.glsl"
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=1,std430) readonly buffer Winners { uvec2 winners[]; };
+layout(binding=2,std430) readonly buffer Ranges { uvec4 ranges[]; };
+layout(binding=3,std430) readonly buffer Objects { Instance instances[]; };
+layout(binding=4,std430) writeonly buffer Ids { uvec2 ids[]; };
+layout(binding=5,std430) writeonly buffer Depth { uint depth[]; };
+layout(binding=6) uniform texture2D triangleDepth;
+void main() {
+    uvec2 xy=gl_GlobalInvocationID.xy, size=uvec2(textureSize(visibilityImage,0));
+    if(any(greaterThanEqual(xy,size))) return;
+    uint pixel=xy.x+xy.y*size.x;
+    uvec2 win=winners[pixel];
+    uint opaque=floatBitsToUint(texelFetch(triangleDepth,ivec2(xy),0).x);
+    if(win.x==0u || ~win.y>opaque) {
+        depth[pixel]=opaque;
+        ids[pixel]=visibilityAt(xy);
+        return;
+    }
+    depth[pixel]=~win.y;
+    uint hit=win.x-1u;
+    uint lo=0u,hi=uint(ranges.length());
+    while(lo+1u<hi) {
+        uint mid=(lo+hi)/2u;
+        if(ranges[mid].y<=hit) lo=mid; else hi=mid;
+    }
+    uvec4 r=ranges[lo];
+    uint local=hit-r.y;
+    ids[pixel]=uvec2(instances[r.x+local/r.z].routing.y+1u,(r.w<<6u)+local%r.z);
+}

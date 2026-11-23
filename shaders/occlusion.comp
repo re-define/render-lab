@@ -11,6 +11,18 @@ layout(set=0,binding=7,std430) buffer Stats{uint counters[];};
 layout(set=0,binding=8,std430) buffer Deferred{uvec4 deferredHead;uvec2 deferred[];};
 layout(set=0,binding=9,std430) buffer Dispatch{uvec4 postArgs;};
 #endif
+#ifdef BRICKS
+#ifdef POST
+#define BRICK_BASE 8
+#else
+#define BRICK_BASE 10
+#endif
+layout(set=0,binding=BRICK_BASE,std430) buffer BrickJobs { uvec4 brickHead; uvec4 brickJobs[]; };
+layout(set=0,binding=BRICK_BASE+1,std430) buffer BrickDispatch { uvec4 binDispatch; uvec4 rasterDispatch; };
+#ifndef SOFTWARE_ONLY
+layout(set=0,binding=BRICK_BASE+2,std430) buffer DepthBins { uint binCount[4]; };
+#endif
+#endif
 
 bool hidden(vec4 sphere,mat4 model){
     if(z[view.screen.z+16]!=1.0)return false;
@@ -39,6 +51,7 @@ void main(){
     uvec2 pair=candidates[idx];
     Instance obj=instances[pair.x];
     Cluster c=assets[obj.routing.z].clusters.data[pair.y];
+    if(view.foliage.y!=0. && outsideFrustum(view.vp*obj.model,c.sphere))return;
     if(hidden(c.sphere,obj.model)){
 #ifndef POST
         uint slot=atomicAdd(deferredHead.x,1);
@@ -48,14 +61,38 @@ void main(){
 #endif
         return;
     }
-    uint slot=atomicAdd(visibleHead.x,1);visible[slot]=pair;
-    uint page=slot/view.screen.w, local=slot%view.screen.w;
-    if(local<ROW_GROUPS) atomicMax(drawArgs[page].x,local+1);
-    if(local>=ROW_GROUPS && local%ROW_GROUPS==0u) atomicMax(drawArgs[page].y,local/ROW_GROUPS+1u);
 #ifdef POST
     atomicAdd(counters[5],1);
 #else
     atomicAdd(counters[3],1);
 #endif
     atomicAdd(counters[6+min(c.meta.z,9u)],c.span.w);
+    if ((obj.tex.w & PLANT) != 0u)
+        atomicAdd(counters[(c.meta.w & VOXEL_CLUSTER) != 0u ? 19u : 18u], 1u);
+#ifdef BRICKS
+    if ((c.meta.w & VOXEL_CLUSTER) != 0u) {
+        uint groups=((c.meta.w>>1u)+7u)/8u;
+        atomicAdd(counters[26],c.meta.w>>1u);
+        uint bin=0u,rank=0u;
+#ifndef SOFTWARE_ONLY
+        vec4 center=view.vp*obj.model*vec4(c.sphere.xyz,1.);
+        float nearest=max(0.,center.w-c.sphere.w*obj.params.z);
+        bin=uint(nearest>=32.)+uint(nearest>=96.)+uint(nearest>=256.);
+        rank=atomicAdd(binCount[bin],groups);
+#endif
+        uint slot=atomicAdd(brickHead.x,groups);
+        for(uint i=0u;i<groups;i++) brickJobs[slot+i]=uvec4(pair,bin|(8u*i<<2u),rank+i);
+#ifndef SOFTWARE_ONLY
+        PUBLISH_WORK(binDispatch,slot,groups,64u);
+#endif
+#if defined(SOFTWARE_ONLY) || defined(COMPARE)
+        PUBLISH_WORK(rasterDispatch,slot,groups,1u);
+#endif
+        return;
+    }
+#endif
+    uint slot=atomicAdd(visibleHead.x,1);visible[slot]=pair;
+    uint page=slot/view.screen.w, local=slot%view.screen.w;
+    if(local<ROW_GROUPS) atomicMax(drawArgs[page].x,local+1);
+    if(local>=ROW_GROUPS && local%ROW_GROUPS==0u) atomicMax(drawArgs[page].y,local/ROW_GROUPS+1u);
 }

@@ -1,0 +1,34 @@
+#version 460
+#include "lighting_scene.glsl"
+layout(set=0,binding=0,std430) readonly buffer Direct { LightingPixel lightPixels[]; };
+layout(set=0,binding=1,std430) readonly buffer LowResolution { vec4 raw[]; };
+layout(set=0,binding=2,std430) writeonly buffer Indirect { vec4 bounce[]; };
+layout(set=0,binding=3,std430) readonly buffer Camera { mat4 vp; vec4 eye; uvec2 screen; };
+layout(local_size_x=8,local_size_y=8) in;
+
+void main() {
+    uvec2 xy=gl_GlobalInvocationID.xy;
+    if(any(greaterThanEqual(xy,screen))) return;
+    uint pixel=xy.y*screen.x+xy.x;
+    LightingPixel center=lightPixels[pixel];
+    vec3 sum=vec3(0);
+    float total=0.0;
+    if(center.position.w>0.0){
+        ivec2 extent=ivec2((screen+1u)/2u);
+        for(int y=-2;y<=2;++y) for(int x=-2;x<=2;++x){
+            ivec2 i=ivec2(xy/2u)+ivec2(x,y);
+            if(any(lessThan(i,ivec2(0))) || any(greaterThanEqual(i,extent))) continue;
+            uvec2 uv=min(uvec2(i)*2u+1u,screen-1u);
+            LightingPixel tap=lightPixels[uv.y*screen.x+uv.x];
+            if(tap.position.w==0.0) continue;
+            vec3 diff=tap.position.xyz-center.position.xyz;
+            float plane=abs(dot(diff,center.normal.xyz));
+            float normalWeight=pow(max(dot(center.normal.xyz,tap.normal.xyz),0.0),16.0);
+            vec2 distance=vec2(uv)-vec2(xy);
+            float w=normalWeight*exp(-0.063*dot(distance,distance)-65.0*plane);
+            sum+=w*raw[i.y*extent.x+i.x].rgb;
+            total+=w;
+        }
+    }
+    bounce[pixel]=vec4(sum/max(total,0.0001),0.0);
+}

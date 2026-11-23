@@ -15,10 +15,18 @@ void main() {
     Instance obj = instances[job.x];
     Asset asset = assets[obj.routing.z];
     Cluster cluster = asset.clusters.data[job.y];
-    if (outsideFrustum(view.vp * obj.model, cluster.sphere)) return;
+    if (outsideCasterVolume(obj.model,cluster.sphere,view)) return;
+    float low = 0.0;
     if (cluster.meta.y != NONE) {
         Group finer = asset.groups.data[cluster.meta.y];
-        if (refine(finer.error, finer.sphere, obj, view)) return;
+        low = refinementWeight(finer.error, finer.sphere, obj, view);
+        if (low >= 1.0) return;
+    }
+    if (foliageLod(obj)) {
+        Group owner = asset.groups.data[cluster.meta.x];
+        float high = refinementWeight(owner.error, owner.sphere, obj, view);
+        if (round(low * 65535.0) >= round(high * 65535.0)) return;
+        if (low > 0.0 || high < 1.0) atomicAdd(counters[20], 1u);
     }
     uint slot = atomicAdd(selectedHead.x, 1u);
     selected[slot] = job;

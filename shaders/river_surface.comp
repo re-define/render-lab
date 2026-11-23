@@ -1,0 +1,43 @@
+#version 460
+layout(local_size_x=8,local_size_y=8) in;
+struct Vertex {vec4 p;vec4 n;};
+layout(set=0,binding=0,std430) readonly buffer Rest {Vertex bed[];};
+layout(set=0,binding=1,std430) writeonly buffer Result {vec4 data[];};
+layout(push_constant) uniform Params {layout(offset=8) uvec2 grid;float time;float dt;float dz;
+#ifdef PREVIOUS
+    layout(offset=32) mat4 model;
+#endif
+} p;
+float speed(float u){return 1.10+0.61*(1.0-u*u);}
+float heightAt(vec3 rest,float u,float t){
+    float s=rest.z-1.52*t;
+    return .058*sin(s*1.25+4.1*u+1.2*sin(rest.z*.15))
+         + .028*sin(2.19*(rest.z-1.11*t)-7.9*u+.55*sin(rest.x*.51))
+         + .014*cos(3.2*s+13.*u);
+}
+vec3 at(ivec2 cell) {
+    cell=clamp(cell,ivec2(0),ivec2(p.grid)-1);
+    vec4 v=bed[cell.y*int(p.grid.x)+cell.x].p;
+    return v.xyz+vec3(0,heightAt(v.xyz,v.w,p.time),0);
+}
+void main(){
+    uvec2 c=gl_GlobalInvocationID.xy;
+    if(any(greaterThanEqual(c,p.grid)))return;
+    uint id=c.y*p.grid.x+c.x;
+    vec4 rest=bed[id].p;
+    float u=rest.w;
+#ifdef PREVIOUS
+    float prev=float(c.y)-p.dt*speed(u)/p.dz;
+    if(prev<0.){data[id]=vec4(0);return;}
+    uint row=uint(floor(prev));
+    vec3 old=mix(bed[row*p.grid.x+c.x].p.xyz,bed[min(row+1,p.grid.y-1)*p.grid.x+c.x].p.xyz,fract(prev));
+    data[id]=p.model*vec4(old+vec3(0,heightAt(old,u,p.time),0),1);
+#else
+    ivec2 q=ivec2(c);
+    vec3 n=normalize(cross(at(q+ivec2(0,1))-at(q-ivec2(0,1)),
+                           at(q+ivec2(1,0))-at(q-ivec2(1,0))));
+    // Transport material detail along the same channel lane as the temporal correspondence.
+    data[2*id]=vec4(at(q),1.52*(rest.z/speed(u)-p.time));
+    data[2*id+1]=vec4(n,u);
+#endif
+}

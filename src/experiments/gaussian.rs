@@ -1,12 +1,12 @@
 //! Indexed random access to exported 2DGaussian texture fields.
 mod bvh;
 mod compact;
-use super::texture::{self, MaterialAtlas};
+use super::texture;
 use crate::{
     engine::Engine,
     import,
-    rdg::Graph,
-    render::{Camera, MaterialPrograms, Snapshot, Technique},
+    render::FrameGraph,
+    render::{AtlasCache, Camera, Forward, MaterialPrograms, Snapshot, Technique},
     scene::*,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -54,9 +54,7 @@ struct Settings {
 impl Settings {
     fn read(w: &World) -> Result<(Id, Self)> {
         let (id, value) = w
-            .entities
-            .iter()
-            .find_map(|(&id, e)| Some((id, e.components.get(SETTING)?)))
+            .first_raw_component(SETTING)
             .context("open the gaussian experiment first")?;
         Ok((id, serde_json::from_value(value.clone())?))
     }
@@ -286,7 +284,7 @@ pub fn register(materials: &mut MaterialPrograms) -> Result<()> {
 pub struct Gaussian {
     id: Id,
     blob: Option<Arc<Vec<u8>>>,
-    atlas: MaterialAtlas,
+    atlas: AtlasCache,
 }
 impl Gaussian {
     fn payload(w: &World, id: Id) -> Result<&Arc<Vec<u8>>> {
@@ -327,14 +325,17 @@ impl Gaussian {
     }
 }
 impl Technique for Gaussian {
-    fn build(&self, s: &Snapshot) -> Result<Graph> {
+    fn build(&self, s: &Snapshot) -> Result<FrameGraph> {
         let payloads = self
             .blob
             .as_ref()
             .map(|v| (self.id, v.as_slice()))
             .into_iter()
             .collect::<BTreeMap<_, _>>();
-        self.atlas.frame(s, &payloads, "Gaussian material atlas")
+        let atlas = self
+            .atlas
+            .get(&s.scene, &payloads, "Gaussian material atlas")?;
+        Forward::default().build_with_atlas(s, atlas)
     }
 }
 pub fn command(engine: &mut Engine, arg: &str) -> Result<String> {
@@ -441,7 +442,7 @@ mod tests {
         let mut gpu = Backend::open()?;
         let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
         let mut decode = |payload, code| -> Result<_> {
-            let mut g = Graph::new([layout.width, layout.height]);
+            let mut g = FrameGraph::new([layout.width, layout.height]);
             let atlas = g.input("Gaussian payload", payload);
             let output = g.resource(
                 "Decoded texels",
@@ -464,7 +465,7 @@ mod tests {
                     groups: [layout.width.div_ceil(8), layout.height.div_ceil(8), 1],
                 },
             );
-            g.pass("Read RGB", Op::HostRead(output));
+            g.set_output(output);
             Ok(gpu.execute(g.compile()?, &pool)?.pixels)
         };
         let original = decode(
@@ -525,12 +526,7 @@ mod tests {
         let mut draw = |mode| -> Result<_> {
             cfg.mode = mode;
             cfg.store(&mut w, id)?;
-            let s = Snapshot {
-                world: Arc::new(w.clone()),
-                camera: camera(&w)?,
-                extent: [321, 201],
-                materials: shared.clone(),
-            };
+            let s = Snapshot::new(&w, camera(&w)?, [321, 201], shared.clone())?;
             let graph = Gaussian::new(&w)?.build(&s)?;
             gpu.execute(graph.compile()?, &pool)
         };

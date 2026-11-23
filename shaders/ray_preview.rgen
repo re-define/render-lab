@@ -1,0 +1,70 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#include "ray_preview.glsl"
+layout(set=0,binding=1,std430) readonly buffer View {
+    mat4 inverseVP;
+    vec4 eye;
+    uvec4 modes;
+};
+layout(set=0,binding=2,std430) writeonly buffer Color { uint pixels[]; };
+// Three descriptor indices, followed by a pad word and the TLAS device address.
+layout(push_constant) uniform Params { layout(offset=16) uvec2 tlas; } p;
+layout(location=0) rayPayloadEXT RayHit surface;
+
+RayHit hit(vec3 origin, vec3 direction) {
+    traceRayEXT(accelerationStructureEXT(p.tlas),gl_RayFlagsOpaqueEXT,
+        255,0,0,0,origin,0.002,direction,90.0,0);
+    return surface;
+}
+
+bool inShadow(vec3 origin, vec3 direction, float limit) {
+    surface.distance=0.0;
+    traceRayEXT(accelerationStructureEXT(p.tlas),
+        gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+        255,0,0,0,origin,0.002,direction,limit,0);
+    return surface.distance>=0.0;
+}
+
+vec3 sky(vec3 dir) {
+    return mix(vec3(0.20,0.25,0.35),vec3(0.69,0.79,0.92),clamp(dir.y*0.9+0.20,0.0,1.0));
+}
+
+vec3 direct(RayHit h, vec3 position) {
+    vec3 delta=vec3(-3.6,6.4,3.5)-position;
+    float distance=length(delta);
+    vec3 light=delta/distance;
+    float cosine=max(dot(h.normal,light),0.0);
+    float visible=cosine>0.0 && !inShadow(position+h.normal*0.006,light,distance-0.01) ? 1.0 : 0.0;
+    return h.material.rgb*(0.09+visible*cosine*48.0/dot(delta,delta));
+}
+
+void main() {
+    vec2 uv=(vec2(gl_LaunchIDEXT.xy)+0.5)/vec2(gl_LaunchSizeEXT.xy)*2.0-1.0;
+    vec4 farPoint=inverseVP*vec4(uv,0.99,1.0);
+    vec3 direction=normalize(farPoint.xyz/farPoint.w-eye.xyz);
+    RayHit primary=hit(eye.xyz,direction);
+    vec3 color=modes.x==0u ? sky(direction) : vec3(0.02);
+    if(primary.distance>=0.0){
+        vec3 position=eye.xyz+direction*primary.distance;
+        if(modes.x==1u) color=primary.normal*0.5+0.5;
+        else if(modes.x==4u){
+            vec3 delta=vec3(-3.6,6.4,3.5)-position;
+            bool occluded=inShadow(position+primary.normal*0.006,normalize(delta),length(delta)-0.01);
+            color=vec3(occluded?0.13:0.85);
+        }
+        else if(modes.x==2u) color=vec3(exp(-primary.distance*0.12));
+        else {
+            vec3 reflected=vec3(0);
+            if(primary.material.w>0.0){
+                vec3 ray=reflect(direction,primary.normal);
+                vec3 origin=position+primary.normal*0.008;
+                RayHit secondary=hit(origin,ray);
+                reflected=secondary.distance<0.0 ? sky(ray) : direct(secondary,origin+ray*secondary.distance);
+                reflected *= mix(vec3(1),primary.material.rgb,0.5);
+            }
+            color=modes.x==3u ? reflected : mix(direct(primary,position),reflected,primary.material.w);
+        }
+    }
+    if(modes.x!=1u && modes.x!=2u && modes.x!=4u) color=pow(max(color,0.0),vec3(1.0/2.2));
+    pixels[gl_LaunchIDEXT.y*gl_LaunchSizeEXT.x+gl_LaunchIDEXT.x]=packUnorm4x8(vec4(color.bgr,1));
+}

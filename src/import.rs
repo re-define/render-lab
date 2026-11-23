@@ -8,6 +8,44 @@ use std::{
     sync::Arc,
 };
 
+fn material_uv(m: &gltf::Material<'_>) -> u32 {
+    m.pbr_metallic_roughness()
+        .base_color_texture()
+        .or_else(|| m.emissive_texture())
+        .map_or(0, |t| t.tex_coord())
+}
+fn imported_hit_material(m: &gltf::Material<'_>, textures: &[Id]) -> GiHitMaterial {
+    let mut hit = GiHitMaterial {
+        two_sided: m.double_sided(),
+        ..Default::default()
+    };
+    let factor = m.emissive_factor();
+    if factor == [0.; 3] {
+        return hit;
+    }
+    if let Some(map) = m.emissive_texture() {
+        // Ray vertices currently carry one UV channel, selected with the same rule as raster.
+        if map.tex_coord() == material_uv(m) {
+            let p = m.pbr_metallic_roughness();
+            hit.reflectance = Some(std::array::from_fn(|i| {
+                p.base_color_factor()[i] * (1. - p.metallic_factor())
+            }));
+            hit.model = GiHitModel::Program {
+                nodes: vec![
+                    GiNode::Texture(GiTexture::Inherit),
+                    GiNode::Texture(GiTexture::Texture(textures[map.texture().source().index()])),
+                    GiNode::Constant(factor),
+                    GiNode::Multiply([1, 2]),
+                ],
+                diffuse: 0,
+                emission: 3,
+            };
+        }
+    } else {
+        hit.emission = factor;
+    }
+    hit
+}
 /// Build into a temporary world so a bad primitive never partially changes the live scene.
 pub fn import(target: &mut World, path: &Path) -> Result<Vec<Id>> {
     let (doc, buffers, images) =
@@ -60,6 +98,7 @@ pub fn import(target: &mut World, path: &Path) -> Result<Vec<Id>> {
                 name: m.name().unwrap_or("Material").into(),
                 material: Some(Material {
                     shading: Shading::Pbr,
+                    gi_hit: imported_hit_material(&m, &textures),
                     base_color: p.base_color_factor(),
                     metallic: p.metallic_factor(),
                     roughness: p.roughness_factor(),
@@ -103,11 +142,7 @@ pub fn import(target: &mut World, path: &Path) -> Result<Vec<Id>> {
                     .collect(),
                 other => bail!("unsupported glTF primitive mode {other:?}"),
             };
-            let uv_set = p
-                .material()
-                .pbr_metallic_roughness()
-                .base_color_texture()
-                .map_or(0, |t| t.tex_coord());
+            let uv_set = material_uv(&p.material());
             let id = w.spawn(Entity {
                 name: mesh.name().unwrap_or("Mesh").into(),
                 mesh: Some(Arc::new(Mesh {
@@ -222,12 +257,10 @@ pub fn import(target: &mut World, path: &Path) -> Result<Vec<Id>> {
                     name: format!("{} / {}", m.name().unwrap_or("Mesh"), p.index()),
                     parent: Some(nodes[n.index()]),
                     skin_binding: n.skin().map(|s| skins[s.index()]),
-                    instance: Some(Instance {
-                        mesh: meshes[&(m.index(), p.index())],
-                        material: p.material().index().map(|i| materials[i]),
-                        legacy_shading: None,
-                        outline: false,
-                    }),
+                    instance: Some(Instance::new(
+                        meshes[&(m.index(), p.index())],
+                        p.material().index().map(|i| materials[i]),
+                    )),
                     ..Default::default()
                 });
             }

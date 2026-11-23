@@ -1,10 +1,12 @@
-mod support;
 use anyhow::Result;
 use glam::Mat4;
 use render_lab::{
     engine::{Schedule, System},
     experiments::{clusters, motion},
-    render::{Camera, Forward, GeometrySelection, Snapshot, Technique},
+    render::{
+        Camera, Forward, GeometryPath, GeometrySelection, MeshId, SceneExtractor, Snapshot,
+        Technique,
+    },
     rhi::Backend,
     scene::*,
 };
@@ -13,7 +15,7 @@ use std::sync::Arc;
 #[test]
 fn cluster_cut_refines_and_round_trips() -> Result<()> {
     let mut w = clusters::terrain()?;
-    let dir = support::tempdir()?;
+    let dir = tempfile::tempdir()?;
     let path = dir.path().join("terrain.json");
     w.save(&path)?;
     w = World::load(&path)?;
@@ -23,15 +25,10 @@ fn cluster_cut_refines_and_round_trips() -> Result<()> {
             .values_mut()
             .find_map(|e| e.components.get_mut(clusters::SETTING))
             .unwrap() = px.into();
-        let view = Snapshot {
-            materials: Default::default(),
-            world: Arc::new(w),
-            camera,
-            extent: [480, 300],
-        };
+        let view = Snapshot::new(&w, camera, [480, 300], Default::default())?;
         let geom = view
-            .world
-            .entities
+            .scene
+            .meshes()
             .values()
             .find(|e| e.hierarchy.is_some())
             .unwrap();
@@ -88,6 +85,161 @@ fn motion_queries_change_clips_and_drive_skin() -> Result<()> {
     assert_ne!(before, w.entities[&initial.bones[1]].local);
     Ok(())
 }
+
+#[test]
+fn extraction_updates_only_the_affected_hierarchy_and_shares_rig_palettes() -> Result<()> {
+    let mut world = World::demo();
+    let original = world
+        .entities
+        .values()
+        .find_map(|e| e.instance.clone())
+        .unwrap();
+    let mut weighted = world.entities[&original.mesh]
+        .mesh
+        .as_deref()
+        .unwrap()
+        .clone();
+    weighted.joints = vec![[0; 4]; weighted.positions.len()];
+    weighted.weights = vec![[1., 0., 0., 0.]; weighted.positions.len()];
+    let topology = Arc::new(weighted.edges());
+    let mesh = world.spawn(Entity {
+        mesh: Some(Arc::new(weighted)),
+        meshlets: Some(Arc::new(vec![Meshlet {
+            triangles: vec![0],
+            refined_group: None,
+        }])),
+        hierarchy: Some(Arc::new(vec![ClusterNode {
+            meshlets: vec![0],
+            center: [0.; 3],
+            radius: 1.,
+            error: 0.,
+        }])),
+        topology: Some(topology),
+        ..Default::default()
+    });
+    let joint = world.spawn(Entity::default());
+    let child = world.spawn(Entity {
+        parent: Some(joint),
+        ..Default::default()
+    });
+    let skin = world.spawn(Entity {
+        skin: Some(Skin {
+            joints: vec![child],
+            inverse_bind: vec![Mat4::IDENTITY],
+        }),
+        ..Default::default()
+    });
+    let mut outline = Instance::new(mesh, original.material);
+    outline.outline = true;
+    let outlined = world.spawn(Entity {
+        instance: Some(outline),
+        ..Default::default()
+    });
+    let rigid = Instance::new(mesh, original.material);
+    let first_rigid = world.spawn(Entity {
+        instance: Some(rigid.clone()),
+        ..Default::default()
+    });
+    for _ in 1..2048 {
+        world.spawn(Entity {
+            instance: Some(rigid.clone()),
+            ..Default::default()
+        });
+    }
+    let binding = Entity {
+        instance: Some(rigid),
+        skin_binding: Some(skin),
+        ..Default::default()
+    };
+    let first_actor = world.spawn(binding.clone());
+    let second_actor = world.spawn(binding);
+    world.validate()?;
+    let mut world = Arc::new(world);
+    let mut extractor = SceneExtractor::default();
+    let mut extract =
+        |world: &World| extractor.snapshot(world, Camera::default(), [128, 80], Default::default());
+    let before = extract(&world)?;
+    let get = |scene: &render_lab::render::RenderScene, id| {
+        scene
+            .instances()
+            .iter()
+            .find(|i| i.id == id)
+            .unwrap()
+            .clone()
+    };
+    let asset = &before.scene.meshes()[&MeshId(mesh)];
+    assert_eq!(
+        get(&before.scene, first_rigid).geometry_path(asset, true),
+        GeometryPath::ClusterLod
+    );
+    assert_eq!(
+        get(&before.scene, outlined).geometry_path(asset, true),
+        GeometryPath::Ordinary
+    );
+    assert_eq!(
+        get(&before.scene, first_actor).geometry_path(asset, true),
+        GeometryPath::Ordinary
+    );
+    assert_eq!(Arc::strong_count(&world), 1);
+
+    Arc::make_mut(&mut world)
+        .entities
+        .get_mut(&joint)
+        .unwrap()
+        .local = Mat4::from_translation(glam::Vec3::X);
+    let after = extract(&world)?;
+    assert_eq!(after.scene.stats.transforms_updated, 2);
+    assert_eq!(after.scene.stats.palettes_updated, 1);
+    assert_eq!(after.scene.stats.instances_updated, 2);
+    assert!(Arc::ptr_eq(asset, &after.scene.meshes()[&MeshId(mesh)]));
+    for (old, new) in before.scene.instances().iter().zip(after.scene.instances()) {
+        assert_eq!(
+            Arc::ptr_eq(old, new),
+            old.id != first_actor && old.id != second_actor
+        );
+    }
+    let first = get(&after.scene, first_actor);
+    let second = get(&after.scene, second_actor);
+    assert!(Arc::ptr_eq(
+        first.palette.as_ref().unwrap(),
+        second.palette.as_ref().unwrap()
+    ));
+    assert_eq!(
+        first.palette.as_ref().unwrap()[0],
+        Mat4::from_translation(glam::Vec3::X)
+    );
+    assert_eq!(
+        get(&before.scene, first_actor).palette.as_ref().unwrap()[0],
+        Mat4::IDENTITY
+    );
+
+    Arc::make_mut(&mut world)
+        .entities
+        .get_mut(&joint)
+        .unwrap()
+        .parent = Some(child);
+    assert!(extract(&world).is_err());
+    Arc::make_mut(&mut world)
+        .entities
+        .get_mut(&joint)
+        .unwrap()
+        .parent = None;
+    Arc::make_mut(&mut world)
+        .entities
+        .get_mut(&child)
+        .unwrap()
+        .parent = None;
+    let detached = extract(&world)?;
+    assert_eq!(detached.scene.stats.transforms_updated, 1);
+    assert_eq!(
+        get(&detached.scene, first_actor).palette.as_ref().unwrap()[0],
+        Mat4::IDENTITY
+    );
+    let unchanged = extract(&world)?;
+    assert_eq!(unchanged.scene.stats.transforms_updated, 0);
+    assert_eq!(unchanged.scene.stats.instances_updated, 0);
+    Ok(())
+}
 #[test]
 #[ignore = "requires Vulkan 1.4 and VK_EXT_descriptor_heap"]
 fn experiments_share_gpu_backend_and_match_reference() -> Result<()> {
@@ -96,12 +248,8 @@ fn experiments_share_gpu_backend_and_match_reference() -> Result<()> {
     let w = Arc::new(clusters::terrain()?);
     let mut camera = Camera::fit(&w)?;
     camera.pitch = 0.5;
-    let mut view = Snapshot {
-        materials: Default::default(),
-        world: w,
-        camera,
-        extent: [256, 160],
-    };
+    let mut extraction = SceneExtractor::default();
+    let view = extraction.snapshot(&w, camera, [256, 160], Default::default())?;
     let reference = Forward {
         selection: Arc::new(clusters::ClusterLod::default()),
     };
@@ -124,15 +272,17 @@ fn experiments_share_gpu_backend_and_match_reference() -> Result<()> {
             .iter()
             .any(|&row| compact.passes[row].name.starts_with("Main Hi-Z"))
     }));
-    view.world = Arc::new(motion::scene());
-    view.camera = Camera::fit(&view.world)?;
+    let mut world = Arc::new(motion::scene());
+    let camera = Camera::fit(&world)?;
+    let view = extraction.snapshot(&world, camera, view.extent, view.materials.clone())?;
     let bind = draw(&mut gpu, &Forward::default(), &view)?;
     let mut schedule = Schedule::default();
     schedule.stage(vec![Arc::new(motion::Matcher::default())]);
     for _ in 0..10 {
-        schedule.tick(&mut view.world, 1. / 30., &pool)?;
+        schedule.tick(&mut world, 1. / 30., &pool)?;
     }
-    let posed = draw(&mut gpu, &Forward::default(), &view)?;
+    let posed_view = extraction.snapshot(&world, camera, view.extent, view.materials.clone())?;
+    let posed = draw(&mut gpu, &Forward::default(), &posed_view)?;
     assert_ne!(bind.pixels, posed.pixels);
     Ok(())
 }
@@ -171,16 +321,16 @@ fn different_assets_share_one_frontier_and_cluster_list() -> Result<()> {
         });
     }
     clusters::prepare(&mut world)?;
-    let view = Snapshot {
-        materials: Default::default(),
-        world: Arc::new(world),
-        camera: Camera {
+    let view = Snapshot::new(
+        &world,
+        Camera {
             pitch: 1.1,
             distance: 13.,
             ..Default::default()
         },
-        extent: [320, 240],
-    };
+        [320, 240],
+        Default::default(),
+    )?;
     let technique = clusters::ClusterLod::default();
     let graph = technique.build(&view)?;
     for name in ["Global BVH node list", "Global cluster candidates"] {
@@ -257,17 +407,18 @@ fn occlusion_history_recovers_after_camera_move() -> Result<()> {
     settings
         .components
         .insert(clusters::SETTING.into(), 0.into());
-    let mut s = Snapshot {
-        materials: Default::default(),
-        world: Arc::new(world),
-        camera: Camera {
+    let mut extractor = SceneExtractor::default();
+    let mut s = extractor.snapshot(
+        &world,
+        Camera {
             distance: 12.,
             pitch: 1.52,
             yaw: 0.,
             target: Vec3::ZERO,
         },
-        extent: [257, 159],
-    };
+        [257, 159],
+        Default::default(),
+    )?;
     let mut gpu = Backend::open()?;
     let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build()?;
     let clusters = clusters::ClusterLod::default();
@@ -295,12 +446,13 @@ fn occlusion_history_recovers_after_camera_move() -> Result<()> {
         different < 30,
         "visibility mismatch at {different} pixels after disocclusion"
     );
-    let e = Arc::make_mut(&mut s.world)
+    let e = world
         .entities
         .values_mut()
         .find(|e| e.components.contains_key(clusters::SETTING))
         .unwrap();
     e.components.insert(clusters::VISUALIZE.into(), true.into());
+    s = extractor.snapshot(&world, s.camera, s.extent, s.materials.clone())?;
     let debug = draw(&clusters, &s)?;
     assert_ne!(restored.pixels, debug.pixels);
     assert_eq!(
@@ -329,7 +481,7 @@ fn occlusion_history_recovers_after_camera_move() -> Result<()> {
 #[test]
 #[ignore = "requires local dragon glTF and Vulkan mesh shader"]
 fn dragon_farm_shares_geometry_and_displays_different_lod_cuts() -> Result<()> {
-    let world = clusters::scene()?;
+    let mut world = clusters::scene()?;
     let geometries = world
         .entities
         .values()
@@ -361,27 +513,24 @@ fn dragon_farm_shares_geometry_and_displays_different_lod_cuts() -> Result<()> {
         target: glam::Vec3::Y * 8.,
         ..Default::default()
     };
-    let mut s = Snapshot {
-        materials: Default::default(),
-        world: Arc::new(world),
-        extent: [403, 259],
-        camera,
-    };
+    let mut extractor = SceneExtractor::default();
+    let materials = Arc::<render_lab::render::MaterialPrograms>::default();
     let technique = clusters::ClusterLod::default();
     let mut gpu = Backend::open()?;
     let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build()?;
-    let mut draw = |s: &mut Snapshot, error: f32| {
-        let e = Arc::make_mut(&mut s.world)
+    let mut draw = |error: f32| {
+        let e = world
             .entities
             .values_mut()
             .find(|e| e.components.contains_key(clusters::SETTING))
             .unwrap();
         e.components.insert(clusters::SETTING.into(), error.into());
         e.components.insert(clusters::VISUALIZE.into(), true.into());
-        gpu.execute(technique.build(s)?.compile()?, &pool)
+        let s = extractor.snapshot(&world, camera, [403, 259], materials.clone())?;
+        gpu.execute(technique.build(&s)?.compile()?, &pool)
     };
-    let fine = draw(&mut s, 0.2)?;
-    let coarse = draw(&mut s, 1.5)?;
+    let fine = draw(0.2)?;
+    let coarse = draw(1.5)?;
     for frame in [&fine, &coarse] {
         assert!(frame.counters["Cluster tests"] < frame.counters["Potential clusters"]);
         assert!(frame.counters["Toon pixels"] > 0 && frame.counters["PBR pixels"] > 0);

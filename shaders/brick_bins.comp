@@ -1,0 +1,19 @@
+#version 460
+layout(local_size_x=64) in;
+layout(binding=0,std430) readonly buffer InputJobs { uvec4 head; uvec4 jobs[]; };
+layout(binding=1,std430) readonly buffer Counts { uint counts[4]; };
+layout(binding=2,std430) writeonly buffer Sorted { uvec4 sorted[]; };
+layout(binding=3,std430) writeonly buffer Draws { uvec4 draws[]; };
+layout(push_constant) uniform Params { layout(offset=16) uint pages; uint pageSize; } p;
+void main() {
+    uint index=(gl_WorkGroupID.x+32768u*gl_WorkGroupID.y)*64u+gl_LocalInvocationID.x;
+    if(index>=head.x) return;
+    uvec4 job=jobs[index];
+    uint bin=job.z & 3u, base=0u;
+    for(uint i=0u;i<bin;i++) base+=counts[i];
+    sorted[base+job.w]=uvec4(job.xy,job.z>>2u,0u);
+    if(job.w%p.pageSize==0u) {
+        uint n=min(p.pageSize,counts[bin]-job.w);
+        draws[bin*p.pages+job.w/p.pageSize]=uvec4(min(n,32768u),(n+32767u)/32768u,1u,0u);
+    }
+}

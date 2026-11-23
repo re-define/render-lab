@@ -1,16 +1,28 @@
 use super::*;
 use vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as S};
 use vulkanalia::vk::ExtMeshShaderExtensionDeviceCommands;
-fn scope(a: Access) -> (S, A, L) {
+pub(super) fn scope(a: Access) -> (S, A, L) {
     use Access::*;
     match a {
         Indirect => (S::DRAW_INDIRECT, A::INDIRECT_COMMAND_READ, L::UNDEFINED),
         Upload => (S::HOST, A::HOST_WRITE, L::UNDEFINED),
         Mesh => (S::MESH_SHADER_EXT, A::SHADER_STORAGE_READ, L::UNDEFINED),
+        MeshFragment => (
+            S::MESH_SHADER_EXT | S::FRAGMENT_SHADER,
+            A::SHADER_STORAGE_READ,
+            L::UNDEFINED,
+        ),
         Vertex => (S::VERTEX_SHADER, A::SHADER_STORAGE_READ, L::UNDEFINED),
         Fragment => (S::FRAGMENT_SHADER, A::SHADER_STORAGE_READ, L::UNDEFINED),
         ComputeRead => (S::COMPUTE_SHADER, A::SHADER_STORAGE_READ, L::UNDEFINED),
+        ComputeSample => (
+            S::COMPUTE_SHADER,
+            A::SHADER_SAMPLED_READ,
+            L::SHADER_READ_ONLY_OPTIMAL,
+        ),
         ComputeWrite => (S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE, L::UNDEFINED),
+        SdkImageRead => (S::ALL_COMMANDS, A::MEMORY_READ, L::GENERAL),
+        SdkImageWrite => (S::ALL_COMMANDS, A::MEMORY_WRITE, L::GENERAL),
         ComputeReadWrite => (
             S::COMPUTE_SHADER,
             A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE,
@@ -27,8 +39,48 @@ fn scope(a: Access) -> (S, A, L) {
             L::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
         ),
         CopySrc => (S::COPY, A::TRANSFER_READ, L::TRANSFER_SRC_OPTIMAL),
-        CopyDst => (S::COPY, A::TRANSFER_WRITE, L::UNDEFINED),
+        CopyDst => (S::COPY, A::TRANSFER_WRITE, L::TRANSFER_DST_OPTIMAL),
         HostRead => (S::HOST, A::HOST_READ, L::UNDEFINED),
+        ClusterBuildInput => (
+            S::ACCELERATION_STRUCTURE_BUILD_KHR,
+            A::INDIRECT_COMMAND_READ | A::SHADER_READ | A::ACCELERATION_STRUCTURE_READ_KHR,
+            L::UNDEFINED,
+        ),
+        AccelerationInput => (
+            S::ACCELERATION_STRUCTURE_BUILD_KHR,
+            A::SHADER_READ,
+            L::UNDEFINED,
+        ),
+        AccelerationRead => (
+            S::ACCELERATION_STRUCTURE_BUILD_KHR,
+            A::ACCELERATION_STRUCTURE_READ_KHR,
+            L::UNDEFINED,
+        ),
+        AccelerationWrite => (
+            S::ACCELERATION_STRUCTURE_BUILD_KHR,
+            A::ACCELERATION_STRUCTURE_WRITE_KHR,
+            L::UNDEFINED,
+        ),
+        RayAcceleration => (
+            S::RAY_TRACING_SHADER_KHR,
+            A::ACCELERATION_STRUCTURE_READ_KHR,
+            L::UNDEFINED,
+        ),
+        RayRead => (
+            S::RAY_TRACING_SHADER_KHR,
+            A::SHADER_STORAGE_READ,
+            L::UNDEFINED,
+        ),
+        RayReadWrite => (
+            S::RAY_TRACING_SHADER_KHR,
+            A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE,
+            L::UNDEFINED,
+        ),
+        RayWrite => (
+            S::RAY_TRACING_SHADER_KHR,
+            A::SHADER_STORAGE_WRITE,
+            L::UNDEFINED,
+        ),
     }
 }
 impl Recorder {
@@ -47,7 +99,13 @@ impl Recorder {
             match &res[b.resource.0] {
                 Physical::Image(i, ..) => images.push(
                     vk::ImageMemoryBarrier2::builder()
-                        .src_stage_mask(src)
+                        // Cross-queue waits target the consuming stage. Chain that wait
+                        // into the layout transition itself, including read-to-read moves.
+                        .src_stage_mask(if old != L::UNDEFINED && old != layout {
+                            src | dst
+                        } else {
+                            src
+                        })
                         .src_access_mask(access)
                         .dst_stage_mask(dst)
                         .dst_access_mask(next)
@@ -59,7 +117,12 @@ impl Recorder {
                         .subresource_range(i.range)
                         .build(),
                 ),
-                Physical::Buffer(_) if !src.is_empty() => {
+                Physical::Buffer(_)
+                | Physical::SharedBuffer(_)
+                | Physical::Acceleration(_)
+                | Physical::Clusters(_)
+                    if !src.is_empty() =>
+                {
                     memory.src_stage_mask |= src;
                     memory.src_access_mask |= access;
                     memory.dst_stage_mask |= dst;
@@ -109,9 +172,18 @@ impl Recorder {
         d.cmd_write_timestamp2(cmd, S::TOP_OF_PIPE, self.query, 0);
         self.barriers(step, res);
         let op = &plan.graph.passes[step.index].op;
+        if gpu.raster_queries && matches!(op, Op::Draw { .. }) {
+            if self.raster.is_none() {
+                self.raster = Some(raster_queries::Pools::new(&gpu)?);
+            }
+            self.raster.as_ref().unwrap().reset(cmd);
+        }
         if let Some(p) = op.program() {
             let point = match p.shader {
                 Shader::Graphics(..) | Shader::Mesh(..) => vk::PipelineBindPoint::GRAPHICS,
+                Shader::RayTracing(..) | Shader::ClusterShadows(..) | Shader::ClusterRays(..) => {
+                    vk::PipelineBindPoint::RAY_TRACING_KHR
+                }
                 _ => vk::PipelineBindPoint::COMPUTE,
             };
             d.cmd_bind_pipeline(cmd, point, pipes[&(p.shader, p.bindings.len())].1);
@@ -122,6 +194,12 @@ impl Recorder {
                 .flat_map(|(r, _)| (r.0 as u32).to_ne_bytes())
                 .collect::<Vec<_>>();
             data.extend(&p.push);
+            if let Op::TraceRays { tlas, .. } = *op {
+                let Physical::Acceleration(tlas) = &res[tlas.0] else {
+                    unreachable!()
+                };
+                data.extend(tlas.address.to_ne_bytes());
+            }
             if !data.is_empty() {
                 d.cmd_push_data_ext(
                     cmd,
@@ -135,7 +213,6 @@ impl Recorder {
                 );
             }
         }
-        let [width, height] = plan.graph.extent;
         match *op {
             Op::Draw {
                 color,
@@ -144,6 +221,7 @@ impl Recorder {
                 count,
                 ..
             } => {
+                let [width, height] = plan.graph.image_desc(color).unwrap().extent;
                 let load = if clear {
                     vk::AttachmentLoadOp::CLEAR
                 } else {
@@ -192,6 +270,9 @@ impl Recorder {
                     }],
                 );
                 d.cmd_set_scissor(cmd, 0, &[rect]);
+                if let Some(q) = &self.raster {
+                    q.begin(cmd);
+                }
                 match count {
                     DrawCount::Mesh([x, y, z]) => d.cmd_draw_mesh_tasks_ext(cmd, x, y, z),
                     DrawCount::MeshIndirect { args, offset } => d.cmd_draw_mesh_tasks_indirect_ext(
@@ -211,6 +292,9 @@ impl Recorder {
                         d.cmd_draw_indirect(cmd, res[r.0].buffer().raw, 0, 1, 16)
                     }
                 }
+                if let Some(q) = &self.raster {
+                    q.end(cmd);
+                }
                 d.cmd_end_rendering(cmd);
             }
             Op::Compute {
@@ -219,7 +303,85 @@ impl Recorder {
             Op::ComputeIndirect { args, offset, .. } => {
                 d.cmd_dispatch_indirect(cmd, res[args.0].buffer().raw, offset)
             }
-            Op::ReadPixels { image, buffer } => {
+            Op::BuildClusters {
+                records,
+                count,
+                addresses,
+                output,
+                ..
+            }
+            | Op::BuildClusterBottom {
+                record: records,
+                addresses,
+                output,
+                clusters: count,
+            } => {
+                let Physical::Clusters(allocation) = &res[output.0] else {
+                    unreachable!()
+                };
+                let key = pipes
+                    .iter()
+                    .find(|((shader, _), _)| shader.supports_clusters())
+                    .context("missing cluster-capable RT pipeline")?
+                    .1;
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::RAY_TRACING_KHR, key.1);
+                let triangle_build = matches!(op, Op::BuildClusters { .. });
+                allocation.record(
+                    &gpu,
+                    cmd,
+                    res[records.0].buffer().address,
+                    if triangle_build {
+                        res[count.0].buffer().address
+                    } else {
+                        0
+                    },
+                    if triangle_build {
+                        res[addresses.0].buffer().address
+                    } else {
+                        0
+                    },
+                );
+            }
+            Op::BuildBlas {
+                vertices,
+                indices,
+                output,
+                ..
+            } => {
+                let Physical::Acceleration(acceleration) = &res[output.0] else {
+                    unreachable!()
+                };
+                if acceleration.needs_build {
+                    acceleration.record(
+                        cmd,
+                        Some((
+                            res[vertices.0].buffer().address,
+                            res[indices.0].buffer().address,
+                        )),
+                    );
+                }
+            }
+            Op::BuildTlas { output, .. } => {
+                let Physical::Acceleration(acceleration) = &res[output.0] else {
+                    unreachable!()
+                };
+                if acceleration.needs_build {
+                    acceleration.record(cmd, None);
+                }
+            }
+            Op::TraceRays {
+                ref program,
+                extent,
+                ..
+            } => {
+                pipes[&(program.shader, program.bindings.len())]
+                    .2
+                    .as_ref()
+                    .unwrap()
+                    .trace(d, cmd, extent);
+            }
+            Op::ReadPixels { image, buffer } | Op::WritePixels { image, buffer } => {
+                let [width, height] = plan.graph.image_desc(image).unwrap().extent;
                 let layers = vk::ImageSubresourceLayers::builder()
                     .aspect_mask(res[image.0].image().range.aspect_mask)
                     .layer_count(1);
@@ -231,17 +393,52 @@ impl Recorder {
                         depth: 1,
                     })
                     .build();
-                d.cmd_copy_image_to_buffer(
+                let image = res[image.0].image().raw;
+                let buffer = res[buffer.0].buffer().raw;
+                if matches!(op, Op::ReadPixels { .. }) {
+                    d.cmd_copy_image_to_buffer(
+                        cmd,
+                        image,
+                        L::TRANSFER_SRC_OPTIMAL,
+                        buffer,
+                        &[region],
+                    );
+                } else {
+                    d.cmd_copy_buffer_to_image(
+                        cmd,
+                        buffer,
+                        image,
+                        L::TRANSFER_DST_OPTIMAL,
+                        &[region],
+                    );
+                }
+            }
+            Op::Dlss(dlss) => {
+                // Vendor temporal intermediates are private to the SDK and reused
+                // across dispatches on this same physical queue.
+                let memory = [vk::MemoryBarrier2::builder()
+                    .src_stage_mask(S::ALL_COMMANDS)
+                    .src_access_mask(A::MEMORY_WRITE)
+                    .dst_stage_mask(S::ALL_COMMANDS)
+                    .dst_access_mask(A::MEMORY_READ | A::MEMORY_WRITE)
+                    .build()];
+                d.cmd_pipeline_barrier2(
                     cmd,
-                    res[image.0].image().raw,
-                    L::TRANSFER_SRC_OPTIMAL,
-                    res[buffer.0].buffer().raw,
-                    &[region],
+                    &vk::DependencyInfo::builder().memory_barriers(&memory),
                 );
+                self.barriers_count[0] += 1;
+                self.barriers_count[1] += 1;
+                let images = [dlss.color, dlss.depth, dlss.motion, dlss.output]
+                    .map(|r| (res[r.0].image(), plan.graph.image_desc(r).unwrap()));
+                self.gpu
+                    .ngx
+                    .as_ref()
+                    .context("DLSS unavailable")?
+                    .evaluate(d, cmd, images, dlss)?;
             }
             Op::Present(r) => {
                 if let Some(frame) = image {
-                    frame.copy(d, cmd, res[r.0].buffer().raw, plan.graph.extent);
+                    frame.copy(d, cmd, res[r.0].buffer().raw, plan.graph.output_extent());
                 }
             }
             Op::HostRead(_) | Op::Counters { .. } => (),

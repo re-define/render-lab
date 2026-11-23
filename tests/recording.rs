@@ -1,4 +1,3 @@
-mod support;
 use anyhow::Result;
 use image::{AnimationDecoder, codecs::gif::GifDecoder};
 use std::{fs, io::BufReader, process::Command};
@@ -6,7 +5,7 @@ use std::{fs, io::BufReader, process::Command};
 #[test]
 #[ignore = "requires Vulkan and FFmpeg with GIF and H.264 encoders"]
 fn fixed_step_recording_exports_both_formats() -> Result<()> {
-    let output = support::tempdir()?;
+    let output = tempfile::tempdir()?;
     let gif = output.path().join("preview.gif");
     let mp4 = output.path().join("preview.mp4");
     let result = Command::new(env!("CARGO_BIN_EXE_render-lab"))

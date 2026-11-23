@@ -1,0 +1,44 @@
+#version 460
+#include "restir_types.glsl"
+#define RESTIR_CONFIG 1
+#define RESTIR_HISTORY 2
+#include "restir_controls.glsl"
+#include "restir_history.glsl"
+layout(set=0,binding=0,std430) readonly buffer Current { Surface surfaces[]; };
+layout(set=0,binding=3,std430) readonly buffer Input { Radiance raw[]; };
+layout(set=0,binding=4,std430) writeonly buffer Temporal { Radiance filtered[]; };
+layout(set=0,binding=5,std430) readonly buffer Correspondence { uint oldPixels[]; };
+layout(local_size_x=8,local_size_y=8) in;
+void main() {
+    uvec2 xy=gl_GlobalInvocationID.xy;
+    if(any(greaterThanEqual(xy,screenSize))) return;
+    uint i=indexAt(xy);
+    Radiance current=raw[i];
+    Surface s=surfaces[i];
+    uint oldIndex=viewport.w!=0u ? oldPixels[i] : 0xffffffffu;
+    if(oldIndex!=0xffffffffu){
+        Previous old=previous[oldIndex];
+        vec2 total=vec2(0);
+        float n=0.0;
+        for(int y=-1;y<=1;++y) for(int x=-1;x<=1;++x){
+            ivec2 p=ivec2(xy)+ivec2(x,y);
+            if(!inScreen(p)) continue;
+            uint j=indexAt(uvec2(p));
+            if(!compatible(s,surfaces[j],0.05+0.013*s.point.w)) continue;
+            total+=vec2(raw[j].color.w,raw[j].moments.x);
+            n+=1.0;
+        }
+        vec2 moments=total/max(n,1.0);
+        float sigma=sqrt(max(moments.y-moments.x*moments.x,0.0))+0.025;
+        // Limit old energy when newly visible or when different samples expose an edge.
+        float maxOld=moments.x+4.0*sigma;
+        float scale=min(1.0,maxOld/max(old.color.w,1e-5));
+        float age=min(old.moments.y+1.0,24.0);
+        float alpha=max(1.0/age,0.095);
+        current.color=mix(old.color*scale,current.color,alpha);
+        current.moments.x=mix(old.moments.x*scale*scale,current.moments.x,alpha);
+        current.moments.y=age;
+        current.moments.z=max(current.moments.x-current.color.w*current.color.w,0.0);
+    }
+    filtered[i]=current;
+}

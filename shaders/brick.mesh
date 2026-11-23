@@ -1,0 +1,87 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#include "cluster_scene.glsl"
+#include "plant_geometry.glsl"
+#include "cluster_coverage.glsl"
+#include "brick_trace.glsl"
+layout(binding=2,std430) readonly buffer Camera { View view; };
+layout(binding=3,std430) readonly buffer Sorted { uvec4 jobs[]; };
+layout(binding=4,std430) readonly buffer Palettes { mat4 jointPalette[]; };
+layout(binding=5,std430) readonly buffer Counts { uint counts[4]; };
+#include "cluster_pose.glsl"
+#include "brick_project.glsl"
+layout(push_constant) uniform Params { layout(offset=24) uint bucket; uint pageBase; } p;
+layout(local_size_x=32) in;
+layout(triangles,max_vertices=96,max_primitives=32) out;
+layout(location=0) perprimitiveEXT flat out vec4 gridEyeNear[];
+layout(location=1) perprimitiveEXT flat out vec3 rayCenter[];
+layout(location=2) perprimitiveEXT flat out uvec4 masks[];
+layout(location=3) perprimitiveEXT flat out uvec4 ids[];
+layout(location=4) perprimitiveEXT flat out vec4 depthRow[];
+layout(location=5) perprimitiveEXT flat out vec4 wRow[];
+layout(location=6) perprimitiveEXT flat out uvec2 fade[];
+layout(location=7) perprimitiveEXT flat out vec3 rayX[];
+layout(location=8) perprimitiveEXT flat out vec3 rayY[];
+
+void main() {
+    uint base=0u;
+    for(uint i=0u;i<p.bucket;i++) base+=counts[i];
+    uint slot=p.pageBase+linearGroup();
+    bool valid=slot<counts[p.bucket];
+    // A nonempty indirect draw can pad its last row. Inactive groups still
+    // need a valid asset until every invocation reaches SetMeshOutputsEXT.
+    uvec4 job=jobs[base+(valid?slot:0u)];
+    Instance obj=instances[job.x];
+    Asset asset=assets[obj.routing.z];
+    Cluster cluster=asset.clusters.data[job.y];
+    BrickWords words=BrickWords(uvec2(asset.vertices));
+    uint stream=cluster.span.x;
+    uint bricks=valid?min(8u,(cluster.meta.w>>1u)-job.z):0u;
+    SetMeshOutputsEXT(12u*bricks,4u*bricks);
+    uint b=gl_LocalInvocationID.x/4u, lane=gl_LocalInvocationID.x%4u;
+    if(b>=bricks) return;
+    PlantBrick brick=loadBrick(words,stream,job.z+b);
+    mat4 clip; mat3 toLocal; vec3 eyeGrid; float nearest;
+    uvec4 rect=projectBrick(brick,obj,clip,toLocal,eyeGrid,nearest);
+    vec2 a=vec2(rect.xy), z=vec2(rect.xy+rect.zw), pixels=vec2(view.screen.xy);
+    ivec2 dims=ivec2(rect.zw);
+    uint t=4u*b+lane, v=12u*b+3u*lane;
+    gl_PrimitiveTriangleIndicesEXT[t]=uvec3(v);
+    gl_MeshPrimitivesEXT[t].gl_CullPrimitiveEXT=true;
+    if(any(equal(dims,ivec2(0)))) return;
+    uvec4 mask=uvec4(brick.occupancy,uvec2(asset.vertices));
+    uint first=cellAddress(words,stream,brick.first);
+    uvec2 transition=clusterFade(asset,obj,cluster,view);
+    mat4 rows=transpose(clip);
+    mat3 basis=brickRayBasis(toLocal,brick.originSize.w);
+    if(dims.x<=4 && dims.y<=4 && dims.x*dims.y<=4) {
+        if(lane>=uint(dims.x*dims.y)) return;
+        uvec2 xy=uvec2(a)+uvec2(lane%uint(dims.x),lane/uint(dims.x));
+        if(transition.x!=0xffff0000u && !coversLod(xy,transition)) return;
+        vec2 center=vec2(xy)+.5;
+        vec3 ray=brickPixelRay(basis,xy);
+        float depth; uint primitive;
+        if(!hitBrick(eyeGrid+view.settings.y*ray,ray,mask,first,cluster.span.z,rows[2],rows[3],depth,primitive)) return;
+        // Exactly one sample is inside the triangle, at its measured depth.
+        const vec2 offset[3]=vec2[](vec2(-.45,-.4),vec2(.45,-.4),vec2(0,.45));
+        for(uint k=0u;k<3u;k++) gl_MeshVerticesEXT[v+k].gl_Position=vec4((center+offset[k])*2./pixels-1.,depth,1.);
+        gl_PrimitiveTriangleIndicesEXT[t]=v+uvec3(0,1,2);
+        ids[t]=uvec4(obj.routing.y+1u,primitive,0u,1u);
+        fade[t]=uvec2(0xffff0000u,0u);
+    } else {
+        if(lane>=2u) return;
+        float depth=nearest;
+        uvec3 corners=lane==0u?uvec3(0,1,3):uvec3(0,3,2);
+        for(uint k=0u;k<3u;k++) {
+            uint corner=corners[k];
+            vec2 ndc=mix(a,z,vec2(uvec2(corner,corner>>1u)&1u))*2./pixels-1.;
+            gl_MeshVerticesEXT[v+k].gl_Position=vec4(ndc,depth,1.);
+        }
+        gridEyeNear[t]=vec4(eyeGrid,view.settings.y);
+        rayX[t]=basis[0]; rayY[t]=basis[1]; rayCenter[t]=basis[2];
+        gl_PrimitiveTriangleIndicesEXT[t]=v+uvec3(0,1,2);
+        ids[t]=uvec4(obj.routing.y+1u,cluster.span.z,first,0u);
+        masks[t]=mask; depthRow[t]=rows[2]; wRow[t]=rows[3]; fade[t]=transition;
+    }
+    gl_MeshPrimitivesEXT[t].gl_CullPrimitiveEXT=false;
+}

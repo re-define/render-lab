@@ -53,9 +53,7 @@ class PackedTests(unittest.TestCase):
             np.float32,
         )
         expected = ply_image(rows, width, height)
-        root = Path("target/test-data")
-        root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=root) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "field.ply"
             write_ply(path, rows)
             for size in (8, 16, 32):

@@ -1,0 +1,33 @@
+#version 460
+#include "restir_types.glsl"
+#include "gi12_types.glsl"
+#define RESTIR_CONFIG 0
+#include "restir_controls.glsl"
+layout(binding=1,std430) readonly buffer Visible { Surface surfaces[]; };
+layout(binding=2,std430) readonly buffer Current { Probe probes[]; };
+layout(binding=3,std430) writeonly buffer Output { vec4 indirect[]; };
+layout(local_size_x=8,local_size_y=8) in;
+void main() {
+    uvec2 px=gl_GlobalInvocationID.xy;
+    if(any(greaterThanEqual(px,screenSize))) return;
+    uint pixel=indexAt(px);
+    Surface s=surfaces[pixel];
+    vec3 sum=vec3(0); float weights=0.;
+    if(s.id!=0u) {
+        ivec2 size=ivec2((screenSize+TILE-1u)/TILE), center=ivec2(px/TILE);
+        float radius=max(0.035,s.point.w*float(TILE)*2./float(screenSize.y));
+        for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++) {
+            ivec2 tile=center+ivec2(x,y);
+            if(any(lessThan(tile,ivec2(0))) || any(greaterThanEqual(tile,size))) continue;
+            Probe p=probes[tile.y*size.x+tile.x];
+            if(p.anchor.id==0u) continue;
+            vec3 d=p.anchor.point.xyz-s.point.xyz;
+            float normal=max(dot(surfaceNormal(s),surfaceNormal(p.anchor)),0.);
+            float plane=abs(dot(d,surfaceNormal(s)));
+            float w=pow(normal,6.)*exp(-dot(d,d)/(radius*radius)-4.*plane/radius);
+            if(s.id!=p.anchor.id) w*=0.15;
+            sum+=w*p.light.rgb; weights+=w;
+        }
+    }
+    indirect[pixel]=vec4(sum/max(weights,0.015),0);
+}

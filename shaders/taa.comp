@@ -1,0 +1,170 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+#include "motion.glsl"
+
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0,std430) readonly buffer Motion { MotionSample motion[]; };
+layout(set=0,binding=1) uniform texture2D depthImage;
+layout(set=0,binding=2,std430) readonly buffer TemporalView {
+    uvec4 flags; // extent, stationary camera, debug view
+    vec4 jitter;
+};
+#ifdef HDR
+layout(set=0,binding=3,std430) readonly buffer Color { vec4 color[]; };
+vec3 readColor(uint i) { return color[i].rgb; }
+#else
+layout(set=0,binding=3,std430) readonly buffer Color { uint color[]; };
+vec3 readColor(uint i) { return unpackUnorm4x8(color[i]).bgr; }
+#endif
+
+uint pixelIndex(uvec2 p) { return p.y*flags.x + p.x; }
+
+#ifdef STORE
+layout(set=0,binding=4,std430) writeonly buffer History { uvec4 metadata; vec4 samples[]; };
+layout(set=0,binding=5,std430) writeonly buffer HistoryTags { uint tags[]; };
+void main() {
+    uvec2 xy = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(xy,flags.xy))) return;
+    uint i = pixelIndex(xy);
+    float depth = texelFetch(depthImage,ivec2(xy),0).x;
+    uint motionFlags = motion[i].flags;
+    uint historyFlags = uint((motionFlags & MOTION_REACTIVE) != 0u) | (motionFlags & MOTION_WIND);
+    samples[i] = vec4(readColor(i),uintBitsToFloat((floatBitsToUint(depth)&~3u)|historyFlags));
+    tags[i] = motion[i].currentTag;
+    if (i == 0u) metadata = uvec4(1u,0u,0u,0u);
+}
+#else
+layout(set=0,binding=4,std430) readonly buffer History { uvec4 metadata; vec4 samples[]; };
+layout(set=0,binding=5,std430) readonly buffer HistoryTags { uint tags[]; };
+#if defined(HDR) && !defined(VISUALIZE)
+layout(set=0,binding=6,std430) writeonly buffer Result { vec4 result[]; };
+void writeColor(uint i, vec3 rgb) { result[i] = vec4(rgb,1.0); }
+#else
+layout(set=0,binding=6,std430) writeonly buffer Result { uint result[]; };
+void writeColor(uint i, vec3 rgb) { result[i] = packUnorm4x8(vec4(rgb.bgr,1.0)); }
+#endif
+
+vec3 currentColor(uvec2 xy) {
+    vec2 p = vec2(xy) + jitter.xy;
+    ivec2 a = ivec2(floor(p));
+    ivec2 hi = ivec2(flags.xy)-1;
+    vec2 t = fract(p);
+    vec3 colors[4];
+    for (int i=0; i<4; ++i) {
+        ivec2 tap = clamp(a+ivec2(i&1,i>>1),ivec2(0),hi);
+        colors[i] = readColor(pixelIndex(uvec2(tap)));
+    }
+    return mix(mix(colors[0],colors[1],t.x),mix(colors[2],colors[3],t.x),t.y);
+}
+
+float depthTolerance(float depth) {
+    return max(0.000002,0.06*(1.0-depth));
+}
+
+MotionSample dilateMotion(uvec2 xy, MotionSample center) {
+    if ((center.flags & MOTION_TRACKED) == 0u) return center;
+    float depth = texelFetch(depthImage,ivec2(xy),0).x;
+    float nearest = depth;
+    MotionSample front = center;
+    for (int y=-1; y<=1; ++y) {
+        for (int x=-1; x<=1; ++x) {
+            uvec2 p = uvec2(clamp(ivec2(xy)+ivec2(x,y),ivec2(0),ivec2(flags.xy)-1));
+            float z = texelFetch(depthImage,ivec2(p),0).x;
+            if (z >= nearest || depth-z > depthTolerance(depth)) continue;
+            MotionSample candidate = motion[pixelIndex(p)];
+            // A leaf edge must not borrow the motion of its background or another LOD type.
+            if (candidate.currentTag==center.currentTag && candidate.previousTag==center.previousTag
+                && candidate.previousDepth >= 0.0) {
+                nearest = z;
+                front = candidate;
+            }
+        }
+    }
+    return front;
+}
+
+void main() {
+    uvec2 xy = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(xy,flags.xy))) return;
+    uint i = pixelIndex(xy);
+    MotionSample sampleValue = motion[i];
+    vec3 unavailable = vec3(1.0,0.05,0.65);
+    bool debug = flags.w == 2u;
+    vec3 current = currentColor(xy);
+    vec3 fallback = debug ? unavailable : current;
+    if (sampleValue.previousDepth < 0.0 || metadata.x == 0u) {
+        writeColor(i, fallback);
+        return;
+    }
+    if (!debug) sampleValue = dilateMotion(xy,sampleValue);
+
+    vec2 old = vec2(xy) + sampleValue.offset;
+    if (any(lessThan(old,vec2(-0.5))) || any(greaterThan(old,vec2(flags.xy)-0.5))) {
+        writeColor(i, fallback);
+        return;
+    }
+
+    float tolerance = depthTolerance(sampleValue.previousDepth);
+    bool reactive = (sampleValue.flags & MOTION_REACTIVE) != 0u;
+    bool tracked = (sampleValue.flags & MOTION_TRACKED) != 0u;
+    bool wind = (sampleValue.flags & MOTION_WIND) != 0u;
+    float velocity = length(sampleValue.offset);
+    float slowWind = flags.z != 0u ? 0.60*(1.0-smoothstep(0.45,1.3,velocity)) : 0.0;
+    vec3 history = vec3(0.0);
+    float confidence = 0.0;
+    ivec2 base = ivec2(floor(old));
+    vec2 t = fract(old);
+    for (int y=0; y<=1; ++y) {
+        for (int x=0; x<=1; ++x) {
+            uvec2 tap = uvec2(clamp(base+ivec2(x,y),ivec2(0),ivec2(flags.xy)-1));
+            uint previousIndex = pixelIndex(tap);
+            uint tag = tags[previousIndex];
+            vec4 value = samples[previousIndex];
+            uint depthBits = floatBitsToUint(value.w);
+            bool wasReactive = (depthBits & 1u) != 0u;
+            bool wasWind = (depthBits & MOTION_WIND) != 0u;
+            float oldDepth = uintBitsToFloat(depthBits & ~3u);
+            bool same = tag == sampleValue.previousTag;
+            bool changedRepresentation = !same && (tag >> 2u) == (sampleValue.previousTag >> 2u);
+            float weight = (x==0 ? 1.0-t.x : t.x)*(y==0 ? 1.0-t.y : t.y);
+            if (!same || abs(oldDepth-sampleValue.previousDepth)>tolerance) {
+                if (debug || changedRepresentation) continue;
+                if ((wind && (!wasReactive || wasWind)) || (!tracked && wasWind)) weight *= slowWind;
+                else if (flags.z != 0u && !tracked && !reactive && !wasReactive) weight *= 0.72;
+                else continue;
+            }
+            if (!debug && (reactive || wasReactive))
+                weight *= tracked || !reactive ? 0.82 : 0.22;
+            history += value.rgb*weight;
+            confidence += weight;
+        }
+    }
+    if (confidence <= 1e-5) {
+        writeColor(i, fallback);
+        return;
+    }
+    vec3 reprojected = history/confidence;
+    if (debug) {
+        vec3 difference = abs(current-reprojected);
+        float error = max(difference.r,max(difference.g,difference.b));
+        writeColor(i, vec3(1.0,0.55,0.10) * clamp(error*4.0,0.0,1.0));
+        return;
+    }
+
+    vec3 lo = current, hi = current;
+    for (int y=-1; y<=1; ++y) {
+        for (int x=-1; x<=1; ++x) {
+            uvec2 tap = uvec2(clamp(ivec2(xy)+ivec2(x,y),ivec2(0),ivec2(flags.xy)-1));
+            vec3 neighbor = readColor(pixelIndex(tap));
+            lo = min(lo,neighbor);
+            hi = max(hi,neighbor);
+        }
+    }
+    vec3 clipped = clamp(reprojected,lo,hi);
+    // Preserve more of the subpixel coverage when surface and view barely move.
+    float stable = flags.z != 0u && (wind || (!tracked && !reactive))
+        ? 1.0 - smoothstep(0.25,1.0,velocity) : 0.0;
+    float blend = mix(0.88,0.94,stable)*confidence/(1.0+0.05*max(velocity-1.0,0.0));
+    writeColor(i,mix(current,clipped,blend));
+}
+#endif

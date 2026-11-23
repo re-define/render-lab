@@ -1,0 +1,134 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_atomic_int64 : require
+#extension GL_KHR_memory_scope_semantics : require
+#include "cluster_scene.glsl"
+#include "plant_geometry.glsl"
+#include "cluster_coverage.glsl"
+#include "brick_trace.glsl"
+layout(local_size_x=32) in;
+layout(binding=2,std430) readonly buffer Camera { View view; };
+layout(binding=3,std430) readonly buffer Jobs { uvec4 head; uvec4 jobs[]; };
+layout(binding=4,std430) readonly buffer Palettes { mat4 jointPalette[]; };
+layout(binding=5,std430) readonly buffer Ranges { uvec4 ranges[]; };
+layout(binding=6,std430) buffer Winners { uint64_t winners[]; };
+#ifdef POST
+#extension GL_EXT_samplerless_texture_functions : require
+layout(binding=7) uniform texture2D recoveredDepth;
+#define METRIC_SLOT 8
+#else
+#define METRIC_SLOT 7
+#endif
+#ifdef MEASURE
+layout(binding=METRIC_SLOT,std430) buffer Metrics { uint stats[]; };
+shared uvec3 laneMetrics[64];
+#endif
+#include "cluster_pose.glsl"
+#include "brick_project.glsl"
+
+struct ProjectedBrick {
+    uvec4 rect, mask;
+    mat3 rayBasis;
+    vec3 eye;
+    vec4 depthRow,wRow;
+    float nearest;
+    uint first;
+};
+shared ProjectedBrick bricks[8];
+shared uint ends[8];
+
+void main() {
+    uint slot=linearGroup(), lane=gl_LocalInvocationID.x;
+    if(slot>=head.x) return;
+    uvec4 job=jobs[slot];
+    Instance obj=instances[job.x];
+    Asset asset=assets[obj.routing.z];
+    Cluster cluster=asset.clusters.data[job.y];
+    uint start=job.z>>2u, count=min(8u,(cluster.meta.w>>1u)-start);
+    if(lane<8u) {
+        uint pixels=0u;
+        if(lane<count) {
+            BrickWords words=BrickWords(uvec2(asset.vertices));
+            PlantBrick brick=loadBrick(words,cluster.span.x,start+lane);
+            mat4 clip; mat3 toLocal; vec3 eye; float nearest;
+            uvec4 rect=projectBrick(brick,obj,clip,toLocal,eye,nearest);
+            mat4 rows=transpose(clip);
+            bricks[lane]=ProjectedBrick(rect,uvec4(brick.occupancy,uvec2(asset.vertices)),
+                brickRayBasis(toLocal,brick.originSize.w),eye,rows[2],rows[3],nearest,
+                cellAddress(words,cluster.span.x,brick.first));
+            pixels=rect.z*rect.w;
+        }
+        ends[lane]=pixels;
+    }
+    barrier();
+    if(lane==0u) for(uint i=1u;i<8u;i++) ends[i]+=ends[i-1u];
+    barrier();
+    uvec2 fade=clusterFade(asset,obj,cluster,view);
+    uvec4 range=ranges[obj.routing.z];
+    uint base=1u+range.y+(job.x-range.x)*range.z-(range.w<<6u);
+#ifdef MEASURE
+    uint candidates=0u, lod=0u, rejected=0u, traced=0u, hits=0u, wins=0u;
+#endif
+    // Give the next 32 pixel tasks across all eight bricks to the whole group.
+    // No fixed number of lanes per brick and no dependency on subgroup width.
+    for(uint i=lane;i<ends[7];i+=gl_WorkGroupSize.x) {
+        uint b=uint(i>=ends[3])*4u;
+        b+=uint(i>=ends[b+1u])*2u;
+        b+=uint(i>=ends[b]);
+        uint k=i-(b>0u?ends[b-1u]:0u);
+        uvec4 rect=bricks[b].rect;
+        uvec2 xy=rect.xy+uvec2(k%rect.z,k/rect.z);
+#ifdef MEASURE
+        candidates++;
+#endif
+        if(fade.x!=0xffff0000u && !coversLod(xy,fade)) {
+#ifdef MEASURE
+            lod++;
+#endif
+            continue;
+        }
+        uint pixel=xy.x+view.screen.x*xy.y;
+        uint64_t seen=atomicLoad(winners[pixel],gl_ScopeDevice,gl_StorageSemanticsNone,gl_SemanticsRelaxed);
+        uint closest=~uint(seen>>32u);
+#ifdef POST
+        closest=min(closest,floatBitsToUint(texelFetch(recoveredDepth,ivec2(xy),0).x));
+#endif
+        if(floatBitsToUint(bricks[b].nearest)>closest) {
+#ifdef MEASURE
+            rejected++;
+#endif
+            continue;
+        }
+#ifdef MEASURE
+        traced++;
+#endif
+        vec3 ray=brickPixelRay(bricks[b].rayBasis,xy);
+        float depth; uint primitive;
+        if(!hitBrick(bricks[b].eye+view.settings.y*ray,ray,bricks[b].mask,bricks[b].first,
+                     cluster.span.z,bricks[b].depthRow,bricks[b].wRow,depth,primitive)) continue;
+#ifdef MEASURE
+        hits++;
+#endif
+        uint bits=floatBitsToUint(max(depth,0.));
+        if(bits>closest) continue;
+        uint64_t key=packUint2x32(uvec2(base+primitive,~bits));
+        if(key<=seen) continue;
+        uint64_t old=atomicMax(winners[pixel],key);
+#ifdef MEASURE
+        wins+=uint(key>old);
+#endif
+    }
+#ifdef MEASURE
+    laneMetrics[lane]=uvec3(candidates,lod,rejected);
+    laneMetrics[32u+lane]=uvec3(traced,hits,wins);
+    barrier();
+    if(lane<6u) {
+        uint total=0u;
+        for(uint i=0u;i<32u;i++) total+=laneMetrics[(lane/3u)*32u+i][lane%3u];
+        if(total!=0u) atomicAdd(stats[lane],total);
+#ifdef POST
+        if(total!=0u && (lane==0u || lane==3u)) atomicAdd(stats[13u+lane/3u],total);
+#endif
+    }
+#endif
+}

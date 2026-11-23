@@ -1,6 +1,12 @@
 # Render Lab
 
-一个独立的 Rust 渲染实验框架。默认场景并排展示 PBR 与带描边的卡通物体。研究场景包括 cluster LOD、Motion Matching 和基于银狼 glTF 的卡通人物渲染。
+一个独立的 Rust 渲染实验框架。默认场景并排展示 PBR 与带描边的卡通物体。实验涵盖 cluster LOD、Motion Matching、卡通渲染、纹理压缩、全局光照、阴影和 Vulkan 光线追踪。
+
+从[架构与帧流程](docs/architecture.md)可以跟踪一帧森林阴影从 ECS 到交换链的全过程。[全引擎模块图](docs/module-map.md)给出源码入口，[实验目录](docs/experiment-catalog.md)列出全部命名预设、启动方式和能力边界。[开发规范](CONTRIBUTING.md)说明代码归属和验证方式。
+
+[视口输入、HUD 与后处理](docs/viewport-post.md) 介绍键鼠映射、最终界面合成和时域抗锯齿。
+
+控制台 `schedule` 可查看模拟系统的读写集合、分组和冲突。`memory idle`、`memory alloc`、`memory driver` 可按资源用途查闲置容量、绑定申请和驱动分配，支持名称片段或 `#所有者编号`。窗口 benchmark 的 `memory.managed` 提供全部用途、两个帧槽及常驻缓存的实测显存和峰值，可用 `RENDER_LAB_GPU_BUDGET_MIB` 设置单个后端的设备本地预算。[调度说明](docs/runtime-and-scene.md) · [GPU 资源与计量](docs/render-pipeline.md#按资源用途查显存)
 
 ## 运行
 
@@ -11,27 +17,67 @@
 ```powershell
 cargo run --locked
 cargo run --locked -- --experiment clusters
+cargo run --release --locked -- --experiment vegetation
+cargo run --release --locked -- --experiment vegetation-scale
+cargo run --release --locked -- --experiment river-forest --command "post taa"
+cargo run --release --locked -- --experiment confluence
+cargo run --release --locked -- --experiment water
+cargo run --release --locked -- --experiment destruction
 cargo run --locked -- --experiment motion
 cargo run --release --locked -- --experiment toon
 cargo run --release --locked -- --experiment texture
 cargo run --release --locked -- --experiment gaussian
+cargo run --release --locked -- --experiment gi
+cargo run --release --locked -- --experiment shadow
+cargo run --release --locked -- --experiment rt
+cargo run --release --locked -- --experiment restir
+cargo run --release --locked -- --experiment gi12-forest
+cargo run --release --locked -- --experiment forest-mega
+cargo run --release --locked -- --experiment forest-karst
+cargo run --release --locked -- --experiment gi12-silver
+cargo run --release --locked -- --experiment ibl
+cargo run --release --locked -- --experiment mixed
 cargo run --locked -- --scene assets/scenes/cornell-box/cornell_box_core.gltf
 ```
 
 `--scene` 接受 glTF、GLB 和本框架保存的 JSON。给 cluster 实验同时传入 `--scene` 会为该场景构建层次。任一启动方式都可附加 `--capture target/frame.png`，通过相同的三线程管线预热一帧、捕获第二帧后退出。动作截图先执行固定时长的模拟，便于回归比较。
 
+## GI 命中材质与多跳漫反射
+
+`gi12-forest` 使用风动植被，`gi12-silver` 使用银狼与摄影棚反光板。控制台输入 `restir gi direct`、`restir gi single`、`restir gi multi` 可以在同一机位切换直接光、一次和两次间接反弹。[实现、对照图与复现方法](docs/gi12.md) · [森林植被硬阴影、软阴影和 GPU 耗时](docs/forest-shadows.md)
+
+## 河谷密林
+
+河道贯穿 22,750 棵树、256,081 丛草的程序化森林。控制台输入 `vegetation camera glade` 查看带穗草地，`vegetation camera grass` 查看湿岸，`vegetation camera basin` 俯瞰密林，`vegetation camera river` 回到河道。 [草地制作依据、实现与性能](docs/river-forest.md)
+
+## 森林、流水和角色组合实验
+
+`confluence` 将风动树林、台阶流水和银狼写入同一份可见性与深度，银狼材质可同时使用 IBL 和 ReSTIR。控制台支持 `feature forest|water|actor|ibl|restir on|off`，例如 `feature water off` 保留石阶，`feature restir off` 保留环境光。树皮、树叶、石材和水沿用各自的材质程序。开关随场景保存。[组合与 GPU 增量更新](docs/scene-composition.md)
+
 ## 窗口与控制台
 
-W/S 沿视线前进和后退，A/D 左右平移，在视口内按住鼠标右键改变朝向，F 根据场景包围盒重新取景。按 / 或 Enter 打开控制台，输入命令后按 Enter 执行，Esc 取消。Windows 下支持粘贴路径。右侧图中的每个节点对应一次实际执行的 pass，连线来自 RDG 编译结果，点击节点可查看资源屏障。
+W/S 沿视线前进和后退，A/D 左右平移，在视口内按住鼠标右键改变朝向，F 根据场景包围盒重新取景。按 / 或 Enter 打开控制台，输入命令后按 Enter 执行，Esc 取消。Windows 下支持粘贴路径。工具栏可暂停模拟或隐藏 RDG。右侧图中的每个节点对应一次 pass，颜色标记队列，连线来自 RDG 编译结果，点击节点可在面板顶部查看屏障。
+
+银狼 Motion Matching 中，按住 I/K 向角色前方/后方移动，J/L 向左/右横移。I+J 和 I+L 分别边走边左转和右转。松开后角色平滑停下。相机跟随角色平移，仍可用 WASD 和鼠标调整视角。地面蓝线显示未来轨迹，圆点标出 0.20、0.47 和 0.77 秒后的预测位置。
 
 | 命令 | 效果 |
 | --- | --- |
 | `help`、`stats` | 查看命令、实体数、pass 数和 GPU 区间耗时之和 |
 | `fit`、`pause`、`rdg` | 重新取景、切换模拟暂停、切换依赖图 |
+| `hud on`、`hud off` | 在视口上显示或隐藏 GPU 时间、呈现模式和抗锯齿状态 |
+| `post taa`、`post off`、`post reset`、`post status` | 启用 TAA、关闭后处理、清除时域历史或查看后端状态 |
+| `post dlss`、`post dlaa` | 在启用 NVIDIA NGX 的构建上选择 DLSS Quality 或原生分辨率 DLAA。[森林对照与运行环境](docs/viewport-post.md) |
+| `post view motion`、`post view reprojection`、`post view off` | 显示屏幕运动向量、检查重投影误差或返回原先的抗锯齿模式 |
 | `import "路径"` | 把 glTF 的资产和实例加入当前场景 |
 | `save "路径"`、`load "路径"` | 保存或打开自包含场景，路径可以包含空格 |
 | `lod 0`、`lod 3` | 在 cluster 实验中查看全精度和三像素误差下的结果 |
 | `lodview on`、`lodview off` | 按最终可见 meshlet 的实际 LOD 层级着色。窗口顶部显示颜色图例，RDG 面板列出各层绘制的三角数 |
+| `vegetation auto`、`vegetation triangles`、`vegetation voxels` | 查看混合 DAG、全三角对照或放宽误差后的混合粗级 |
+| `vegetation raster auto/compute/mesh/compare` | 自动选择、强制计算光栅、mesh 对照、逐像素重放同一份砖列表。详见[体素计算光栅](docs/procedural-vegetation.md#体素计算光栅) |
+| `vegetation view paths`、`vegetation view beauty`、`vegetation camera near` | 橙色标出三角植被，青色标出体素植被。摄像机也可选择 `overview`、`far` 或 `forest` |
+| `vegetation pixels 1.45`、`vegetation wind 1.5`、`vegetation time 0` | 调整混合 DAG 的屏幕误差、风力和风场时间。参考[植被实验方案](docs/procedural-vegetation.md) |
+| `effect restart`、`effect time 1.9`、`pause` | 台阶流水或破碎与消融实验中重播、定位到指定秒数或切换暂停。左侧晶体炸裂，右侧晶体逐渐消融。 |
+| `light list`、`light point 2 3 5 60 15 1 0.6 0.25`、`light sun 0.42 -0.73 -0.55 1.85` | 查看场景光源实体，或添加点光源和平行光。参考[场景光源实例](docs/scene-lights.md) |
 | `motion 3 0`、`motion 1.35 -1`、`motion 0 0 1.2` | 给银狼指定向前速度（米/秒）、转速（弧度/秒）和可选的向右速度（米/秒）。三个例子分别是直跑、左转行走和向右横移 |
 | `motionsearch kd`、`motionsearch scan` | 在 PCA + KD-tree（默认）与同一归一化度量的穷举查询之间切换。窗口显示最近一次查询实际对多少个姿势计算了完整代价 |
 | `record "captures/live.mp4"`、`stoprecord` | 开始和结束视口录制，扩展名可用 `.mp4` 或 `.gif`。窗口模式按实际经过的时间输出 30 fps |
@@ -41,30 +87,71 @@ W/S 沿视线前进和后退，A/D 左右平移，在视口内按住鼠标右键
 | `toon sdf on`、`toon sdf off` | 在面部 SDF 与面部普通二分光之间切换 |
 | `toon view face`、`toon view full` | 切换头肩特写与全身取景 |
 | `texture neural`、`texture original`、`texture stats` | 在 Modern Hall 中切换特征网格与原始贴图，或打印三张纹理的有效载荷字节数；切换保留当前摄像机 |
+| `gi off`、`gi ssgi`、`gi probes`、`gi ray` | 切换纯直射、屏幕空间 GI、辐照度探针或单次漫反射世界空间追踪 |
+| `gi view indirect`、`gi view combined`、`gi camera detail` | 单独查看间接光、恢复合成或观察遮挡隔板 |
+| `shadow hard`、`shadow pcf`、`shadow pcss`、`shadow ray` | 比较硬阴影图、固定 3×3 PCF、PCSS 和 16 样本面积光追踪 |
+| `shadow view visibility`、`shadow size 1.1`、`shadow bias 0.018` | 显示可见度，并调整面积光半宽和偏移（单位为米） |
+| `shadow camera contact`、`shadow camera distance` | 检查细栅栏、接触阴影和远处接收面。`shadow camera overview` 恢复总览 |
+| `rt view beauty`、`rt view normals`、`rt view distance`、`rt view reflections` | 查看硬件光追的合成结果、世界法线、命中距离和单次反射 |
+| `restir uniform`、`restir ris`、`restir reuse`、`restir reference` | 切换单样本均匀采样、单帧 RIS、时空 ReSTIR DI 或分层高样本参考 |
+| `restir denoise off`、`restir denoise spatial`、`restir denoise svgf` | 独立切换关闭降噪、空间 à-trous、时域累积加方差引导的 à-trous |
+| `restir history-stats on/off` | 统计表面、历史接受和位移至少一个像素的受跟踪表面数 |
+| `restir source auto`、`restir source scene`、`restir source bank` | 自动选择光源表、显式使用场景实例，或显式使用程序化灯库 |
+| `restir lights 65536`、`restir candidates 16`、`restir samples 512`、`restir camera contact` | 调整程序灯库的灯数、每像素初始候选数、参考模式的样本数，或切换近景 |
+| `ibl yaw 90`、`ibl ev -1`、`ibl sky on` | 旋转 HDR 环境、调整曝光 EV、显示真实环境背景 |
+| `ibl view combined`、`ibl view diffuse`、`ibl view specular` | 查看完整 PBR、环境漫反射或环境镜面反射 |
 
 ## 帧流水线
 
 | 执行位置 | 所有权与职责 |
 | --- | --- |
-| GPUI 主线程 | 持有可写 World、相机和模拟 Schedule，收集输入，按阶段并行计算系统更新 |
-| 渲染线程 | 接收只读帧快照，由 Technique 并行提取几何与材质、声明资源和 pass、编译 RDG |
+| GPUI 主线程 | 持有可写 World、相机和模拟 Schedule，按阶段并行计算系统更新，并提取只读 RenderScene |
+| 渲染线程 | 接收渲染快照，由 Technique 选择几何、声明资源和 pass、编译 RDG |
 | RHI 线程 | 持有 Vulkan 队列与帧资源，通过共享 Rayon 任务池并行录制每个 pass，再按 RDG 顺序提交 |
 
-两个容量为一的通道限制积压。主线程在通道满时继续处理输入和模拟。交互视口是嵌入 GPUI 的 Win32 子窗口。GPU 将着色结果复制到取得的 swapchain image 后执行 `vkQueuePresentKHR`。默认选 MAILBOX，surface 不支持时选择 FIFO，标题栏区域显示实际模式。窗口尺寸变化时重建交换链，每张交换链图像独立持有呈现完成信号量。普通交互只读取时间戳和少量调试计数。截图、录制和像素测试会读回最终的视口画面。
+两个容量为一的通道限制积压。主线程在通道满时继续处理输入和模拟。交互视口是由 GPUI 主窗口拥有的无边框 Win32 窗口，跟随界面分配的视口区域。GPU 将着色结果复制到取得的 swapchain image 后执行 `vkQueuePresentKHR`。默认选 MAILBOX，surface 不支持时选择 FIFO，标题栏区域显示实际模式。窗口尺寸变化时重建交换链，每张交换链图像独立持有呈现完成信号量。普通交互只读取时间戳和少量调试计数。截图、录制和像素测试会读回最终的视口画面。
 
-每个可并行录制的 pass 独占 command pool、primary command buffer 和 timestamp query pool。RDG 将光栅、计算、复制映射到同一通用队列族的最多三条独立 VkQueue，硬件队列不足时合并角色。同队列连续 pass 合成一次提交。跨队列依赖使用各队列自己的 timeline semaphore，同一生产队列的多条依赖合成一次最大值等待，后续提交跳过已覆盖的等待。窗口 acquire/present 使用 WSI 二值信号量。当前帧资源在 RHI 线程等待本帧 timeline 完成后复用。性能面板中的时间仅覆盖 GPU 上的 pass。
+每个可并行录制的 pass 独占 command pool、primary command buffer 和 timestamp query pool。RDG 将光栅、计算、复制映射到同一通用队列族的最多三条独立 VkQueue，硬件队列不足时合并角色。同队列连续 pass 合成一次提交。跨队列依赖使用各队列自己的 timeline semaphore，同一生产队列的多条依赖合成一次最大值等待，后续提交跳过已覆盖的等待。窗口 acquire/present 使用 WSI 二值信号量。交互使用两个独立帧槽，按各自 timeline 退役后复用临时资源；时域历史由多个帧槽共享，并声明跨帧等待。工具栏显示各 GPU pass 时间之和，窗口 benchmark 另报 GPU 时间跨度。
 
-RHI 直接使用 vulkanalia 绑定。buffer 描述符通过 `vkWriteResourceDescriptorsEXT` 写入资源堆，shader binding 按 push data 中的槽号选择描述符。示例把纹理像素存入只读 storage buffer，采用最近邻采样。堆的对齐、步长与实现保留空间由设备查询结果决定。[Khronos 扩展规范](https://docs.vulkan.org/refpages/latest/refpages/source/VK_EXT_descriptor_heap.html)
+RHI 直接使用 vulkanalia 绑定。buffer 和采样图像描述符通过 `vkWriteResourceDescriptorsEXT` 写入资源堆，shader binding 按 push data 中的槽号选择描述符。基础色纹理集仍用只读 storage buffer，可见性、场景深度、阴影图可以直接采样 Vulkan 图像。堆的对齐、步长与实现保留空间由设备查询结果决定。[Khronos 扩展规范](https://docs.vulkan.org/refpages/latest/refpages/source/VK_EXT_descriptor_heap.html)
 
 ## 替换实验模块
 
-- **模拟**。实现 `engine::System`，调用 `Schedule::stage` 注册。同阶段的系统读取同一个世界快照，返回编辑操作，按注册顺序提交。需要消费上一阶段结果的物理、约束或动画系统放入后续阶段。系统内部也可以使用 Rayon 并行处理实体。
+- **模拟**。实现 `engine::System`，调用 `Schedule::stage` 或 `Schedule::fixed_stage` 注册。同阶段的系统读取同一个世界快照，返回编辑操作，按注册顺序提交。需要消费上一阶段结果的物理、约束或动画系统放入后续阶段。系统内部也可以使用 Rayon 并行处理实体。
 - **渲染**。实现 `render::Technique`，从 `Snapshot` 构建 `rdg::Graph`。仅替换几何选择时可实现 `GeometrySelection` 并复用 `VisibilityRenderer`。新增 compute/graphics pass 可提供自己的 SPIR-V 与资源绑定。示例中的 GPU 压紧与间接绘制经过普通 RDG 接口。
 - **同步**。按资源生产、消费的顺序声明 pass，可以额外声明 `after` 边。编译器检查未初始化读取、非法用途和环，追踪 RAW、WAR、WAW，以及颜色与深度图像布局。同一访问阶段的连续读取共享同步。后端把一个 pass 前的 buffer 依赖合成一个内存屏障，连同图像转换一次下发 `vkCmdPipelineBarrier2`。当前粒度是整项资源。
 - **实体**。`World` 使用稳定 ID 关联资产、节点和实例。网格顶点流、meshlet、分层加速数据、边面拓扑、材质路径、描边、骨骼绑定和扩展组件可以组合。大块几何与图像通过 Arc 共享。新系统的命名空间组件可存入 `Entity::components` 并随场景往返。
 - **导入与存档**。glTF 节点、共享图元、基础色纹理和材质、皮肤以及动画轨道转换为实体。三角形列表、条带和扇形统一成三角形列表。存档带版本号，加载时校验引用与层次，保存时原子替换文件。导入失败时保留原有世界。当前材质预览着重基础色、金属度和粗糙度，动画实验的动作库采用下面的固定采样格式。
 
 ## 实验场景
+
+### 多光源 ReSTIR DI 与降噪
+
+冷暖两组点光照亮柱廊、地面和球体。光强分布含少数强光和许多低能量灯，柱子与隔板造成遮挡。灯数默认 16,384，可调到 65,536。选择不同灯数时保持总功率标度相近。`restir uniform` 对每个可见像素均匀取一盏灯。`restir ris` 计算 16 个初始候选的未遮挡贡献并选一盏灯。`restir reuse` 进一步从上帧同一表面和本帧五个邻居重采样，最终仍只对所选灯做一次 GPU BVH 可见性查询。历史记录随分辨率、光源数、算法和重载变化重置。时域复用用共享表面运动查找上一帧像素，并校验标签、预期深度与法线。空间复用仍用本帧位置和法线。[银狼与混合光照对照](docs/lighting-comparison.md)当前场景使用静态点灯，有限历史与空间复用会引入相关性和估计偏差。[ReSTIR DI 原文](https://research.nvidia.com/labs/rtr/publication/bitterli2020spatiotemporal/)
+
+空间降噪执行两轮边缘保持的 à-trous。SVGF 风格降噪重投影直接光、一阶和二阶亮度矩，再执行三轮方差引导的 à-trous。耗时分别显示在 RDG。降噪作用于线性入射光，最后才乘材质基础色并色调映射。[SVGF 原文](https://research.nvidia.com/labs/rtr/publication/schied2017spatiotemporal/)
+
+以下命令预热 23 帧并保存第 24 帧。同机位基准可追加 `--command "restir uniform" --command "restir denoise off"`。高样本参考可用 `--command "restir reference" --command "restir samples 512" --command "restir denoise off" --warmup 0`。如果灯数不超过样本数，参考模式会逐灯计算。
+
+```powershell
+cargo run --release --locked -- --experiment restir --warmup 23 --capture target/restir.png
+```
+
+RTX 5070 的 800×500 固定机位截图中，取画面 `x=100..699, y=150..479`，以 512 样本分层渲染作为参考。显示空间 RGB PSNR 在 16,384 盏灯下分别为 7.23 dB（均匀采样）、9.47 dB（RIS）、12.49 dB（ReSTIR）、21.29 dB（ReSTIR 加空间降噪）和 21.67 dB（ReSTIR 加 SVGF）。在达到指定预热帧后的截图上，ReSTIR 加 SVGF 的表面重建、复用、阴影射线、滤波及历史写入等 GPU pass 的时间之和，在 16,384 和 65,536 盏灯下分别约 1.46 与 1.49 ms。
+
+### HDR 环境光 PBR
+
+18 个球体展示三档金属度（0、0.5、1）和六档粗糙度（0.06、0.19、0.35、0.52、0.73、0.96）。启动时并行由线性 HDR 图生成漫反射辐照度、七个 GGX 预过滤层级和 128×128 BRDF 积分 LUT，同一进程内复用这些数据。可见性缓冲材质 pass 用 split-sum 进行镜面近似，按金属度与 Fresnel 分配漫反射和镜面能量。房间照明完全取自环境图，基础反射可用 `ibl yaw` 转动。粗糙度越高，高光越宽。金属度为 1 的一行在漫反射视图中为黑色。[Karis 的 split-sum 实现](https://cdn2.unrealengine.com/Resources/files/2013SiggraphPresentationsNotes-26915738.pdf) · [HDR 环境图](https://polyhaven.com/a/studio_small_02)
+
+### GI、阴影和硬件光追
+
+**GI** 是开放前面的 Cornell 风格房间，带红绿反弹墙、矩形面积灯、白色方块和球体，以及遮挡后的蓝色隔间。相机、直射和材质统一，便于看色污染和遮挡差异。`gi ssgi` 在屏幕空间用可见表面做漫反射光线步进；`gi probes` 用 7×5×7 个世界空间探针保存六方向辐照度，采样时对邻近探针做可见性测试；`gi ray` 使用 GPU 上的软件 BVH 遍历计算一次漫反射。三者在半分辨率求间接光，再以可见表面的几何信息做双边上采样。当前使用固定空间采样。追踪模式仍可见少量采样噪声，探针模式会抹平部分细节。[辐照度探针研究](https://research.nvidia.com/index.php/publication/2019-05_dynamic-diffuse-global-illumination-ray-traced-irradiance-fields)
+
+**阴影** 带细栅栏、接触地面的球、留出 0.42 米和 1.15 米间隙的悬空球、远端球及倾斜接收面。硬阴影、PCF、PCSS 从同一光源机位光栅化深度。PCSS 先搜索遮挡物，再根据深度差估计过滤半径。`shadow ray` 在同一几何上对面积光执行 16 次可见性采样，提供对照。`shadow view visibility` 用灰度直接显示光源可见度，`shadow size 0` 可把 PCSS 恢复为点光源比较。[PCSS 算法](https://developer.nvidia.com/gpugems/gpugems3/part-ii-light-and-shadows/chapter-8-summed-area-variance-shadow-maps)
+
+**硬件光追** 用镜面、金属球、遮挡物和镜头外的绿色立柱测试实际的 GPU 遍历。RDG 分别记录构建三角形 BLAS、构建实例化 TLAS 和追踪光线，RHI 管理构建缓冲、同步和 shader binding table。光追程序通过 `vkCmdTraceRaysKHR` 调度 raygen、miss 和 closest-hit。raygen 依次发送主光线、可见性光线和一次镜面反射，便于逐阶段观察。静态 BLAS 按帧槽复用，兼容拓扑的变形可使用 UPDATE。可用 `rays software` 和 `rays hardware` 比较固定点光源的遮挡结果，`rays normals` 查看射线几何法线，`rays off` 返回材质画面。运行此场景需要 `VK_KHR_acceleration_structure` 和 `VK_KHR_ray_tracing_pipeline`，GI 和阴影使用普通计算着色器和现有的可见性缓冲渲染。[Vulkan 光追指南](https://docs.vulkan.org/guide/latest/extensions/ray_tracing.html)
+
+场景由引擎生成，几何、材质和实验设置可以用 `save`、`load` 保存和恢复。抓取固定机位时，可用 `--command` 设置比较模式。
 
 ### 2DGaussian 地砖压缩
 
@@ -124,7 +211,9 @@ cargo run --locked -- --experiment clusters --command "lod 0.25" --command "lodv
 
 **银狼 Motion Matching** 使用 NVIDIA Kimodo-SOMA-RP-v1.2 在 RTX 5070 上生成的 39 段动作。输入是逐帧的水平根轨迹与朝向，覆盖静立、慢走、走、跑、左右转弯走、左右转弯跑、起步、减速停步、后退和左右横移。每类使用种子 41、42、43，每段 4 秒、30 Hz，总计 156 秒、4,680 帧。生成使用空文本、40 步去噪、CFG 权重 1.8，关闭生成后的脚部修正。[Kimodo 源码](https://github.com/nv-tlabs/kimodo) · [模型与权重](https://huggingface.co/nvidia/Kimodo-SOMA-RP-v1.2)
 
-离线转换先对齐 SOMA 与银狼的静止骨轴，再沿银狼的骨架层次计算 21 个关节的局部四元数，并按腿长缩放轨迹。动作库位于 `assets/motion/`，运行示例只需银狼模型和已烘焙的数据。每段最后 23 帧用于提供前瞻，整库共有 3,783 个可检索的起点。代价包含未来第 6、14、23 帧的位移与朝向、双脚位置和速度，以及切换惩罚。在 30 Hz 播放时，每五个采样步重新检索一次，收到新指令时提前检索。窗口内显示实际选中的片段、样本和代价。预览固定水平根位置，保留转身和髋部起伏。当前实现未加入运行时锁脚或地形 IK。
+离线转换先对齐 SOMA 与银狼的静止骨轴，再沿银狼的骨架层次计算 21 个关节的局部四元数，并按腿长缩放轨迹。烘焙时将手臂改到适合各类步态的参考姿势并保留摆臂变化，对四元数和双脚支撑切换做平滑，按更新后的骨骼姿势重算脚部检索特征。动作库位于 `assets/motion/`，每段最后 23 帧提供前瞻，整库共有 3,783 个可检索起点。
+
+移动控制和未来预测执行同一套积分。目标速度通过临界阻尼模型从当前速度和加速度连续变化，转身速度单独平滑。预测过程中局部位移随预期朝向旋转，按住转弯键时会形成弧线，反向输入时也保留已有的动量。轨迹、朝向和足部特征一起用于查找动作。加速和制动阶段允许过渡片段进入候选，稳定行走时筛选持续步态。跳到新帧时，对关节旋转和髋部平移应用衰减偏移，减少换段时的突跳。播放速度在输入与动画同向时小幅匹配实际移动速度。控制台的 `motion` 指令可原地预览指定轨迹。交互目前在平地预览，脚部位置来自烘焙数据和混合后的骨骼姿势。[Epic Game Animation Sample](https://dev.epicgames.com/documentation/unreal-engine/game-animation-sample-project-in-unreal-engine) · [Ubisoft La Forge](https://www.ubisoft.com/en-us/studio/laforge/news/6xXL85Q3bF2vEj76xmnmIu/introducing-learned-motion-matching) · [临界阻尼模型](https://theorangeduck.com/page/spring-roll-call)
 
 原始 SOMA 输出保存在 `assets/motion/source/`。可以直接用第二条命令重新做银狼的骨架映射。要从头生成，在支持 CUDA 的 Python 环境安装官方 Kimodo（本次使用提交 `e1c219c99b4b94ba48be1fb6a1cbc64ecee4c954`）及模型权重，并给第一条命令指定空目录。生成脚本会跳过已有的片段。模型权重版本记在 `bank.json`。
 
@@ -137,9 +226,9 @@ python tools/bake_silver_wolf.py assets/motion/source assets/characters/silver-w
 
 每次查询构造 24 维角色空间特征，包含三个时刻的水平位移与朝向（12 维），以及左右脚踝的位置和速度（各 6 维）。只用可检索的 3,783 个起点拟合各维的均值与标准差。对库和查询使用完全相同的变换 `(x − mean) × gain`，其中 `gain = sqrt(weight) / max(std, floor)`。轨迹位置、朝向、脚位置、脚速度的权重依次为 5、1.6、0.8、0.018，尺度下限依次为 0.05 米、0.1、0.05 米和 0.15 米/秒，防止放大近乎常量的朝向分量。
 
-在加权归一化空间拟合 PCA，前六个正交主成分保留 96.68% 的方差。按六维中跨度最大的轴做中位数切分，得到 511 个树节点、256 个叶子，每叶 14 或 15 个候选。均值、增益、投影矩阵、节点包围盒与叶子样本号一起写入 `assets/motion/search.json`。运行时用可用的顺播候选初始化上界，优先访问距离查询点较近的子树。投影点到子树包围盒的距离为原空间距离提供下界，叶子仍用完整的 24 维代价和 0.18 的跳转惩罚精排。全扫描与 KD-tree 的候选排除、连续播放和同分规则相同。
+在加权归一化空间拟合 PCA，取前六个正交主成分。按六维中跨度最大的轴做中位数切分，得到 511 个树节点、256 个叶子，每叶 14 或 15 个候选。均值、增益、投影矩阵、节点包围盒与叶子样本号一起写入 `assets/motion/search.json`。运行时用可用的顺播候选初始化上界，优先访问距离查询点较近的子树。投影点到子树包围盒的距离为原空间距离提供下界，叶子仍用完整的 24 维代价精排。片段内跳转的附加代价为 0.28，跨片段为 0.42。全扫描与 KD-tree 使用相同的候选筛选和同分规则。
 
-Ryzen 7 9700X，release 构建，单角色，动作库驻内存，交替执行两种检索。预热 240 次后对同一组连续移动输入测量 2,160 次。全部 2,400 次查询以及另外 512 次扰动或片段边界测试，两条路径均得到相同的样本号与代价。
+以下性能数据来自轨迹与过渡改造前的版本。Ryzen 7 9700X，release 构建，单角色，动作库驻内存，交替执行两种检索。预热 240 次后对同一组连续移动输入测量 2,160 次。全部 2,400 次查询以及另外 512 次扰动或片段边界测试，两条路径均得到相同的样本号与代价。
 
 | CPU 范围 | P50 | P95 |
 | --- | ---: | ---: |
@@ -152,9 +241,11 @@ Ryzen 7 9700X，release 构建，单角色，动作库驻内存，交替执行�
 
 ```powershell
 cargo test --release --locked --lib benchmark_silver_motion -- --ignored --nocapture
-cargo run --release --locked -- --experiment motion --command "motionsearch kd" --benchmark 600
-cargo run --release --locked -- --experiment motion --command "motionsearch scan" --benchmark 600
+cargo run --release --locked -- --experiment motion --command "motion 1.35 0" --command "motionsearch kd" --benchmark 600
+cargo run --release --locked -- --experiment motion --command "motion 1.35 0" --command "motionsearch scan" --benchmark 600
 ```
+
+岩柱森林默认开启 ReSTIR DI、GI-1.2 两跳漫反射和 Vulkan 硬件光追。控制台运行 `restir rays toggle` 可在软硬件后端间往返，也可用 `restir rays software` 或 `restir rays hardware` 指定后端。这一设置同时控制太阳阴影、漫反射命中和命中点到光源的遮挡查询。`vegetation shadows adaptive` 使用近景精细、远景简化的投影几何，`vegetation shadows mega` 在硬件模式下追踪主视图选簇及屏幕外补充簇。[岩柱森林逐帧开销](docs/procedural-vegetation.md#岩柱森林的多跳光追) · [Mega Geometry](docs/forest-mega.md)
 
 ### 录制实验
 

@@ -36,8 +36,8 @@ void main() {
     if (lane >= max(parent.children, 1u)) return;
     uint child = parent.children == 0u ? job.y : parent.first + lane;
     Node node = tree.data[child];
-    if (outsideFrustum(view.vp * obj.model, node.geometry)
-        || !refine(node.error, node.projection, obj, view)) return;
+    if (outsideCasterVolume(obj.model,node.geometry,view)
+        || refinementWeight(node.error, node.projection, obj, view) <= 0.0) return;
 
 #ifndef LAST_LEVEL
     if (node.children != 0u) {

@@ -1,0 +1,25 @@
+#version 460
+#include "lighting_scene.glsl"
+#include "restir_types.glsl"
+#define RESTIR_CONFIG 2
+#define RESTIR_HISTORY 3
+#include "restir_controls.glsl"
+#include "restir_history.glsl"
+#include "restir_lights.glsl"
+#define LIGHTING_NODES 5
+#define LIGHTING_TRIANGLES 6
+#define SKINNED_SHADOWS
+#define SCENE_HAS_DEFORMED (viewport.z!=0u)
+#include "scene_ray_query.glsl"
+layout(set=0,binding=0,std430) readonly buffer Current { Surface surfaces[]; };
+layout(set=0,binding=4,std430) readonly buffer Reservoirs { Reservoir selected[]; };
+layout(set=0,binding=7,std430) writeonly buffer Output { Radiance raw[]; };
+layout(local_size_x=8,local_size_y=8) in;
+
+#include "restir_visibility.glsl"
+#include "restir_shadow_eval.glsl"
+void main() {
+    uvec2 xy=gl_GlobalInvocationID.xy;
+    if(any(greaterThanEqual(xy,screenSize))) return;
+    evaluateShadow(xy);
+}

@@ -1,0 +1,103 @@
+//! Frame-local acceleration and hit data shared by visibility and closest-hit queries.
+use super::*;
+
+pub(crate) enum RayScene {
+    Software {
+        nodes: Resource,
+        triangles: Resource,
+        deformed: Software,
+    },
+    Hardware(NativeScene),
+}
+
+pub(crate) struct NativeScene {
+    tlas: Resource,
+    blases: Vec<Resource>,
+    pub(crate) cluster: Option<ClusterShadow>,
+    // Vertex/index addresses and material slots in TLAS instance order.
+    pub(crate) hit_streams: Option<[Resource; 2]>,
+}
+
+impl RayScene {
+    pub(crate) fn build(
+        g: &mut FrameGraph,
+        hardware: bool,
+        hit_attributes: bool,
+        rigid: Option<[Arc<[u8]>; 2]>,
+    ) -> Result<Self> {
+        if hardware {
+            let cluster = g.products.cluster_shadow;
+            let surfaces: Vec<_> = g
+                .products
+                .ray_surfaces
+                .iter()
+                .enumerate()
+                .filter(|(i, s)| {
+                    s.geometry.count > 0
+                        && !cluster.is_some_and(|c| (c.proxy_start..c.proxy_end).contains(i))
+                })
+                .map(|(_, s)| *s)
+                .collect();
+            if !surfaces.is_empty() || cluster.is_some() {
+                let (tlas, blases, _) = native_scene(
+                    g,
+                    &surfaces,
+                    cluster.map(|c| c.blas),
+                    RayHits::InstanceGeometry,
+                )?;
+                let hit_streams = if hit_attributes {
+                    let pointers = surfaces
+                        .iter()
+                        .flat_map(|s| [s.geometry.vertices, s.geometry.faces])
+                        .collect();
+                    let mut slots = vec![u32::try_from(surfaces.len())?];
+                    slots.extend(surfaces.iter().map(|s| s.material_slot));
+                    Some([
+                        g.address_table(pointers),
+                        g.input(
+                            "GI ray instance material slots",
+                            bytemuck::cast_slice(&slots).to_vec(),
+                        ),
+                    ])
+                } else {
+                    None
+                };
+                return Ok(Self::Hardware(NativeScene {
+                    tlas,
+                    blases,
+                    cluster,
+                    hit_streams,
+                }));
+            }
+        }
+        // An empty scene needs no TLAS. Zero-length node arrays make every ray miss.
+        let [nodes, triangles] = rigid.unwrap_or_default();
+        Ok(Self::Software {
+            nodes: g.resident_input("Many-light shadow BVH", nodes),
+            triangles: g.resident_input("Shadow caster triangles", triangles),
+            deformed: software(g, true)?,
+        })
+    }
+}
+
+impl NativeScene {
+    pub(crate) fn trace(
+        &self,
+        extent: [u32; 2],
+        shader: Shader,
+        bindings: Vec<(Resource, Access)>,
+    ) -> Op {
+        // The TLAS device address follows the heap indices at an eight-byte boundary.
+        let push = vec![0; 4 * (bindings.len() % 2)];
+        Op::TraceRays {
+            extent,
+            tlas: self.tlas,
+            blases: self.blases.clone(),
+            program: Dispatch {
+                shader,
+                bindings,
+                push,
+            },
+        }
+    }
+}

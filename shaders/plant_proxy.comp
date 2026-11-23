@@ -1,0 +1,67 @@
+#version 460
+#include "cluster.glsl"
+layout(local_size_x=64) in;
+layout(binding=0,std430) readonly buffer Objects { Instance objs[]; };
+#ifdef DETAIL
+layout(binding=1,std430) readonly buffer FineFaces { uint corners[]; };
+struct SourceVertex {vec4 p;vec4 n;uvec4 joints;vec4 weights;};
+layout(binding=7,std430) readonly buffer Source {SourceVertex source[];};
+#else
+layout(binding=1,std430) readonly buffer Prototype { vec4 points[]; };
+#endif
+layout(binding=2,std430) readonly buffer Wind { mat4 bones[]; };
+layout(binding=3,std430) writeonly buffer Vertices { vec4 vertices[]; };
+layout(binding=4,std430) writeonly buffer Indices { uvec4 faces[]; };
+layout(binding=5,std430) readonly buffer Layout {uvec4 slots[];};
+#ifdef INDEXED
+layout(binding=6,std430) readonly buffer Order {uint instanceOrder[];};
+#ifdef DETAIL
+#define PARAM_OFFSET 32
+#else
+#define PARAM_OFFSET 28
+#endif
+#else
+#define PARAM_OFFSET 24
+#endif
+layout(push_constant) uniform Params {layout(offset=PARAM_OFFSET) uint first;uint count;uint facesPerInstance;
+#ifdef INDEXED
+uint start;
+#endif
+} p;
+void main(){
+    uint i=gl_GlobalInvocationID.x+gl_WorkGroupID.y*32768u*64u;
+    if(i>=p.count*p.facesPerInstance)return;
+    uint local=i/p.facesPerInstance;
+#ifdef INDEXED
+    local=instanceOrder[p.start+local];
+#endif
+    uint slot=p.first+local;
+    Instance obj=objs[slot];
+    vec2 uv[3];
+    vec3 world[3];
+    for(uint j=0;j<3;++j){
+        uint corner=3u*(i%p.facesPerInstance)+j;
+#ifdef DETAIL
+        SourceVertex v=source[corners[corner]];
+        vec4 pos=vec4(v.p.xyz,1);
+        if((obj.tex.w&WIND_DEFORM)!=0u) {
+            vec4 skinned=vec4(0);
+            for(uint k=0u;k<4u;k++) if(v.weights[k]>0.) skinned+=v.weights[k]*(bones[obj.routing.w+v.joints[k]]*pos);
+            pos=skinned;
+        }
+        uv[j]=vec2(v.p.w,v.n.w);
+#else
+        vec4 v=points[2u*corner];
+        vec4 pos=vec4(v.xyz,1);
+        if((obj.tex.w&WIND_DEFORM)!=0u)pos=bones[obj.routing.w+floatBitsToUint(v.w)]*pos;
+        uv[j]=points[2u*corner+1u].xy;
+#endif
+        world[j]=(obj.model*pos).xyz;
+    }
+    vec3 normal=normalize(cross(world[1]-world[0],world[2]-world[0]));
+    for(uint j=0;j<3;++j){
+        vertices[6*i+2*j]=vec4(world[j],uv[j].x);
+        vertices[6*i+2*j+1]=vec4(normal,uv[j].y);
+    }
+    faces[i]=uvec4(3*i,3*i+1,3*i+2,slots[2u*slot].z);
+}

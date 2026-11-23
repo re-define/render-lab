@@ -12,8 +12,9 @@ void main() {
     uint id = workIndex();
     if (id >= p.count) return;
     Instance obj = instances[id];
+    if (obj.routing.z == NONE) return;
     vec4 bounds = assets[obj.routing.z].tree.data[0].geometry;
-    if (outsideFrustum(view.vp * obj.model, bounds)) return;
+    if (outsideCasterVolume(obj.model,bounds,view)) return;
     uint slot = atomicAdd(counts[0], 1u);
     roots[slot] = uvec2(id, 0);
     atomicAdd(counters[0], 1u);
