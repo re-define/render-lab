@@ -7,9 +7,6 @@ layout(set=0,binding=1,std430) readonly buffer Camera{View view;};
 #extension GL_EXT_samplerless_texture_functions : require
 layout(set=0,binding=2) uniform texture2D sceneDepth;
 #define START 12
-#elif defined(SOURCE_VOXELS)
-layout(set=0,binding=2,std430) readonly buffer RasterDepth { uvec2 winners[]; };
-#define START 12
 #else
 #define START 8
 #endif
@@ -24,9 +21,6 @@ void main(){
         uint index=p.src+src.y*p.width+src.x;
 #ifdef SOURCE_DEPTH
         float depth=texelFetch(sceneDepth,ivec2(src),0).x;
-        z[index]=depth;
-#elif defined(SOURCE_VOXELS)
-        float depth=uintBitsToFloat(~winners[index].y);
         z[index]=depth;
 #else
         float depth=z[index];

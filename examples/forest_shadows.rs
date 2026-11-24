@@ -29,7 +29,7 @@ fn frame(e: &mut Engine, dt: f32, extent: [u32; 2]) -> Result<Frame> {
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let dir = PathBuf::from(args.next().context(
-        "usage: forest_shadows OUTPUT reference|realtime [frames] [rounds], proxy-images, or zoom [laps] [purposes] [--size WIDTHxHEIGHT] [--raster auto|mesh|compute] [--rays auto|software|hardware|inline] [--gi direct|single|multi]",
+        "usage: forest_shadows OUTPUT reference|realtime [frames] [rounds], proxy-images, or zoom [laps] [purposes] [--size WIDTHxHEIGHT] [--raster auto|mesh|compute|linear] [--rays auto|software|hardware|inline] [--gi direct|single|multi]",
     )?);
     let sampling = args.next().context("missing sampling mode")?;
     if sampling == "proxy-images" {
@@ -66,9 +66,9 @@ fn main() -> Result<()> {
                 "--raster" => {
                     raster = args
                         .next()
-                        .context("--raster needs auto, mesh or compute")?;
+                        .context("--raster needs auto, mesh, compute or linear")?;
                     ensure!(
-                        matches!(raster.as_str(), "auto" | "mesh" | "compute"),
+                        matches!(raster.as_str(), "auto" | "mesh" | "compute" | "linear"),
                         "invalid raster mode"
                     );
                 }

@@ -260,30 +260,56 @@ impl SilverMatcher {
         Ok(jumped.then_some((outgoing, next)))
     }
 }
-impl System for SilverMatcher {
-    fn access(&self) -> SystemAccess {
-        use SimulationData::{Component, LocalTransform};
-        SystemAccess {
-            name: "Silver Wolf motion matcher",
-            reads: &[Component(PLAYER), LocalTransform],
-            writes: &[Component(PLAYER), LocalTransform],
+impl SimulationSystem for SilverMatcher {
+    fn order(&self) -> SystemOrder {
+        SystemOrder {
+            key: Some(PLAYER),
+            after: &[],
         }
     }
-    fn update(&self, w: &World, dt: f32) -> Result<Edit> {
+    fn access(&self) -> SystemAccess {
+        use SimulationData::{Component, LocalTransformsById};
+        SystemAccess {
+            name: "Silver Wolf motion matcher",
+            reads: &[Component(PLAYER), LocalTransformsById],
+            writes: &[Component(PLAYER), LocalTransformsById],
+        }
+    }
+    fn transform_targets(&self, bindings: &TransformBindings<'_>) -> Result<TransformTargets> {
+        let mut joints = Vec::new();
+        for &id in bindings.component_owners(PLAYER)? {
+            let player = bindings
+                .component::<State>(id, PLAYER)?
+                .context("missing Silver Wolf motion player")?;
+            joints.push(id);
+            joints.extend_from_slice(&player.bones);
+        }
+        Ok(TransformTargets {
+            reads: joints.clone(),
+            writes: joints,
+        })
+    }
+    fn run(&self, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
         ensure!(dt.is_finite() && dt >= 0., "invalid motion time");
         if dt == 0. {
-            return Ok(Box::new(|_| {}));
+            return Ok(());
         }
-        let mut updates = vec![];
-        for &id in w.entities.component_owners(PLAYER) {
-            let mut p = player(w, id)?.into_owned();
+        for &id in cx.component_owners(PLAYER)? {
+            let mut p: State = cx
+                .component::<State>(id, PLAYER)?
+                .context("missing Silver Wolf motion player")?
+                .into_owned();
             ensure!(
                 p.sample < self.poses.len()
                     && p.bones.len() == self.poses[p.sample].rotations.len(),
                 "invalid motion binding"
             );
             let time = dt.min(0.25);
-            let mut root = w.entities[&id].local.w_axis.truncate();
+            let mut root = cx
+                .local(id)?
+                .context("missing motion root")?
+                .w_axis
+                .truncate();
             if p.move_root {
                 let travel = p.advance(time);
                 let delta = travel.displacement;
@@ -347,11 +373,9 @@ impl System for SilverMatcher {
                 Mat4::from_rotation_translation(Quat::from_rotation_y(p.yaw), root),
             ));
             for (i, &bone) in p.bones.iter().enumerate() {
-                let (scale, previous, mut translation) = w
-                    .entities
-                    .get(&bone)
+                let (scale, previous, mut translation) = cx
+                    .local(bone)?
                     .context("missing motion joint")?
-                    .local
                     .to_scale_rotation_translation();
                 let target = pose.rotations[i].slerp(after.rotations[i], p.fraction);
                 let rotation = if let Some((old, next, blend)) = &mut transition {
@@ -389,16 +413,10 @@ impl System for SilverMatcher {
             if let Some((_, _, blend)) = transition {
                 p.transition = Some(blend);
             }
-            updates.push((id, p, LocalPose::prepare(w, joints)?));
+            cx.set_pose(joints)?;
+            cx.set_typed_component(id, PLAYER, p)?;
         }
-        Ok(Box::new(move |w| {
-            for (id, state, pose) in updates {
-                pose.apply(w);
-                if w.entities.contains_key(&id) {
-                    w.set_typed_component(id, PLAYER, state);
-                }
-            }
-        }))
+        Ok(())
     }
 }
 pub fn set_goal(w: &mut World, speed: f32, turn: f32, side: f32) -> Result<()> {
@@ -517,6 +535,64 @@ pub fn scene() -> Result<World> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::System;
+
+    #[test]
+    fn silver_joints_and_fracture_pieces_share_a_batch_until_rebound() -> Result<()> {
+        use crate::{engine::Schedule, experiments::effects, render::MaterialPrograms};
+        let rig = scene()?;
+        let source = actor(&rig).unwrap();
+        let mut binding = player(&rig, source)?.into_owned();
+        let mut world = effects::destruction()?;
+        // Copy the animated local poses into the destruction scene's entity namespace.
+        for bone in &mut binding.bones {
+            *bone = world.spawn(Entity {
+                local: rig.entities[bone].local,
+                ..Default::default()
+            });
+        }
+        let hip = binding.bones[0];
+        let root = world.spawn(Entity {
+            local: rig.entities[&source].local,
+            ..Default::default()
+        });
+        world.set_typed_component(root, PLAYER, binding);
+        let (&piece, _) = world
+            .entities
+            .iter()
+            .find(|(_, e)| e.name == "Crystal fragment")
+            .unwrap();
+        let (hip_before, piece_before) = (world.entities[&hip].local, world.entities[&piece].local);
+        let mut schedule = Schedule::default();
+        effects::configure(
+            &world,
+            &mut MaterialPrograms::default(),
+            &mut schedule,
+            true,
+        )?;
+        schedule.add_system(Arc::new(SilverMatcher::load()?));
+        schedule.bind_transforms(&world)?;
+        let batches: Vec<_> = schedule
+            .stages()
+            .map(|(batch, _)| batch.iter().map(|a| a.name).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(
+            batches,
+            [vec!["Effect playback", "Silver Wolf motion matcher"]]
+        );
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+        let mut world = Arc::new(world);
+        schedule.tick(&mut world, 1.125, &pool)?;
+        assert_ne!(world.entities[&piece].local, piece_before);
+        assert_ne!(world.entities[&hip].local, hip_before);
+        let mut binding = player(&world, root)?.into_owned();
+        binding.bones[0] = piece;
+        Arc::make_mut(&mut world).set_typed_component(root, PLAYER, binding);
+        schedule.tick(&mut world, 1. / 30., &pool)?;
+        assert_eq!(schedule.stages().count(), 2);
+        assert!(schedule.describe().contains(&format!("write/write LocalTransform entity {piece}: Effect playback → Silver Wolf motion matcher")));
+        Ok(())
+    }
 
     #[test]
     fn idle_pose_keeps_the_support_foot_at_ground_level() -> Result<()> {

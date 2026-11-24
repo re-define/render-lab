@@ -5,7 +5,6 @@ pub(super) fn scope(a: Access) -> (S, A, L) {
     use Access::*;
     match a {
         Indirect => (S::DRAW_INDIRECT, A::INDIRECT_COMMAND_READ, L::UNDEFINED),
-        Upload => (S::HOST, A::HOST_WRITE, L::UNDEFINED),
         Mesh => (S::MESH_SHADER_EXT, A::SHADER_STORAGE_READ, L::UNDEFINED),
         MeshFragment => (
             S::MESH_SHADER_EXT | S::FRAGMENT_SHADER,
@@ -89,9 +88,21 @@ pub(super) fn scope(a: Access) -> (S, A, L) {
     }
 }
 impl Recorder {
-    unsafe fn barriers(&mut self, step: &Step, res: &[Physical]) {
+    unsafe fn barriers(&mut self, graph: &Graph, step: &Step, res: &[Physical]) {
         let mut images = vec![];
         let mut memory = vk::MemoryBarrier2::default();
+        let pass = &graph.passes[step.index];
+        let count = self.gpu.queues.len();
+        let queue = queues::physical_queue(pass.queue, count);
+        // Submission order alone does not establish an execution dependency.
+        if pass
+            .after
+            .iter()
+            .any(|&id| queues::physical_queue(graph.passes[id].queue, count) == queue)
+        {
+            memory.src_stage_mask = S::ALL_COMMANDS;
+            memory.dst_stage_mask = S::ALL_COMMANDS;
+        }
         for b in &step.barriers {
             let (mut src, mut access, mut old) = (S::empty(), A::empty(), L::UNDEFINED);
             for &a in &b.from {
@@ -130,9 +141,18 @@ impl Recorder {
                     if !src.is_empty() =>
                 {
                     memory.src_stage_mask |= src;
-                    memory.src_access_mask |= access;
                     memory.dst_stage_mask |= dst;
-                    memory.dst_access_mask |= next;
+                    // A read followed by a write only needs execution order. Make only
+                    // prior writes available, including writes inherited from an alias.
+                    if b.from.iter().any(|a| a.writes()) {
+                        memory.src_access_mask |= access
+                            & (A::HOST_WRITE
+                                | A::SHADER_STORAGE_WRITE
+                                | A::TRANSFER_WRITE
+                                | A::ACCELERATION_STRUCTURE_WRITE_KHR
+                                | A::MEMORY_WRITE);
+                        memory.dst_access_mask |= next;
+                    }
                 }
                 _ => (),
             }
@@ -176,7 +196,7 @@ impl Recorder {
         )?;
         d.cmd_reset_query_pool(cmd, self.query, 0, 2);
         d.cmd_write_timestamp2(cmd, S::TOP_OF_PIPE, self.query, 0);
-        self.barriers(step, res);
+        self.barriers(&plan.graph, step, res);
         let op = &plan.graph.passes[step.index].op;
         if gpu.raster_queries && matches!(op, Op::Draw { .. }) {
             if self.raster.is_none() {

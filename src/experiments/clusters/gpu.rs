@@ -677,7 +677,7 @@ impl ClusterScene {
         input: Work,
         out: Work,
         deferred: Option<Work>,
-        bricks: Option<&bricks::BrickBins>,
+        bricks: Option<&bricks::BrickJobs>,
     ) {
         let mut bindings = vec![
             (self.assets, R),
@@ -691,14 +691,6 @@ impl ClusterScene {
         ];
         let variants: (&'static [u8], &'static [u8]) = match bricks {
             None => (spirv!("occlusion.comp"), spirv!("occlusion_post.comp")),
-            Some(bins) if bins.counts.is_none() => (
-                spirv!("occlusion_compute_bricks.comp"),
-                spirv!("occlusion_compute_bricks_post.comp"),
-            ),
-            Some(_) if self.voxel_hit_ranges.is_some() => (
-                spirv!("occlusion_compare_bricks.comp"),
-                spirv!("occlusion_compare_bricks_post.comp"),
-            ),
             Some(_) => (
                 spirv!("occlusion_bricks.comp"),
                 spirv!("occlusion_bricks_post.comp"),
@@ -710,8 +702,8 @@ impl ClusterScene {
         } else {
             ("Post Hi-Z retest", variants.1)
         };
-        if let Some(bins) = bricks {
-            bindings.extend(bins.outputs());
+        if let Some(jobs) = bricks {
+            bindings.extend(jobs.outputs());
         }
         g.pass_in(
             PassPhase::Culling,
@@ -792,23 +784,12 @@ impl Pyramid {
             header: src + 1,
         })
     }
-    fn build(
-        &self,
-        g: &mut FrameGraph,
-        depth: (Resource, Access),
-        h: Resource,
-        view: Resource,
-        name: &str,
-    ) {
+    fn build(&self, g: &mut FrameGraph, depth: Resource, h: Resource, view: Resource, name: &str) {
         for (i, &params) in self.levels.iter().enumerate() {
             let mut bindings = vec![(h, RW), (view, R)];
             let shader: &'static [u8] = if i == 0 {
-                bindings.push(depth);
-                if depth.1 == R {
-                    spirv!("hiz_voxel_depth.comp")
-                } else {
-                    spirv!("hiz_depth.comp")
-                }
+                bindings.push((depth, Access::ComputeSample));
+                spirv!("hiz_depth.comp")
             } else {
                 spirv!("hiz.comp")
             };
@@ -981,52 +962,23 @@ impl ClusterLod {
         let deferred = Work::new(g, "Deferred clusters", scene.capacity, 1);
         let post = Work::new(g, "Recovered clusters", triangle_capacity, pages);
         let compare = plants.is_some_and(|p| p.raster == vegetation::BrickRaster::Compare);
-        let mesh_bins = scene.voxel_hit_ranges.is_none() || compare;
-        let main_bricks =
-            bricks::BrickBins::new(g, "Main voxel jobs", scene.brick_draw_capacity, mesh_bins);
-        scene.visibility(
-            g,
-            history,
-            selected,
-            main,
-            Some(deferred),
-            main_bricks.as_ref(),
-        );
+        let bricks = bricks::BrickJobs::new(g, scene.brick_draw_capacity);
+        scene.visibility(g, history, selected, main, Some(deferred), bricks.as_ref());
         scene.draw(g, t, main, "Main mesh visibility");
         ordinary(g, t)?;
-        let software = scene
-            .voxel_hit_ranges
-            .map(|ranges| bricks::SoftwareRaster::new(g, t, ranges, compare));
-        let mut current_depth = (t.depth, Access::ComputeSample);
-        if let Some(main) = &main_bricks {
-            if let Some(sw) = &software {
-                sw.trace(g, &scene, main, None, "Main voxel brick visibility trace");
-                current_depth = (sw.winners, R);
-            } else {
-                main.draw_mesh(g, t, &scene, "Main voxel brick visibility");
-            }
-        }
-        pyramid.build(g, current_depth, history, view, "Current Hi-Z");
-        let post_bricks = bricks::BrickBins::new(
-            g,
-            "Recovered voxel jobs",
-            scene.brick_draw_capacity,
-            mesh_bins,
-        );
-        scene.visibility(g, history, deferred, post, None, post_bricks.as_ref());
+
+        // A triangle-only intermediate pyramid is conservative. Main and
+        // recovered brick jobs wait for the final opaque triangle depth.
+        pyramid.build(g, t.depth, history, view, "Current Hi-Z");
+        scene.visibility(g, history, deferred, post, None, bricks.as_ref());
         scene.draw(g, t, post, "Post mesh visibility");
-        if let (Some(main), Some(post)) = (&main_bricks, &post_bricks) {
-            if let Some(sw) = &software {
-                sw.trace(
-                    g,
-                    &scene,
-                    post,
-                    Some(t.depth),
-                    "Post voxel brick visibility trace",
-                );
-                sw.finish(g, t, &scene, main, post);
+        if let Some(jobs) = &bricks {
+            if let Some(ranges) = scene.voxel_hit_ranges {
+                let raster = bricks::SoftwareRaster::new(g, t, ranges, compare);
+                raster.trace(g, &scene, jobs);
+                raster.finish(g, t, &scene, jobs);
             } else {
-                post.draw_mesh(g, t, &scene, "Post voxel brick visibility");
+                jobs.draw_mesh(g, t, &scene);
             }
         }
         g.pass(
@@ -1041,13 +993,7 @@ impl ClusterLod {
                 },
             },
         );
-        pyramid.build(
-            g,
-            (t.depth, Access::ComputeSample),
-            history,
-            view,
-            "History Hi-Z",
-        );
+        pyramid.build(g, t.depth, history, view, "History Hi-Z");
         Ok(())
     }
     pub(in crate::experiments) fn owns(s: &Snapshot, i: &RenderInstance) -> bool {

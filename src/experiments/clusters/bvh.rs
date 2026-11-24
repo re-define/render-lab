@@ -238,26 +238,43 @@ impl Packed {
             }
     }
     pub fn build(e: &MeshAsset, mixed: bool) -> Result<Self> {
-        let mesh = &e.mesh;
-        let meshlets = e.meshlets.as_ref().context("missing meshlets")?;
-        let dag = e.hierarchy.as_ref().context("missing DAG")?;
-        // Validate the group ordering before using it to gather source coverage.
-        let mut flat = repaired(dag, meshlets, None)?;
-        let mut replacements = Vec::new();
-        if let Some(size) = e.plant.as_ref().and_then(|plant| plant.voxel_cell_size) {
-            let errors = if mixed {
-                let (choices, errors) = voxels::choose(mesh, dag, meshlets, size);
-                replacements = choices;
-                errors
-            } else {
+        let source_mesh = &e.mesh;
+        let source_meshlets = e.meshlets.as_ref().context("missing meshlets")?;
+        let source_dag = e.hierarchy.as_ref().context("missing DAG")?;
+        let size = e.plant.as_ref().and_then(|plant| plant.voxel_cell_size);
+        let generated = if let (true, Some(size)) = (mixed, size) {
+            Some(voxels::Hierarchy::build(
+                source_mesh,
+                source_meshlets,
+                source_dag,
+                size,
+            )?)
+        } else {
+            None
+        };
+        let (mesh, meshlets, dag) = match &generated {
+            Some(tree) => (&tree.mesh, tree.meshlets.as_slice(), tree.nodes.as_slice()),
+            None => (
+                source_mesh.as_ref(),
+                source_meshlets.as_slice(),
+                source_dag.as_slice(),
+            ),
+        };
+        let replacements = generated
+            .as_ref()
+            .map_or(&[][..], |tree| tree.choices.as_slice());
+        let errors = if size.is_some() && !mixed {
+            Some(
                 foliage_coverage_errors(mesh, dag, meshlets)
                     .into_iter()
-                    .zip(dag.iter())
+                    .zip(dag)
                     .map(|(coverage, group)| coverage.max(group.error))
-                    .collect()
-            };
-            flat = repaired(dag, meshlets, Some(&errors))?;
-        }
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+        let flat = repaired(dag, meshlets, errors.as_deref())?;
         let mut groups = flat
             .iter()
             .map(|g| Group {
@@ -288,7 +305,6 @@ impl Packed {
         let mut packed = vec![];
         let mut voxel_pages = vec![];
         let mut leaves = vec![];
-        let mut emitted = vec![false; replacements.len()];
         for (owner, g) in dag.iter().enumerate() {
             let first = packed.len();
             for &id in &g.meshlets {
@@ -297,21 +313,18 @@ impl Packed {
                 if let Some(child) = c.refined_group
                     && let Some(Some(voxel)) = replacements.get(child as usize)
                 {
-                    if !emitted[child as usize] {
-                        emitted[child as usize] = true;
-                        packed.push(
-                            voxel.emit(
-                                &mut vertices,
-                                &mut indices,
-                                &mut voxel_pages,
-                                [owner.try_into()?, child, level, 1],
-                                &e.plant
-                                    .as_ref()
-                                    .expect("voxel cluster requires a plant rig")
-                                    .bones,
-                            )?,
-                        );
-                    }
+                    packed.extend(
+                        voxel.emit(
+                            &mut vertices,
+                            &mut indices,
+                            &mut voxel_pages,
+                            [owner.try_into()?, child, level, 1],
+                            &e.plant
+                                .as_ref()
+                                .expect("voxel cluster requires a plant rig")
+                                .bones,
+                        )?,
+                    );
                     continue;
                 }
                 // Older/custom assets may exceed the shader's per-workgroup limits.
@@ -442,11 +455,11 @@ impl Packed {
                 vertices: bytes(&vertices),
                 indices: bytes(&indices),
             },
-            voxel_replacements: emitted.into_iter().filter(|v| *v).count().try_into()?,
+            voxel_replacements: replacements.iter().flatten().count().try_into()?,
             bones,
-            mesh: mesh.clone(),
-            meshlets: meshlets.clone(),
-            dag: dag.clone(),
+            mesh: source_mesh.clone(),
+            meshlets: source_meshlets.clone(),
+            dag: source_dag.clone(),
             plant,
             mixed,
         })
@@ -471,6 +484,7 @@ mod tests {
         let groups: &[Group] = bytemuck::cast_slice(&packed.streams.groups);
         let clusters: &[Cluster] = bytemuck::cast_slice(&packed.streams.clusters);
         let mut voxel_levels = BTreeSet::new();
+        let mut parent_counts = std::collections::BTreeMap::new();
         let mut replaced = BTreeSet::new();
         let mut triangles = BTreeSet::new();
         for cluster in &clusters[..packed.streams.count as usize] {
@@ -492,16 +506,150 @@ mod tests {
                 );
                 voxel_levels.insert(level);
                 replaced.insert(child);
+                *parent_counts.entry(child).or_insert(0usize) += 1;
             } else {
                 triangles.insert(child);
             }
         }
+        let mut mixed = 0;
+        let mut voxel_children = 0;
+        for &child in &replaced {
+            let group = &groups[child as usize];
+            let cut = &clusters[group.first_cluster as usize..][..group.cluster_count as usize];
+            let count = cut.iter().filter(|c| c.meta[3] & 1 != 0).count();
+            voxel_children += usize::from(count != 0);
+            mixed += usize::from(count != 0 && count != cut.len());
+        }
+        eprintln!(
+            "Spruce: {} voxel replacements, {} from voxel children, {} from mixed children, {} emitted parents, {} groups with multiple parents",
+            replaced.len(),
+            voxel_children,
+            mixed,
+            parent_counts.values().sum::<usize>(),
+            parent_counts.values().filter(|&&n| n > 1).count()
+        );
+        assert!(mixed > 0 && voxel_children >= mixed);
         assert!(voxel_levels.len() >= 2);
         assert!(triangles.contains(&NONE));
         assert!(replaced.is_disjoint(&triangles));
         assert_eq!(packed.voxel_replacements as usize, replaced.len());
         let plain = Packed::build(&asset, false)?;
         assert_eq!(plain.voxel_replacements, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_frontier_crosses_saved_boundaries_and_uses_each_leaf_once() -> Result<()> {
+        let world = crate::experiments::vegetation::scene()?;
+        let canopy = world
+            .entities
+            .values()
+            .find(|e| e.name == "Spruce canopy")
+            .unwrap();
+        let mut asset = MeshAsset::from_entity(canopy).unwrap();
+        let slots = asset.meshlets.as_ref().unwrap();
+        let stored = asset.hierarchy.as_ref().unwrap();
+        let size = asset.plant.as_ref().unwrap().voxel_cell_size.unwrap();
+        let dag = voxels::Hierarchy::build(&asset.mesh, slots, stored, size)?;
+        let mut source_owner = HashMap::new();
+        let mut leaf_ids = vec![];
+        for (owner, g) in stored.iter().enumerate() {
+            for &id in &g.meshlets {
+                let c = &slots[id as usize];
+                if c.refined_group.is_none() {
+                    leaf_ids.push(id);
+                    for &f in &c.triangles {
+                        assert!(source_owner.insert(f, owner).is_none());
+                    }
+                }
+            }
+        }
+        let mut seen = vec![0; dag.meshlets.len()];
+        let mut leaf_faces = BTreeSet::new();
+        let mut crossed = 0;
+        for group in &dag.nodes {
+            let mut owners = BTreeSet::new();
+            for &id in &group.meshlets {
+                seen[id as usize] += 1;
+                let c = &dag.meshlets[id as usize];
+                if c.refined_group.is_none() {
+                    for &f in &c.triangles {
+                        owners.insert(source_owner[&f]);
+                        assert!(leaf_faces.insert(f));
+                    }
+                }
+            }
+            crossed += usize::from(owners.len() > 1);
+        }
+        assert_eq!(leaf_faces.len(), source_owner.len());
+        assert!(seen.iter().all(|&n| n == 1));
+        // The input and runtime use the same triangle partitioner. Their first all-triangle level
+        // may coincide. Compare descendant sets after actual parents have re-entered grouping.
+        let ancestry = |nodes: &[ClusterNode], slots: &[Meshlet]| {
+            let mut sets = Vec::<BTreeSet<u32>>::new();
+            for n in nodes {
+                let mut represented = BTreeSet::new();
+                for &id in &n.meshlets {
+                    let m = &slots[id as usize];
+                    if let Some(child) = m.refined_group {
+                        represented.extend(&sets[child as usize]);
+                    } else {
+                        represented.insert(m.triangles[0]);
+                    }
+                }
+                sets.push(represented);
+            }
+            sets
+        };
+        let archived = ancestry(stored, slots).into_iter().collect::<BTreeSet<_>>();
+        let regenerated = ancestry(&dag.nodes, &dag.meshlets);
+        let changed = regenerated
+            .iter()
+            .filter(|set| !archived.contains(*set))
+            .count();
+        assert!(
+            changed > 0,
+            "regrouped ancestors should differ after the first reductions"
+        );
+        eprintln!(
+            "Spruce regroup: {crossed} first-level boundary crossings, {changed} new ancestry sets, {} groups, {} roots, {} source leaf triangles",
+            dag.nodes.len(),
+            dag.nodes.iter().filter(|n| n.error == f32::MAX).count(),
+            leaf_faces.len()
+        );
+        let a = Packed::build(&asset, true)?.streams;
+        // A valid leaf-only archive has different group membership and traversal order.
+        // An unreferenced meshlet in the archive must not enter the ray scene or the rendered cut.
+        let orphan = slots[leaf_ids[0] as usize].clone();
+        Arc::make_mut(asset.meshlets.as_mut().unwrap()).push(orphan);
+        leaf_ids.reverse();
+        let mut alternate = vec![
+            ClusterNode {
+                meshlets: vec![],
+                center: [0.; 3],
+                radius: 100.,
+                error: f32::MAX
+            };
+            7
+        ];
+        for (i, id) in leaf_ids.into_iter().enumerate() {
+            alternate[i % 7].meshlets.push(id);
+        }
+        asset.hierarchy = Some(Arc::new(alternate));
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build()?;
+        let b = pool.install(|| Packed::build(&asset, true))?.streams;
+        for (x, y) in [
+            (&a.tree, &b.tree),
+            (&a.groups, &b.groups),
+            (&a.clusters, &b.clusters),
+            (&a.indices, &b.indices),
+            (&a.vertices, &b.vertices),
+        ] {
+            assert!(
+                x == y,
+                "mixed DAG changed with old partition or worker count"
+            );
+        }
         Ok(())
     }
 

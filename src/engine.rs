@@ -16,7 +16,10 @@ use std::{
 };
 
 mod schedule;
-pub use schedule::{Edit, Schedule, SimulationData, System, SystemAccess};
+pub use schedule::{
+    Edit, Schedule, SimulationData, SimulationSystem, System, SystemAccess, SystemContext,
+    SystemOrder, TransformBindings, TransformTargets,
+};
 
 pub type FrameResult = Result<Frame, String>;
 struct Input {

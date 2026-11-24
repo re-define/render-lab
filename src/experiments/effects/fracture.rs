@@ -187,7 +187,7 @@ fn transform(shard: &Shard, mesh: &Mesh, t: f32) -> Mat4 {
     Mat4::from_rotation_translation(rotation, center) * Mat4::from_translation(-shard.pivot)
 }
 pub(super) struct Piece {
-    id: Id,
+    pub(super) id: Id,
     mesh: Arc<Mesh>,
     shard: Shard,
 }

@@ -44,6 +44,54 @@ fn dependencies_cover_fanout_and_overwrite() -> Result<()> {
     Ok(())
 }
 #[test]
+fn submitted_uploads_and_queue_local_read_visibility() -> Result<()> {
+    let mut g = Graph::new([1, 1]);
+    let r = g.input("mapped", vec![0; 16]);
+    compute(
+        &mut g,
+        "first host-backed read",
+        vec![(r, Access::ComputeRead)],
+    );
+    compute(&mut g, "overwrite", vec![(r, Access::ComputeWrite)]);
+    compute(&mut g, "local", vec![(r, Access::ComputeRead)]);
+    compute(&mut g, "local again", vec![(r, Access::ComputeRead)]);
+    let other = compute(&mut g, "other queue", vec![(r, Access::ComputeRead)]);
+    g.passes[other].queue = Queue::Graphics;
+    let plan = g.compile()?;
+    let steps = plan.steps();
+    assert!(steps[0].barriers.is_empty());
+    assert_eq!(steps[1].barriers[0].from, [Access::ComputeRead]);
+    assert_eq!(steps[2].barriers[0].from, [Access::ComputeWrite]);
+    assert!(steps[3].barriers.is_empty());
+    assert_eq!(steps[4].barriers[0].from, [Access::ComputeWrite]);
+    Ok(())
+}
+
+#[test]
+fn sampled_image_fanout_waits_for_the_layout_transition() -> Result<()> {
+    for reverse in [false, true] {
+        let mut g = Graph::new([1, 1]);
+        let image = g.resource("visibility", Storage::Color);
+        let buffer = g.input("input", vec![0; 8]);
+        g.pass("upload", Op::WritePixels { image, buffer });
+        let a = compute(&mut g, "sample A", vec![(image, Access::ComputeSample)]);
+        let b = compute(&mut g, "sample B", vec![(image, Access::ComputeSample)]);
+        g.passes[b].queue = Queue::Graphics;
+        if reverse {
+            g.passes[a].after.push(b);
+        }
+        let plan = g.compile()?;
+        let (first, second) = if reverse { (b, a) } else { (a, b) };
+        assert_eq!(plan.steps()[1].index, first);
+        let reader = &plan.steps()[2];
+        assert_eq!(reader.index, second);
+        assert!(reader.parents.contains(&first));
+        assert!(reader.barriers.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
 fn invalid_graphs_fail_before_recording() {
     let mut g = Graph::new([1, 1]);
     let r = g.resource(
@@ -206,7 +254,7 @@ impl System for Add {
     }
 }
 #[test]
-fn systems_read_stage_snapshots_and_commit_in_order() -> Result<()> {
+fn opaque_plugins_observe_prior_commits_even_in_an_explicit_stage() -> Result<()> {
     let mut w = Arc::new(World::default());
     let mut sched = Schedule::default();
     sched.stage(vec![Arc::new(Add), Arc::new(Add)]);
@@ -221,7 +269,7 @@ fn systems_read_stage_snapshots_and_commit_in_order() -> Result<()> {
             .values()
             .map(|e| e.name.as_str())
             .collect::<Vec<_>>(),
-        ["0", "0", "2"]
+        ["0", "1", "2"]
     );
     Ok(())
 }

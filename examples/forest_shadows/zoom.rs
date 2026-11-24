@@ -72,7 +72,7 @@ pub(super) fn run(
     };
     writeln!(
         csv,
-        "lap,frame,stage,forward_steps,interval_ms,gpu_ms,rhi_prepare_ms,shadow_ms,main_clusters,detailed_instances,detailed_triangles,coarse_triangles,allocations,allocated_bytes,frees,freed_bytes,device_local_bytes,peak_device_local_bytes,suballocations,suballocated_bytes,returned_ranges,returned_range_bytes,pool_blocks,local_pool_free_bytes,nonlocal_pool_free_bytes,raster_ms,voxel_raster_ms,voxel_bins_ms,voxel_clusters,visible_bricks,proxy_prepare_ms,software_bvh_ms,blas_ms,tlas_ms,as_builds,as_updates,shadow_backend,gi_trace,gi_trace_ms,gi_cache_ms,gi_probe_ms,gi_resolve_ms,gi_total_ms,as_bytes,scratch_bytes,main_blas_overlap_ms"
+        "lap,frame,stage,forward_steps,interval_ms,gpu_ms,rhi_prepare_ms,shadow_ms,main_clusters,detailed_instances,detailed_triangles,coarse_triangles,allocations,allocated_bytes,frees,freed_bytes,device_local_bytes,peak_device_local_bytes,suballocations,suballocated_bytes,returned_ranges,returned_range_bytes,pool_blocks,local_pool_free_bytes,nonlocal_pool_free_bytes,raster_ms,voxel_raster_ms,voxel_clusters,visible_bricks,proxy_prepare_ms,software_bvh_ms,blas_ms,tlas_ms,as_builds,as_updates,shadow_backend,gi_trace,gi_trace_ms,gi_cache_ms,gi_probe_ms,gi_resolve_ms,gi_total_ms,as_bytes,scratch_bytes,main_blas_overlap_ms,resource_barriers,barrier_calls,memory_barriers,image_barriers,timeline_waits,timeline_signals"
     )?;
     // This thread owns and pumps the hidden window until the engine and swapchain are dropped.
     let hwnd = unsafe {
@@ -268,20 +268,15 @@ pub(super) fn run(
             .filter(|p| p.phase == render_lab::rdg::PassPhase::Raster)
             .map(|p| p.ms)
             .sum();
-        let mut voxel_ms = 0.;
-        let mut bins_ms = 0.;
-        for pass in &frame.passes {
-            if pass.name.contains("voxel brick visibility") {
-                if pass.name.ends_with("depth bins") {
-                    bins_ms += pass.ms;
-                } else {
-                    voxel_ms += pass.ms;
-                }
-            }
-        }
+        let voxel_ms: f64 = frame
+            .passes
+            .iter()
+            .filter(|p| p.name.contains("voxel brick visibility"))
+            .map(|p| p.ms)
+            .sum();
         writeln!(
             csv,
-            "{},{},{stage},{steps},{interval:.5},{gpu:.5},{:.5},{shadow:.5},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{raster:.5},{voxel_ms:.5},{bins_ms:.5},{},{},{prepare:.5},{refit:.5},{blas:.5},{tlas:.5},{},{},{backend},{trace_kind},{gi_trace:.5},{gi_cache:.5},{gi_probe:.5},{gi_resolve:.5},{gi_total:.5},{},{},{overlap:.5}",
+            "{},{},{stage},{steps},{interval:.5},{gpu:.5},{:.5},{shadow:.5},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{raster:.5},{voxel_ms:.5},{},{},{prepare:.5},{refit:.5},{blas:.5},{tlas:.5},{},{},{backend},{trace_kind},{gi_trace:.5},{gi_cache:.5},{gi_probe:.5},{gi_resolve:.5},{gi_total:.5},{},{},{overlap:.5},{},{},{},{},{},{}",
             seen / FRAMES + 1,
             seen % FRAMES + 1,
             frame.profile.rhi_prepare_ms,
@@ -307,7 +302,13 @@ pub(super) fn run(
             frame.profile.acceleration_builds,
             frame.profile.acceleration_updates,
             memory.device_local.acceleration,
-            memory.device_local.build_scratch
+            memory.device_local.build_scratch,
+            frame.profile.resource_barriers,
+            frame.profile.barrier_calls,
+            frame.profile.memory_barriers,
+            frame.profile.image_barriers,
+            frame.profile.timeline_waits,
+            frame.profile.timeline_signals,
         )?;
         if let Some(writer) = &mut details {
             let full = path((seen + 1) % FRAMES).0 != stage;

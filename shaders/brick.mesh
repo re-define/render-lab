@@ -5,12 +5,11 @@
 #include "cluster_coverage.glsl"
 #include "brick_trace.glsl"
 layout(binding=2,std430) readonly buffer Camera { View view; };
-layout(binding=3,std430) readonly buffer Sorted { uvec4 jobs[]; };
+layout(binding=3,std430) readonly buffer Jobs { uvec4 header; uvec4 jobs[]; };
 layout(binding=4,std430) readonly buffer Palettes { mat4 jointPalette[]; };
-layout(binding=5,std430) readonly buffer Counts { uint counts[4]; };
 #include "cluster_pose.glsl"
 #include "brick_project.glsl"
-layout(push_constant) uniform Params { layout(offset=24) uint bucket; uint pageBase; } p;
+layout(push_constant) uniform Params { layout(offset=20) uint pageBase; } p;
 layout(local_size_x=32) in;
 layout(triangles,max_vertices=96,max_primitives=32) out;
 layout(location=0) perprimitiveEXT flat out vec4 gridEyeNear[];
@@ -24,13 +23,11 @@ layout(location=7) perprimitiveEXT flat out vec3 rayX[];
 layout(location=8) perprimitiveEXT flat out vec3 rayY[];
 
 void main() {
-    uint base=0u;
-    for(uint i=0u;i<p.bucket;i++) base+=counts[i];
     uint slot=p.pageBase+linearGroup();
-    bool valid=slot<counts[p.bucket];
+    bool valid=slot<header.x;
     // A nonempty indirect draw can pad its last row. Inactive groups still
     // need a valid asset until every invocation reaches SetMeshOutputsEXT.
-    uvec4 job=jobs[base+(valid?slot:0u)];
+    uvec4 job=jobs[valid?slot:0u];
     Instance obj=instances[job.x];
     Asset asset=assets[obj.routing.z];
     Cluster cluster=asset.clusters.data[job.y];
@@ -61,7 +58,7 @@ void main() {
         vec2 center=vec2(xy)+.5;
         vec3 ray=brickPixelRay(basis,xy);
         float depth; uint primitive;
-        if(!hitBrick(eyeGrid+view.settings.y*ray,ray,mask,first,cluster.span.z,rows[2],rows[3],depth,primitive)) return;
+        if(!hitBrick(eyeGrid+view.settings.y*ray,ray,mask,brick.bounds,first,cluster.span.z,rows[2],rows[3],depth,primitive)) return;
         // Exactly one sample is inside the triangle, at its measured depth.
         const vec2 offset[3]=vec2[](vec2(-.45,-.4),vec2(.45,-.4),vec2(0,.45));
         for(uint k=0u;k<3u;k++) gl_MeshVerticesEXT[v+k].gl_Position=vec4((center+offset[k])*2./pixels-1.,depth,1.);
@@ -80,7 +77,7 @@ void main() {
         gridEyeNear[t]=vec4(eyeGrid,view.settings.y);
         rayX[t]=basis[0]; rayY[t]=basis[1]; rayCenter[t]=basis[2];
         gl_PrimitiveTriangleIndicesEXT[t]=v+uvec3(0,1,2);
-        ids[t]=uvec4(obj.routing.y+1u,cluster.span.z,first,0u);
+        ids[t]=uvec4(obj.routing.y+1u,cluster.span.z,first,brick.bounds<<1u);
         masks[t]=mask; depthRow[t]=rows[2]; wRow[t]=rows[3]; fade[t]=transition;
     }
     gl_MeshPrimitivesEXT[t].gl_CullPrimitiveEXT=false;

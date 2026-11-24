@@ -76,7 +76,6 @@ fn main() {
         "cluster.mesh",
         "brick.mesh",
         "brick.frag",
-        "brick_bins.comp",
         "brick_seed.comp",
         "brick_raster.comp",
         "brick_resolve.comp",
@@ -96,13 +95,6 @@ fn main() {
         "dissolve.frag",
     ];
     let variants: &[(&str, &str, &[&str])] = &[
-        ("brick_raster_post.comp", "brick_raster.comp", &["-DPOST"]),
-        (
-            "brick_raster_post_measure.comp",
-            "brick_raster.comp",
-            &["-DPOST", "-DMEASURE"],
-        ),
-        ("hiz_voxel_depth.comp", "hiz.comp", &["-DSOURCE_VOXELS"]),
         (
             "plant_proxy_indexed.comp",
             "plant_proxy.comp",
@@ -299,26 +291,6 @@ fn main() {
         ("hiz_depth.comp", "hiz.comp", &["-DSOURCE_DEPTH"]),
         ("cluster_plant.mesh", "cluster.mesh", &["-DPLANTS"]),
         ("occlusion_bricks.comp", "occlusion.comp", &["-DBRICKS"]),
-        (
-            "occlusion_compare_bricks.comp",
-            "occlusion.comp",
-            &["-DBRICKS", "-DCOMPARE"],
-        ),
-        (
-            "occlusion_compare_bricks_post.comp",
-            "occlusion.comp",
-            &["-DBRICKS", "-DPOST", "-DCOMPARE"],
-        ),
-        (
-            "occlusion_compute_bricks.comp",
-            "occlusion.comp",
-            &["-DBRICKS", "-DSOFTWARE_ONLY"],
-        ),
-        (
-            "occlusion_compute_bricks_post.comp",
-            "occlusion.comp",
-            &["-DBRICKS", "-DPOST", "-DSOFTWARE_ONLY"],
-        ),
         (
             "occlusion_bricks_post.comp",
             "occlusion.comp",

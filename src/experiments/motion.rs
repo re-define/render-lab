@@ -11,7 +11,10 @@ pub(super) const MODULE: SceneModule = SceneModule {
     },
 };
 use crate::{
-    engine::{Edit, SimulationData, System, SystemAccess},
+    engine::{
+        SimulationData, SimulationSystem, SystemAccess, SystemContext, SystemOrder,
+        TransformBindings, TransformTargets,
+    },
     scene::*,
 };
 use anyhow::{Context, Result, ensure};
@@ -207,41 +210,50 @@ impl Matcher {
         Ok(())
     }
 }
-impl System for Matcher {
+impl SimulationSystem for Matcher {
+    fn order(&self) -> SystemOrder {
+        SystemOrder {
+            key: Some(PLAYER),
+            after: &[],
+        }
+    }
     fn access(&self) -> SystemAccess {
-        use SimulationData::{Component, LocalTransform};
+        use SimulationData::{Component, LocalTransformsById};
         SystemAccess {
             name: "Motion matcher",
             reads: &[Component(PLAYER)],
-            writes: &[Component(PLAYER), LocalTransform],
+            writes: &[Component(PLAYER), LocalTransformsById],
         }
     }
-    fn update(&self, w: &World, dt: f32) -> Result<Edit> {
-        let mut changes = vec![];
-        for &id in w.entities.component_owners(PLAYER) {
-            let raw = &w.entities[&id].components[PLAYER];
-            let mut p: Player = serde_json::from_value(raw.clone())?;
-            self.advance(&mut p, dt)?;
-            let transforms = LocalPose::prepare(
-                w,
-                p.bones.into_iter().enumerate().map(|(i, j)| {
-                    (
-                        j,
-                        Mat4::from_rotation_translation(
-                            Quat::from_rotation_x(p.angles[i]),
-                            OFFSETS[i],
-                        ),
-                    )
-                }),
-            )?;
-            changes.push((id, serde_json::to_value(p)?, transforms));
+    fn transform_targets(&self, bindings: &TransformBindings<'_>) -> Result<TransformTargets> {
+        let mut writes = Vec::new();
+        for &id in bindings.component_owners(PLAYER)? {
+            let player = bindings
+                .component::<Player>(id, PLAYER)?
+                .context("missing motion player")?;
+            writes.extend_from_slice(&player.bones);
         }
-        Ok(Box::new(move |w| {
-            for (id, state, transforms) in changes {
-                transforms.apply(w);
-                w.set_setting_if_present(id, PLAYER, state);
-            }
-        }))
+        Ok(TransformTargets {
+            reads: Vec::new(),
+            writes,
+        })
+    }
+    fn run(&self, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
+        for &id in cx.component_owners(PLAYER)? {
+            let mut p: Player = cx
+                .component::<Player>(id, PLAYER)?
+                .context("missing motion player")?
+                .into_owned();
+            self.advance(&mut p, dt)?;
+            cx.set_pose(p.bones.into_iter().enumerate().map(|(i, j)| {
+                (
+                    j,
+                    Mat4::from_rotation_translation(Quat::from_rotation_x(p.angles[i]), OFFSETS[i]),
+                )
+            }))?;
+            cx.set_component(id, PLAYER, serde_json::to_value(p)?)?;
+        }
+        Ok(())
     }
 }
 pub fn set_goal(w: &mut World, speed: f32, turn: f32) -> Result<()> {

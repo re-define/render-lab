@@ -912,6 +912,7 @@ impl Backend {
         {
             self.surface = Some(present::Surface::new(&self.gpu, hwnd)?);
         }
+        queues::remove_semaphore_covered_reads(&mut plan.commands, self.gpu.queues.len());
         let reuse = transient::Reuse::plan(&mut plan, self.gpu.queues.len());
         let (resident_upload_bytes, dynamic_upload_bytes, scene_table_upload_bytes) =
             self.prepare_with_budget(&plan, index, &reuse)?;

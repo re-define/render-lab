@@ -239,6 +239,8 @@ pub struct World {
     pub entities: Entities,
     #[serde(skip)]
     runtime: components::RuntimeComponents,
+    #[serde(skip)]
+    pub(crate) simulation_resources: BTreeMap<&'static str, Arc<dyn std::any::Any + Send + Sync>>,
 }
 impl Default for World {
     fn default() -> Self {
@@ -246,6 +248,7 @@ impl Default for World {
             version: 1,
             entities: Entities::default(),
             runtime: Default::default(),
+            simulation_resources: Default::default(),
         }
     }
 }

@@ -43,3 +43,36 @@ Remove-Item Env:RENDER_LAB_GPU_QUEUES
 ~~~
 
 在运行中的实验控制台输入 `restir rays status` 查看能力与当前选择，输入 `timeline frame.json` 导出最近完成帧。在 Perfetto 中打开 JSON，选择对应的 GPU 队列及 pass，可以查阅前驱、同步对象的值和资源屏障。缺少跨队列公共时间基准的设备保留各 pass 耗时，导出跨队列图时会说明限制。[Perfetto 的外部跟踪格式](https://perfetto.dev/docs/getting-started/other-formats)
+
+## RDG 屏障与跨队列交接
+
+RTX 5070，Release，1920×1080，MAILBOX，两个在途帧。岩柱森林启用计算体素光栅、硬件阴影、两跳 GI 和 TAA，使用同一条推近拉远路径。每一对策略按 A、B、B、A 的顺序各跑两圈。每圈 420 帧，剔除 48 帧预热，每组对照的每种配置有 744 个有效帧。性能回放直接呈现，截图单独回读。各次回放的主视图簇数、可见体素砖数和光追代理三角数逐帧一致。
+
+| 配对与配置 | 每帧资源屏障 / Vulkan 屏障调用 P50 | 提交 / 时间线等待 P50 | 主视图与 BLAS 重叠 P50（ms） | 整帧 GPU P50 / P95（ms） |
+| --- | ---: | ---: | ---: | ---: |
+| 原版与默认对照 · 原版 | 387 / 113 | 8 / 9 | 0.00 | 22.62 / 25.86 |
+| 原版与默认对照 · 新版 compact | 210 / 100 | 8 / 9 | 0.00 | 22.87 / 26.11 |
+| 新版策略对照 · compact | 210 / 100 | 8 / 9 | 0.00 | 22.76 / 25.78 |
+| 新版策略对照 · release | 210 / 100 | 10 / 9 | 2.22 | 23.96 / 26.43 |
+
+原版与新默认值的直接对照中，整帧 GPU 中位数增加 0.25 ms，P95 增加 0.26 ms。每圈单独统计时两者的耗时区间有重叠。这次减少了屏障数量，森林的整帧性能未见稳定提升。
+
+在新版策略对照中，提前交接让计算队列在主视图剔除后发出信号，图形队列可以在 BLAS 构建期间画主视图。在 TAA 完成后也可先交接呈现，其历史写入继续在计算队列运行。两种策略都能消除提交已覆盖的主机上传同步，以及直接跨队列读取缓冲时的重复屏障。实际图像屏障保持每帧中位数 27 个。
+
+同一新版二进制中，提前交接的 702 / 744 帧出现主视图与 BLAS 重叠。BLAS 计时中位数由 1.25 增至 3.63 ms，光栅 pass 耗时之和的中位数由 3.31 增至 3.94 ms。两项工作并发时各自用时更久，具体共享硬件单元的瓶颈还需要硬件计数器定位。引擎默认使用紧凑合批。
+
+固定机位另取 960×540 截图，预热 12 帧。在 0–255 的 RGB 色阶上，原版与新版 compact 的每通道平均绝对差为 0.0055，原版重复截图的平均差为 0.0050。原版与新版 compact 有 46 个像素的最大通道差超过 3 级，同一版本重复截图为 36 个。
+
+
+从引擎根目录可以分别复跑两种策略。当前版本的窗口 CSV 用 `voxel_raster_ms` 记录末尾体素阶段。历史测量仍保留当时的分桶列。
+
+~~~powershell
+$env:RENDER_LAB_GPU_QUEUES = "3"
+foreach ($policy in @("compact", "release")) {
+    $env:RENDER_LAB_GPU_BATCHING = $policy
+    cargo run --release --example forest_shadows -- "target/forest-rdg-$policy" zoom 1 --size 1920x1080 --raster compute --rays hardware --gi multi
+}
+Remove-Item Env:RENDER_LAB_GPU_BATCHING, Env:RENDER_LAB_GPU_QUEUES
+~~~
+
+压缩包包含三组配对的逐帧 CSV、每圈第 120 和第 400 帧的时间线，以及截图差异统计。第一组用于原版与提前交接的初测，第二组在同一二进制中切换策略，第三组直接比较原版与新默认值。[原始数据和时间线](../captures/forest-karst/rdg-sync-queues.zip) · [同步契约](render-pipeline.md)

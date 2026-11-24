@@ -110,6 +110,7 @@ impl SceneConfiguration {
         for m in active {
             (m.install)(world, &mut a)?;
         }
+        a.schedule.bind_transforms(world)?;
         let (technique, camera) = match a.technique {
             Some(technique) => (
                 technique,

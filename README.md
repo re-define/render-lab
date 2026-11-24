@@ -39,3 +39,5 @@ cargo run --release --locked -- --scene assets/scenes/cornell-box/cornell_box_co
 | 可见性、材质、时域历史如何连接，队列如何等待和退役 | [渲染管线](docs/render-pipeline.md) |
 | 一条射线如何从几何到达 BLAS、TLAS、SBT 和命中着色 | [光追 RHI 审查](docs/ray-tracing-rhi.md) |
 | 原始算法对照、运行控制与历史测量 | [实验手册](docs/experiment-guide.md) · [开发和测试规范](CONTRIBUTING.md) |
+
+[文档索引](docs/README.md)按运行入口、模块契约和专题测量组织全部资料。

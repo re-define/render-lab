@@ -91,7 +91,6 @@ impl Storage {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
-    Upload,
     Vertex,
     Mesh,
     MeshFragment,
@@ -124,8 +123,7 @@ impl Access {
     pub fn writes(self) -> bool {
         matches!(
             self,
-            Self::Upload
-                | Self::ComputeWrite
+            Self::ComputeWrite
                 | Self::ComputeReadWrite
                 | Self::SdkImageWrite
                 | Self::ColorClear
@@ -141,8 +139,7 @@ impl Access {
     fn reads(self) -> bool {
         !matches!(
             self,
-            Self::Upload
-                | Self::ComputeWrite
+            Self::ComputeWrite
                 | Self::SdkImageWrite
                 | Self::ColorClear
                 | Self::DepthClear
@@ -472,6 +469,49 @@ pub struct Barrier {
     pub from: Vec<Access>,
     pub to: Access,
 }
+#[derive(Default)]
+struct AccessHistory {
+    // None denotes a producer from an earlier frame or a persistent allocation.
+    uses: Vec<(Access, Option<Queue>)>,
+}
+
+impl AccessHistory {
+    fn dependency(
+        &mut self,
+        resource: Resource,
+        access: Access,
+        queue: Queue,
+        image: bool,
+    ) -> Option<Barrier> {
+        let current = (access, Some(queue));
+        let seen = self.uses.contains(&current);
+        let transition = image && self.uses.last().map(|u| u.0) != Some(access);
+        let hazard = !self.uses.is_empty()
+            && (access.writes() || !seen && self.uses.iter().any(|(a, _)| a.writes()));
+        let barrier = (transition || hazard).then(|| {
+            let mut from = Vec::new();
+            for &(prior, _) in &self.uses {
+                // A new buffer reader needs visibility of writes, independently on each queue.
+                if (image || access.writes() || prior.writes()) && !from.contains(&prior) {
+                    from.push(prior);
+                }
+            }
+            Barrier {
+                resource,
+                from,
+                to: access,
+            }
+        });
+        if access.writes() || image {
+            self.uses.clear();
+        }
+        if self.uses.is_empty() || !seen {
+            self.uses.push(current);
+        }
+        barrier
+    }
+}
+
 pub struct Step {
     pub index: usize,
     pub parents: Vec<usize>,
@@ -760,7 +800,8 @@ impl Graph {
         }
         let pass_uses: Vec<_> = self.passes.iter().map(|pass| self.uses(&pass.op)).collect();
         let mut tlas_sources = std::collections::BTreeMap::new();
-        let mut last_image = vec![None; self.resources.len()];
+        let mut image_read_epoch: Vec<Option<(Access, Vec<usize>)>> =
+            vec![None; self.resources.len()];
         let mut image_usage = vec![ImageUsage::default(); self.resources.len()];
         for (i, p) in self.passes.iter().enumerate() {
             self.validate_pass(p, &defined, &mut tlas_sources)?;
@@ -789,11 +830,16 @@ impl Graph {
                     image_usage[r.0].copy_destination |=
                         matches!(a, Access::CopyDst | Access::SdkImageWrite);
                     image_usage[r.0].storage |= a == Access::SdkImageWrite;
-                    if last_image[r.0]
-                        .replace(a)
-                        .is_some_and(|previous| previous != a)
-                    {
-                        deps[i].extend(readers[r.0].iter().copied());
+                    let epoch = &mut image_read_epoch[r.0];
+                    if a.writes() {
+                        *epoch = None;
+                    } else {
+                        // Every reader in this layout must follow the preceding incompatible
+                        // readers. An explicit edge may reorder readers within the same layout.
+                        if epoch.as_ref().is_none_or(|(usage, _)| *usage != a) {
+                            *epoch = Some((a, readers[r.0].iter().copied().collect()));
+                        }
+                        deps[i].extend(&epoch.as_ref().unwrap().1);
                     }
                 }
                 if (!a.writes() || readers[r.0].is_empty())
@@ -814,30 +860,21 @@ impl Graph {
                 deps[i].insert(j);
             }
         }
-        let mut history = self
-            .resources
-            .iter()
-            .map(|(_, s)| {
-                if matches!(
-                    s,
-                    Storage::Buffer {
-                        initial: Some(_),
-                        ..
-                    }
-                ) {
-                    vec![Access::Upload]
-                } else {
-                    vec![]
-                }
-            })
-            .collect::<Vec<_>>();
+        // Host writes to mapped inputs are flushed before queue submission. Submission
+        // makes these writes visible to the device. GPU-persistent resources have separate provenance.
+        let mut history: Vec<AccessHistory> = (0..self.resources.len())
+            .map(|_| AccessHistory::default())
+            .collect();
         for r in self.histories.keys() {
-            history[r.0] = vec![Access::Upload, Access::CopyDst, Access::ComputeWrite];
+            history[r.0].uses = vec![(Access::CopyDst, None), (Access::ComputeWrite, None)];
         }
         // Each version table belongs to its retired frame-slot CLAS allocation.
         for (versions, cache) in &self.cluster_caches {
-            history[versions.0] = vec![Access::Upload, Access::ComputeWrite];
-            history[cache.output.0] = vec![Access::AccelerationWrite, Access::RayAcceleration];
+            history[versions.0].uses = vec![(Access::ComputeWrite, None)];
+            history[cache.output.0].uses = vec![
+                (Access::AccelerationWrite, None),
+                (Access::RayAcceleration, None),
+            ];
         }
         let mut dependents = vec![Vec::new(); deps.len()];
         let mut remaining = Vec::with_capacity(deps.len());
@@ -852,6 +889,7 @@ impl Graph {
             }
         }
         let mut steps = Vec::with_capacity(deps.len());
+        let mut layout_owner: Vec<Option<(Access, usize)>> = vec![None; self.resources.len()];
         let mut previous_queue = None;
         while !ready.is_empty() {
             let i = ready
@@ -863,23 +901,21 @@ impl Graph {
             previous_queue = Some(self.passes[i].queue);
             let mut barriers = Vec::new();
             for &(r, a) in &pass_uses[i] {
-                let prev = &mut history[r.0];
                 let image = self.image_desc(r).is_some();
-                // Preserve the writer for fan-out to readers at different stages.
-                let hazard = !prev.is_empty()
-                    && (a.writes() || !prev.contains(&a) && prev.iter().any(|p| p.writes()));
-                if hazard || image && prev.last() != Some(&a) {
-                    barriers.push(Barrier {
-                        resource: r,
-                        from: prev.clone(),
-                        to: a,
-                    });
+                if image {
+                    match layout_owner[r.0] {
+                        Some((access, owner)) if access == a && !a.writes() => {
+                            // The first scheduled reader performed the transition. Consumers
+                            // on another queue also need that edge even for read-only fanout.
+                            if self.passes[owner].queue != self.passes[i].queue {
+                                deps[i].insert(owner);
+                            }
+                        }
+                        _ => layout_owner[r.0] = Some((a, i)),
+                    }
                 }
-                if a.writes() || image {
-                    prev.clear();
-                }
-                if !prev.contains(&a) {
-                    prev.push(a);
+                if let Some(barrier) = history[r.0].dependency(r, a, self.passes[i].queue, image) {
+                    barriers.push(barrier);
                 }
             }
             for &child in &dependents[i] {

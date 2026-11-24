@@ -1,22 +1,25 @@
 // Pixel-center intersection shared by software raster, mesh, and fragment shaders.
 int minAxis(vec3 v) { return v.x<=v.y && v.x<=v.z ? 0 : (v.y<=v.z?1:2); }
-bool hitBrick(vec3 origin,vec3 rayDirection,uvec4 masks,uint firstCell,uint page,vec4 depthRow,vec4 wRow,
+bool hitBrick(vec3 origin,vec3 rayDirection,uvec4 masks,uint bounds,uint firstCell,uint page,vec4 depthRow,vec4 wRow,
               out float depth,out uint primitive) {
     vec3 dir=normalize(rayDirection);
+    // Clip the ray to the occupied cells, including for single-cell bricks.
+    ivec3 lo=ivec3(brickGrid(bounds)), hi=ivec3(brickGrid(bounds>>6u))+1;
     vec3 inv;
     for(int a=0;a<3;a++) {
-        if(abs(dir[a])<1e-12 && (origin[a]<0. || origin[a]>=4.)) return false;
+        if(abs(dir[a])<1e-12 && (origin[a]<float(lo[a]) || origin[a]>=float(hi[a]))) return false;
         inv[a]=(dir[a]<0.?-1.:1.)/max(abs(dir[a]),1e-12);
     }
-    vec3 first=(-origin)*inv, last=(vec3(4)-origin)*inv;
+    vec3 first=(vec3(lo)-origin)*inv, last=(vec3(hi)-origin)*inv;
     vec3 enter=min(first,last), leave=max(first,last);
+    for(int a=0;a<3;a++) if(abs(dir[a])<1e-12) { enter[a]=-1e30; leave[a]=1e30; }
     int axis=minAxis(-enter);
     float t=enter[axis], end=min(leave.x,min(leave.y,leave.z));
     if(end<=max(t,0.)) return false;
     bool hasEntry=t>=0.;
     t=max(t,0.);
     ivec3 stepDir=ivec3(sign(dir));
-    ivec3 cell=ivec3(clamp(floor(origin+dir*t+vec3(stepDir)*0.00001),vec3(0),vec3(3)));
+    ivec3 cell=ivec3(clamp(floor(origin+dir*t+vec3(stepDir)*0.00001),vec3(lo),vec3(hi-1)));
     vec3 next=(vec3(cell)+vec3(greaterThan(stepDir,ivec3(0)))-origin)*inv;
     for(int a=0;a<3;a++) if(abs(dir[a])<1e-12) next[a]=1e30;
     uint tag=0u;
@@ -38,7 +41,7 @@ bool hitBrick(vec3 origin,vec3 rayDirection,uvec4 masks,uint firstCell,uint page
         }
         if(exitT>=end) break;
         cell[exitAxis]+=stepDir[exitAxis];
-        if(cell[exitAxis]<0 || cell[exitAxis]>=4) break;
+        if(cell[exitAxis]<lo[exitAxis] || cell[exitAxis]>=hi[exitAxis]) break;
         next[exitAxis]+=abs(inv[exitAxis]);
         axis=exitAxis; t=exitT; hasEntry=true;
     }

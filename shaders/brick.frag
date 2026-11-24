@@ -29,9 +29,9 @@ void main() {
 #endif
     float depth=gl_FragCoord.z;
     uint primitive=ids.y;
-    if(ids.w==0u) {
+    if((ids.w&1u)==0u) {
         vec3 ray=brickPixelRay(mat3(rayX,rayY,rayCenter),uvec2(gl_FragCoord.xy));
-        if(!hitBrick(gridEyeNear.xyz+gridEyeNear.w*ray,ray,masks,ids.z,ids.y,depthRow,wRow,depth,primitive)) discard;
+        if(!hitBrick(gridEyeNear.xyz+gridEyeNear.w*ray,ray,masks,ids.w>>1u,ids.z,ids.y,depthRow,wRow,depth,primitive)) discard;
     }
 #ifdef COVERAGE_PROBE
     gl_FragDepth=0.;

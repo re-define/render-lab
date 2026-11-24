@@ -22,7 +22,10 @@ pub(in crate::experiments) mod river;
 mod tests;
 mod water;
 use crate::{
-    engine::{Edit, Engine, Schedule, SimulationData, System, SystemAccess},
+    engine::{
+        Engine, Schedule, SimulationData, SimulationSystem, SystemAccess, SystemContext,
+        SystemOrder, TransformBindings, TransformTargets,
+    },
     rdg::Shader,
     render::{
         self, Atlas, Camera, Forward, Geometry, MaterialPrograms, MotionSource, Snapshot,
@@ -132,37 +135,56 @@ pub fn destruction() -> Result<World> {
 struct Playback {
     pieces: Vec<fracture::Piece>,
 }
-impl System for Playback {
+impl SimulationSystem for Playback {
+    fn order(&self) -> SystemOrder {
+        SystemOrder {
+            key: Some(SETTING),
+            after: &[],
+        }
+    }
     fn access(&self) -> SystemAccess {
-        use SimulationData::{Component, LocalTransform};
+        use SimulationData::{Component, LocalTransformsById};
         SystemAccess {
             name: "Effect playback",
-            reads: &[Component(SETTING)],
+            reads: if self.pieces.is_empty() {
+                &[Component(SETTING)]
+            } else {
+                &[Component(SETTING), LocalTransformsById]
+            },
             writes: if self.pieces.is_empty() {
                 &[Component(SETTING)]
             } else {
-                &[Component(SETTING), LocalTransform]
+                &[Component(SETTING), LocalTransformsById]
             },
         }
     }
-    fn update(&self, world: &World, dt: f32) -> Result<Edit> {
+    fn transform_targets(&self, _: &TransformBindings<'_>) -> Result<TransformTargets> {
+        let joints: Vec<_> = self.pieces.iter().map(|piece| piece.id).collect();
+        Ok(TransformTargets {
+            reads: joints.clone(),
+            writes: joints,
+        })
+    }
+    fn run(&self, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
         if dt == 0. {
-            return Ok(Box::new(|_| {}));
+            return Ok(());
         }
-        let (id, mut s) = settings(world)?;
+        let (id, raw) = cx
+            .first_raw_component(SETTING)?
+            .context("open water or destruction first")?;
+        let mut s = Settings::read(raw)?;
         s.time += f64::from(dt);
-        let poses = LocalPose::prepare(
-            world,
-            self.pieces
-                .iter()
-                .map(|piece| piece.pose(s.time))
-                .filter(|(id, _)| world.entities.contains_key(id)),
-        )?;
-        let value = serde_json::to_value(s)?;
-        Ok(Box::new(move |world| {
-            world.set_setting_if_present(id, SETTING, value);
-            poses.apply(world);
-        }))
+        if !self.pieces.is_empty() {
+            let mut transforms = Vec::with_capacity(self.pieces.len());
+            for piece in &self.pieces {
+                let (joint, local) = piece.pose(s.time);
+                if cx.local(joint)?.is_some() {
+                    transforms.push((joint, local));
+                }
+            }
+            cx.set_pose(transforms)?;
+        }
+        cx.set_component(id, SETTING, serde_json::to_value(s)?)
     }
 }
 pub fn command(engine: &mut Engine, args: &str) -> Result<String> {

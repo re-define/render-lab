@@ -29,7 +29,7 @@ mod karst;
 mod landscape;
 mod river_forest;
 use crate::{
-    engine::{Edit, Engine, SimulationData, System, SystemAccess},
+    engine::{Engine, SimulationData, SimulationSystem, SystemAccess, SystemContext, SystemOrder},
     experiments::clusters,
     rdg::{Access, Dispatch, Op, Resource, Shader},
     render::{Camera, MaterialPrograms, Snapshot},
@@ -59,6 +59,7 @@ pub(super) enum Mode {
 pub(super) enum BrickRaster {
     #[default]
     Auto,
+    #[serde(alias = "linear")]
     Compute,
     Mesh,
     Compare,
@@ -121,7 +122,13 @@ fn read(world: &World) -> Result<(Id, Settings)> {
 }
 
 pub(super) struct Wind;
-impl System for Wind {
+impl SimulationSystem for Wind {
+    fn order(&self) -> SystemOrder {
+        SystemOrder {
+            key: Some(SETTING),
+            after: &[],
+        }
+    }
     fn access(&self) -> SystemAccess {
         SystemAccess {
             name: "Vegetation wind",
@@ -129,16 +136,16 @@ impl System for Wind {
             writes: &[SimulationData::Component(SETTING)],
         }
     }
-    fn update(&self, world: &World, dt: f32) -> Result<Edit> {
+    fn run(&self, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
         if dt == 0. {
-            return Ok(Box::new(|_| {}));
+            return Ok(());
         }
-        let (id, mut settings) = read(world)?;
+        let (id, raw) = cx
+            .first_raw_component(SETTING)?
+            .context("open the vegetation experiment first")?;
+        let mut settings = Settings::decode(raw)?;
         settings.time = (settings.time + dt).rem_euclid(4096.);
-        let value = serde_json::to_value(settings)?;
-        Ok(Box::new(move |world| {
-            world.set_setting_if_present(id, SETTING, value);
-        }))
+        cx.set_component(id, SETTING, serde_json::to_value(settings)?)
     }
 }
 
@@ -347,7 +354,7 @@ pub fn command(engine: &mut Engine, args: &str) -> Result<String> {
         ["raster", mode] => {
             s.raster = match *mode {
                 "auto" => BrickRaster::Auto,
-                "compute" => BrickRaster::Compute,
+                "compute" | "linear" => BrickRaster::Compute,
                 "mesh" => BrickRaster::Mesh,
                 "compare" => BrickRaster::Compare,
                 _ => bail!("vegetation raster auto/compute/mesh/compare"),
@@ -378,7 +385,7 @@ pub fn command(engine: &mut Engine, args: &str) -> Result<String> {
             return Ok(format!("vegetation {args}"));
         }
         _ => bail!(
-            "vegetation auto/triangles/voxels · raster auto/compute/mesh/compare · shadows mega/adaptive/coarse · cache on/off · pixels P · wind 0..2 · time S · view paths/beauty · camera overview/near/far/forest/river/basin/grass/glade/karst/karst-grove"
+            "vegetation auto/triangles/voxels · raster auto/compute/linear/mesh/compare · shadows mega/adaptive/coarse · cache on/off · pixels P · wind 0..2 · time S · view paths/beauty · camera overview/near/far/forest/river/basin/grass/glade/karst/karst-grove"
         ),
     }
     let value = serde_json::to_value(s)?;
@@ -856,18 +863,23 @@ mod tests {
         assert!(auto.counters[PROGRAM] > 1000);
         assert!(auto.counters["Plant clusters in transition"] > 0);
         assert!(auto.counters["Visible voxel bricks"] >= auto.counters["Voxel plant clusters"]);
-        assert!(auto.passes.iter().any(|p| p.name
-            == if atomic64 {
-                "Main voxel brick visibility trace"
-            } else {
-                "Main voxel brick visibility"
-            }));
-        assert!(auto.passes.iter().any(|p| p.name
-            == if atomic64 {
-                "Post voxel brick visibility trace"
-            } else {
-                "Post voxel brick visibility"
-            }));
+        let pass_index = |name: &str| auto.passes.iter().position(|p| p.name == name).unwrap();
+        let final_raster = if atomic64 {
+            "Final voxel brick visibility trace"
+        } else {
+            "Final voxel brick visibility"
+        };
+        assert!(pass_index("Main mesh visibility") < pass_index("Current Hi-Z mip 1"));
+        assert!(pass_index("Current Hi-Z mip 1") < pass_index("Post Hi-Z retest"));
+        assert!(pass_index("Post Hi-Z retest") < pass_index("Post mesh visibility"));
+        assert!(pass_index("Post mesh visibility") < pass_index(final_raster));
+        assert!(pass_index(final_raster) < pass_index("History Hi-Z mip 1"));
+        assert!(!auto.passes.iter().any(|p| p.name.ends_with("depth bins")));
+        assert!(
+            auto.passes[..pass_index("Post mesh visibility")]
+                .iter()
+                .all(|p| !p.name.contains("voxel brick visibility"))
+        );
 
         settings.wind = 0.;
         render(settings)?;
@@ -915,6 +927,22 @@ mod tests {
         }
         let voxels = render(settings)?;
         if atomic64 {
+            settings.raster = BrickRaster::Mesh;
+            let mesh = render(settings)?;
+            assert_eq!(
+                mesh.counters["Visible voxel bricks"],
+                voxels.counters["Visible voxel bricks"]
+            );
+            let differences = voxels
+                .pixels
+                .chunks_exact(4)
+                .zip(mesh.pixels.chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .count();
+            assert!(
+                differences * 1000 < voxels.pixels.len() / 4,
+                "final compute and mesh images differed at {differences} pixels"
+            );
             let c = &voxels.counters;
             assert_eq!(
                 c["Brick candidate pixels"],

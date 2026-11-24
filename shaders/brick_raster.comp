@@ -8,21 +8,18 @@
 #include "brick_trace.glsl"
 layout(local_size_x=32) in;
 layout(binding=2,std430) readonly buffer Camera { View view; };
-layout(binding=3,std430) readonly buffer Jobs { uvec4 head; uvec4 jobs[]; };
+layout(binding=3,std430) readonly buffer Jobs { uvec4 header; uvec4 jobs[]; };
 layout(binding=4,std430) readonly buffer Palettes { mat4 jointPalette[]; };
 layout(binding=5,std430) readonly buffer Ranges { uvec4 ranges[]; };
 layout(binding=6,std430) buffer Winners { uint64_t winners[]; };
-#ifdef POST
-#extension GL_EXT_samplerless_texture_functions : require
-layout(binding=7) uniform texture2D recoveredDepth;
-#define METRIC_SLOT 8
-#else
-#define METRIC_SLOT 7
-#endif
 #ifdef MEASURE
-layout(binding=METRIC_SLOT,std430) buffer Metrics { uint stats[]; };
+layout(binding=7,std430) buffer Metrics { uint stats[]; };
 shared uvec3 laneMetrics[64];
+#define PUSH_OFFSET 32
+#else
+#define PUSH_OFFSET 28
 #endif
+layout(push_constant) uniform Params { layout(offset=PUSH_OFFSET) uint pageBase; } p;
 #include "cluster_pose.glsl"
 #include "brick_project.glsl"
 
@@ -32,19 +29,19 @@ struct ProjectedBrick {
     vec3 eye;
     vec4 depthRow,wRow;
     float nearest;
-    uint first;
+    uint first,bounds;
 };
 shared ProjectedBrick bricks[8];
 shared uint ends[8];
 
 void main() {
-    uint slot=linearGroup(), lane=gl_LocalInvocationID.x;
-    if(slot>=head.x) return;
+    uint slot=p.pageBase+linearGroup(), lane=gl_LocalInvocationID.x;
+    if(slot>=header.x) return;
     uvec4 job=jobs[slot];
     Instance obj=instances[job.x];
     Asset asset=assets[obj.routing.z];
     Cluster cluster=asset.clusters.data[job.y];
-    uint start=job.z>>2u, count=min(8u,(cluster.meta.w>>1u)-start);
+    uint start=job.z, count=min(8u,(cluster.meta.w>>1u)-start);
     if(lane<8u) {
         uint pixels=0u;
         if(lane<count) {
@@ -55,7 +52,7 @@ void main() {
             mat4 rows=transpose(clip);
             bricks[lane]=ProjectedBrick(rect,uvec4(brick.occupancy,uvec2(asset.vertices)),
                 brickRayBasis(toLocal,brick.originSize.w),eye,rows[2],rows[3],nearest,
-                cellAddress(words,cluster.span.x,brick.first));
+                cellAddress(words,cluster.span.x,brick.first),brick.bounds);
             pixels=rect.z*rect.w;
         }
         ends[lane]=pixels;
@@ -90,9 +87,6 @@ void main() {
         uint pixel=xy.x+view.screen.x*xy.y;
         uint64_t seen=atomicLoad(winners[pixel],gl_ScopeDevice,gl_StorageSemanticsNone,gl_SemanticsRelaxed);
         uint closest=~uint(seen>>32u);
-#ifdef POST
-        closest=min(closest,floatBitsToUint(texelFetch(recoveredDepth,ivec2(xy),0).x));
-#endif
         if(floatBitsToUint(bricks[b].nearest)>closest) {
 #ifdef MEASURE
             rejected++;
@@ -104,7 +98,7 @@ void main() {
 #endif
         vec3 ray=brickPixelRay(bricks[b].rayBasis,xy);
         float depth; uint primitive;
-        if(!hitBrick(bricks[b].eye+view.settings.y*ray,ray,bricks[b].mask,bricks[b].first,
+        if(!hitBrick(bricks[b].eye+view.settings.y*ray,ray,bricks[b].mask,bricks[b].bounds,bricks[b].first,
                      cluster.span.z,bricks[b].depthRow,bricks[b].wRow,depth,primitive)) continue;
 #ifdef MEASURE
         hits++;
@@ -126,9 +120,7 @@ void main() {
         uint total=0u;
         for(uint i=0u;i<32u;i++) total+=laneMetrics[(lane/3u)*32u+i][lane%3u];
         if(total!=0u) atomicAdd(stats[lane],total);
-#ifdef POST
-        if(total!=0u && (lane==0u || lane==3u)) atomicAdd(stats[13u+lane/3u],total);
-#endif
+        if(job.w!=0u && total!=0u && (lane==0u || lane==3u)) atomicAdd(stats[13u+lane/3u],total);
     }
 #endif
 }

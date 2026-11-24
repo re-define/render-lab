@@ -3,9 +3,10 @@ use glam::{Mat4, Vec3};
 use rayon::ThreadPoolBuilder;
 use render_lab::{
     engine::{
-        Edit, Schedule,
-        SimulationData::{Component, LocalTransform},
-        System, SystemAccess,
+        Edit, Schedule, SimulationData,
+        SimulationData::{Component, LocalTransform, LocalTransformsById},
+        SimulationSystem, System, SystemAccess, SystemContext, SystemOrder, TransformBindings,
+        TransformTargets,
     },
     experiments::motion,
     render::{Camera, SceneExtractor},
@@ -20,12 +21,12 @@ use std::{
 };
 
 struct Declared(SystemAccess);
-impl System for Declared {
+impl SimulationSystem for Declared {
     fn access(&self) -> SystemAccess {
         self.0
     }
-    fn update(&self, _: &World, _: f32) -> Result<Edit> {
-        Ok(Box::new(|_| {}))
+    fn run(&self, _: &mut SystemContext, _: f32) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -70,7 +71,8 @@ fn automatic_groups_keep_registration_order_and_explain_boundaries() {
             vec!["advance", "pose"],
             vec!["consume", "observe"],
             vec!["reset"],
-            vec!["one", "two"],
+            vec!["one"],
+            vec!["two"],
             vec!["pose"]
         ]
     );
@@ -102,7 +104,7 @@ struct Nudge {
     id: Id,
     delta: f32,
 }
-impl System for Nudge {
+impl SimulationSystem for Nudge {
     fn access(&self) -> SystemAccess {
         SystemAccess {
             name: "Nudge",
@@ -110,11 +112,9 @@ impl System for Nudge {
             writes: &[LocalTransform],
         }
     }
-    fn update(&self, world: &World, dt: f32) -> Result<Edit> {
-        let local =
-            world.entities[&self.id].local * Mat4::from_translation(Vec3::X * self.delta * dt);
-        let pose = LocalPose::prepare(world, [(self.id, local)])?;
-        Ok(Box::new(move |world| pose.apply(world)))
+    fn run(&self, cx: &mut SystemContext, dt: f32) -> Result<()> {
+        let local = cx.local(self.id)?.unwrap() * Mat4::from_translation(Vec3::X * self.delta * dt);
+        cx.set_pose([(self.id, local)])
     }
 }
 
@@ -146,8 +146,8 @@ fn fixed_animation_replays_with_the_same_world_and_extraction_across_workers_and
         }
         let stats = snapshot(&world)?.scene.stats;
         let steps = stage.stages().next().unwrap().1;
-        // Both writers see each substep's original pose. The second registered writer commits last.
-        assert!((world.entities[&id].local.w_axis.x - 3.).abs() < 1e-5);
+        // The second writer observes the first writer's committed pose in every substep.
+        assert!((world.entities[&id].local.w_axis.x - 5.).abs() < 1e-5);
         assert_eq!(steps, 60);
         assert!(stats.transforms_updated > 1 && stats.palettes_updated > 0);
         assert!(stats.entities_visited < world.entities.len());
@@ -227,5 +227,588 @@ fn failed_substep_retries_the_uncommitted_remainder() -> Result<()> {
     stage.tick(&mut world, 0., &pool)?;
     assert_eq!(stage.stages().next().unwrap().1, 3);
     assert_eq!(world.entities[&id].local.w_axis.x, 0.375);
+    Ok(())
+}
+type Job = dyn Fn(&mut SystemContext<'_>, f32) -> Result<()> + Send + Sync;
+type Selector = dyn Fn(&TransformBindings<'_>) -> Result<TransformTargets> + Send + Sync;
+struct Task {
+    targets: Box<Selector>,
+    access: SystemAccess,
+    order: SystemOrder,
+    job: Box<Job>,
+}
+impl SimulationSystem for Task {
+    fn transform_targets(&self, bindings: &TransformBindings<'_>) -> Result<TransformTargets> {
+        (self.targets)(bindings)
+    }
+    fn access(&self) -> SystemAccess {
+        self.access
+    }
+    fn order(&self) -> SystemOrder {
+        self.order
+    }
+    fn run(&self, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
+        (self.job)(cx, dt)
+    }
+}
+fn task(
+    key: &'static str,
+    after: &'static [&'static str],
+    reads: &'static [SimulationData],
+    writes: &'static [SimulationData],
+    job: impl Fn(&mut SystemContext<'_>, f32) -> Result<()> + Send + Sync + 'static,
+) -> Arc<dyn System> {
+    scoped_task(
+        key,
+        after,
+        reads,
+        writes,
+        |_| Ok(TransformTargets::default()),
+        job,
+    )
+}
+
+fn scoped_task(
+    key: &'static str,
+    after: &'static [&'static str],
+    reads: &'static [SimulationData],
+    writes: &'static [SimulationData],
+    targets: impl Fn(&TransformBindings<'_>) -> Result<TransformTargets> + Send + Sync + 'static,
+    job: impl Fn(&mut SystemContext<'_>, f32) -> Result<()> + Send + Sync + 'static,
+) -> Arc<dyn System> {
+    Arc::new(Task {
+        targets: Box::new(targets),
+        access: SystemAccess {
+            name: key,
+            reads,
+            writes,
+        },
+        order: SystemOrder {
+            key: Some(key),
+            after,
+        },
+        job: Box::new(job),
+    })
+}
+
+#[test]
+fn reverse_registration_orders_physics_before_animation_in_each_substep() -> Result<()> {
+    use SimulationData::Resource;
+    for workers in [1, 4] {
+        let pool = ThreadPoolBuilder::new().num_threads(workers).build()?;
+        let mut w = World::default();
+        let id = w.spawn(Default::default());
+        let mut w = Arc::new(w);
+        let mut s = Schedule::default();
+        let physics = task(
+            "physics",
+            &[],
+            &[Resource("position")],
+            &[Resource("position")],
+            |cx, dt| {
+                cx.set_resource(
+                    "position",
+                    cx.resource::<f32>("position")?.copied().unwrap_or_default() + dt,
+                )
+            },
+        );
+        let anim = task(
+            "animation",
+            &["physics"],
+            &[Resource("position")],
+            &[LocalTransform],
+            move |cx, _| {
+                let x = *cx.resource::<f32>("position")?.unwrap();
+                cx.set_pose([(id, Mat4::from_translation(Vec3::X * x))])
+            },
+        );
+        s.fixed_stage(Duration::from_millis(125), 4, vec![anim, physics])?;
+        s.tick(&mut w, 0.375, &pool)?;
+        assert_eq!(w.entities[&id].local.w_axis.x, 0.375);
+        assert!(s.describe().contains("after physics"));
+    }
+    Ok(())
+}
+
+#[test]
+fn independent_systems_on_different_branches_actually_overlap() -> Result<()> {
+    use std::sync::{Condvar, Mutex};
+    let both = Arc::new((Mutex::new(0), Condvar::new()));
+    let rendezvous = || {
+        let both = both.clone();
+        move |cx: &mut SystemContext<'_>, _: f32| {
+            assert!(cx.resource::<u32>("weather")?.is_none());
+            let mut count = both.0.lock().unwrap();
+            *count += 1;
+            both.1.notify_all();
+            let (count, _) = both
+                .1
+                .wait_timeout_while(count, Duration::from_secs(3), |v| *v < 2)
+                .unwrap();
+            anyhow::ensure!(*count == 2, "independent systems did not run concurrently");
+            Ok(())
+        }
+    };
+    let mut s = Schedule::default();
+    s.add_system(task(
+        "first",
+        &[],
+        &[SimulationData::Resource("weather")],
+        &[Component("a")],
+        rendezvous(),
+    ));
+    s.add_system(task("dependent", &["first"], &[], &[], |_, _| Ok(())));
+    s.add_system(task(
+        "last",
+        &[],
+        &[SimulationData::Resource("weather")],
+        &[Component("b")],
+        rendezvous(),
+    ));
+    let groups = s
+        .stages()
+        .map(|(g, _)| g.iter().map(|s| s.name).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(groups, [vec!["first", "last"], vec!["dependent"]]);
+    s.tick(
+        &mut Arc::new(World::default()),
+        0.,
+        &ThreadPoolBuilder::new().num_threads(2).build()?,
+    )
+}
+
+#[test]
+fn invalid_dependencies_are_rejected_before_any_world_update() -> Result<()> {
+    let pool = ThreadPoolBuilder::new().num_threads(2).build()?;
+    let mut w = Arc::new(World::default());
+    let mut s = Schedule::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    s.stage(vec![task("start", &[], &[], &[], move |_, _| {
+        count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })]);
+    s.add_system(task("consumer", &["producer"], &[], &[], |_, _| Ok(())));
+    assert!(
+        s.tick(&mut w, 0., &pool)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    s.add_system(task("producer", &[], &[], &[], |_, _| Ok(())));
+    s.validate()?;
+    s.add_system(task("producer", &[], &[], &[], |_, _| Ok(())));
+    assert!(s.validate().unwrap_err().to_string().contains("duplicate"));
+    let mut s = Schedule::default();
+    s.add_system(task("a", &["b"], &[], &[], |_, _| Ok(())));
+    s.add_system(task("b", &["a"], &[], &[], |_, _| Ok(())));
+    assert!(s.validate().unwrap_err().to_string().contains("cycle"));
+    let mut s = Schedule::default();
+    s.stage(vec![task("a", &["b"], &[], &[], |_, _| Ok(()))]);
+    s.fixed_stage(
+        Duration::from_secs(1),
+        1,
+        vec![task("b", &[], &[], &[], |_, _| Ok(()))],
+    )?;
+    assert!(
+        s.validate()
+            .unwrap_err()
+            .to_string()
+            .contains("later clock/stage")
+    );
+    Ok(())
+}
+
+#[test]
+fn undeclared_access_discards_staged_edits_and_rolls_back_prior_batches() -> Result<()> {
+    use SimulationData::Resource;
+    for read_violation in [false, true] {
+        let mut w = World::default();
+        let id = w.spawn(Default::default());
+        w.entities
+            .get_mut(&id)
+            .unwrap()
+            .components
+            .insert("state".into(), serde_json::json!(7));
+        let mut w = Arc::new(w);
+        let pool = ThreadPoolBuilder::new().num_threads(2).build()?;
+        let mut s = Schedule::default();
+        s.stage(vec![task(
+            "seed",
+            &[],
+            &[],
+            &[Component("state"), Resource("clock")],
+            move |cx, _| {
+                cx.set_typed_component(id, "state", 17u32)?;
+                cx.set_resource("clock", 12u32)
+            },
+        )]);
+        s.tick(&mut w, 0., &pool)?;
+        let mut s = Schedule::default();
+        s.add_system(task(
+            "modify",
+            &[],
+            &[],
+            &[
+                LocalTransform,
+                Component("state"),
+                Component("new"),
+                Resource("clock"),
+            ],
+            move |cx, _| {
+                cx.set_pose([(id, Mat4::from_translation(Vec3::Z))])?;
+                cx.set_component(id, "state", serde_json::json!(99))?;
+                cx.set_component(id, "new", serde_json::Value::Null)?;
+                cx.set_resource("clock", 99u32)
+            },
+        ));
+        s.add_system(task(
+            "invalid",
+            &["modify"],
+            &[],
+            &[Component("new")],
+            move |cx, _| {
+                cx.set_component(id, "new", serde_json::json!(123))?;
+                if read_violation {
+                    cx.world()?;
+                } else {
+                    cx.set_resource("clock", 0u32)?;
+                }
+                Ok(())
+            },
+        ));
+        let err = s.tick(&mut w, 0., &pool).unwrap_err().to_string();
+        assert!(
+            err.contains(if read_violation {
+                "undeclared read"
+            } else {
+                "undeclared write"
+            }),
+            "{err}"
+        );
+        let mut verify = Schedule::default();
+        verify.add_system(task(
+            "check",
+            &[],
+            &[
+                LocalTransform,
+                Component("state"),
+                Component("new"),
+                Resource("clock"),
+            ],
+            &[],
+            move |cx, _| {
+                assert_eq!(cx.local(id)?, Some(Mat4::IDENTITY));
+                assert_eq!(*cx.component::<u32>(id, "state")?.unwrap(), 17);
+                assert!(cx.component_owners("new")?.is_empty());
+                assert_eq!(cx.resource::<u32>("clock")?, Some(&12));
+                Ok(())
+            },
+        ));
+        verify.tick(&mut w, 0., &pool)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn opaque_plugin_cannot_waive_exclusion_with_an_incomplete_access_list() -> Result<()> {
+    struct Opaque;
+    impl System for Opaque {
+        fn access(&self) -> SystemAccess {
+            SystemAccess {
+                name: "legacy",
+                reads: &[],
+                writes: &[],
+            }
+        }
+        fn update(&self, _: &World, _: f32) -> Result<Edit> {
+            Ok(Box::new(|_| {}))
+        }
+    }
+    let mut s = Schedule::default();
+    s.add_system(task("before", &[], &[], &[], |_, _| Ok(())));
+    s.add_system(Arc::new(Opaque));
+    s.add_system(task("after", &[], &[], &[], |_, _| Ok(())));
+    let stages = s.stages().map(|(a, _)| a.to_vec()).collect::<Vec<_>>();
+    assert_eq!(stages.len(), 3);
+    assert_eq!(stages[1][0].writes, [SimulationData::World]);
+    Ok(())
+}
+
+#[test]
+fn conflicting_resource_types_are_reported_before_the_tick_commits() -> Result<()> {
+    use SimulationData::Resource;
+    let mut s = Schedule::default();
+    s.add_system(task("seed", &[], &[], &[Resource("dt")], |cx, _| {
+        cx.set_resource("dt", 1u32)
+    }));
+    s.add_system(task("bad", &[], &[], &[Resource("dt")], |cx, _| {
+        cx.set_resource("dt", "incorrect")
+    }));
+    let pool = ThreadPoolBuilder::new().num_threads(2).build()?;
+    let mut w = Arc::new(World::default());
+    assert!(
+        s.tick(&mut w, 0., &pool)
+            .unwrap_err()
+            .to_string()
+            .contains("type mismatch")
+    );
+    let mut inspect = Schedule::default();
+    inspect.add_system(task("verify", &[], &[Resource("dt")], &[], |cx, _| {
+        assert!(cx.resource::<u32>("dt")?.is_none());
+        Ok(())
+    }));
+    inspect.tick(&mut w, 0., &pool)
+}
+
+#[test]
+fn disjoint_pose_writers_run_concurrently_on_two_workers() -> Result<()> {
+    use std::sync::{Condvar, Mutex};
+    let mut world = World::default();
+    let a = world.spawn(Default::default());
+    let b = world.spawn(Default::default());
+    let rendezvous = Arc::new((Mutex::new(0), Condvar::new()));
+    let mut schedule = Schedule::default();
+    for (key, id) in [("bones", a), ("shards", b)] {
+        let gate = rendezvous.clone();
+        schedule.add_system(scoped_task(
+            key,
+            &[],
+            &[],
+            &[LocalTransformsById],
+            move |_| {
+                Ok(TransformTargets {
+                    reads: vec![],
+                    writes: vec![id, id],
+                })
+            },
+            move |cx, _| {
+                let mut count = gate.0.lock().unwrap();
+                *count += 1;
+                gate.1.notify_all();
+                let (count, _) = gate
+                    .1
+                    .wait_timeout_while(count, Duration::from_secs(3), |v| *v < 2)
+                    .unwrap();
+                anyhow::ensure!(*count == 2, "second pose writer never started");
+                cx.set_pose([(id, Mat4::from_translation(Vec3::X))])
+            },
+        ));
+    }
+    let mut world = Arc::new(world);
+    schedule.tick(
+        &mut world,
+        0.,
+        &ThreadPoolBuilder::new().num_threads(2).build()?,
+    )?;
+    assert_eq!(schedule.stages().count(), 1);
+    for id in [a, b] {
+        assert_eq!(world.entities[&id].local.w_axis.x, 1.);
+    }
+    Ok(())
+}
+
+#[test]
+fn scoped_conflicts_use_read_and_write_sets_separately() -> Result<()> {
+    let world = World::default();
+    // Include unordered duplicates to verify normalization before intersection.
+    for (read_a, write_a, read_b, write_b, expected) in [
+        (vec![4], vec![9], vec![4], vec![7], None),
+        (
+            vec![],
+            vec![9, 4, 9],
+            vec![7, 4],
+            vec![],
+            Some("write/read"),
+        ),
+        (vec![4], vec![9], vec![], vec![4], Some("read/write")),
+        (vec![], vec![4], vec![], vec![4], Some("write/write")),
+    ] {
+        let mut schedule = Schedule::default();
+        for (name, reads, writes) in [("a", read_a, write_a), ("b", read_b, write_b)] {
+            schedule.add_system(scoped_task(
+                name,
+                &[],
+                &[LocalTransformsById],
+                &[LocalTransformsById],
+                move |_| {
+                    Ok(TransformTargets {
+                        reads: reads.clone(),
+                        writes: writes.clone(),
+                    })
+                },
+                |_, _| Ok(()),
+            ));
+        }
+        schedule.bind_transforms(&world)?;
+        assert_eq!(
+            schedule.stages().count(),
+            1 + usize::from(expected.is_some())
+        );
+        if let Some(hazard) = expected {
+            assert!(
+                schedule
+                    .describe()
+                    .contains(&format!("{hazard} LocalTransform entity 4"))
+            );
+        }
+    }
+    for (ids, after, count) in [
+        (vec![], &[][..], 1),
+        (vec![5], &[][..], 2),
+        (vec![], &["all"][..], 2),
+    ] {
+        let mut schedule = Schedule::default();
+        schedule.add_system(task("all", &[], &[], &[LocalTransform], |_, _| Ok(())));
+        schedule.add_system(scoped_task(
+            "bounded",
+            after,
+            &[LocalTransformsById],
+            &[],
+            move |_| {
+                Ok(TransformTargets {
+                    reads: ids.clone(),
+                    writes: vec![],
+                })
+            },
+            |_, _| Ok(()),
+        ));
+        schedule.bind_transforms(&world)?;
+        assert_eq!(schedule.stages().count(), count);
+    }
+    Ok(())
+}
+
+#[test]
+fn changing_bindings_are_resolved_after_commit_inside_each_fixed_substep() -> Result<()> {
+    const KEY: &str = "active joint";
+    let mut world = World::default();
+    let a = world.spawn(Default::default());
+    let b = world.spawn(Default::default());
+    let mut world = Arc::new(world);
+    let mut schedule = Schedule::default();
+    let choose = task(
+        "switch",
+        &[],
+        &[Component(KEY)],
+        &[Component(KEY)],
+        move |cx, _| {
+            let next = if cx.component::<Id>(a, KEY)?.is_some_and(|id| *id == b) {
+                a
+            } else {
+                b
+            };
+            cx.set_typed_component(a, KEY, next)
+        },
+    );
+    let actor = scoped_task(
+        "actor",
+        &[],
+        &[Component(KEY), LocalTransformsById],
+        &[LocalTransformsById],
+        move |cx| {
+            let id = *cx.component::<Id>(a, KEY)?.unwrap();
+            Ok(TransformTargets {
+                reads: vec![id],
+                writes: vec![id],
+            })
+        },
+        move |cx, _| {
+            let id = *cx.component::<Id>(a, KEY)?.unwrap();
+            cx.set_pose([(id, cx.local(id)?.unwrap() * Mat4::from_translation(Vec3::X))])
+        },
+    );
+    let shard = scoped_task(
+        "shard",
+        &[],
+        &[LocalTransformsById],
+        &[LocalTransformsById],
+        move |_| {
+            Ok(TransformTargets {
+                reads: vec![b],
+                writes: vec![b],
+            })
+        },
+        move |cx, _| {
+            let x = cx.local(b)?.unwrap().w_axis.x;
+            cx.set_pose([(b, Mat4::from_translation(Vec3::X * (10. * x)))])
+        },
+    );
+    // First substep binds B (actor → shard); second binds A (actor and shard can overlap).
+    schedule.fixed_stage(Duration::from_millis(125), 2, vec![choose, actor, shard])?;
+    schedule.bind_transforms(&world)?;
+    assert!(schedule.describe().contains("pending binding"));
+    schedule.tick(
+        &mut world,
+        0.25,
+        &ThreadPoolBuilder::new().num_threads(2).build()?,
+    )?;
+    assert_eq!(world.entities[&a].local.w_axis.x, 1.);
+    assert_eq!(world.entities[&b].local.w_axis.x, 100.);
+    assert_eq!(
+        schedule
+            .stages()
+            .map(|(g, n)| (g.len(), n))
+            .collect::<Vec<_>>(),
+        [(1, 2), (2, 2)]
+    );
+    Ok(())
+}
+
+#[test]
+fn pose_scope_errors_rollback_the_substep() -> Result<()> {
+    let pool = ThreadPoolBuilder::new().num_threads(2).build()?;
+    for violation in ["read", "write", "selector"] {
+        let mut world = World::default();
+        let a = world.spawn(Default::default());
+        let b = world.spawn(Default::default());
+        let mut schedule = Schedule::default();
+        let seed = task("seed", &[], &[], &[Component("binding")], move |cx, _| {
+            cx.set_component(a, "binding", b.into())
+        });
+        let invalid = scoped_task(
+            "invalid",
+            &[],
+            &[Component("binding"), LocalTransformsById],
+            &[LocalTransformsById],
+            move |bindings| {
+                if violation == "selector" {
+                    bindings.component_owners("undeclared selector input")?;
+                }
+                Ok(TransformTargets {
+                    reads: vec![a],
+                    writes: vec![a],
+                })
+            },
+            move |cx, _| {
+                if violation == "read" {
+                    cx.local(b)?;
+                }
+                cx.set_pose([
+                    (a, Mat4::from_translation(Vec3::X)),
+                    (b, Mat4::from_translation(Vec3::Y)),
+                ])
+            },
+        );
+        schedule.fixed_stage(Duration::from_millis(125), 1, vec![seed, invalid])?;
+        let mut world = Arc::new(world);
+        let err = schedule
+            .tick(&mut world, 0.125, &pool)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("undeclared"), "{err}");
+        if violation != "selector" {
+            assert!(
+                err.contains(&format!("{violation} of LocalTransform entity {b}")),
+                "{err}"
+            );
+        }
+        assert!(world.first_raw_component("binding").is_none());
+        for id in [a, b] {
+            assert_eq!(world.entities[&id].local, Mat4::IDENTITY);
+        }
+        assert!(schedule.stages().all(|(_, n)| n == 0));
+    }
     Ok(())
 }

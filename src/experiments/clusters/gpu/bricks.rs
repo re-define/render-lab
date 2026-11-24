@@ -1,6 +1,5 @@
 use super::*;
 
-const BUCKETS: u32 = 4;
 const METRICS: &[&str] = &[
     "Brick candidate pixels",
     "Brick LOD rejects",
@@ -31,10 +30,9 @@ fn local(g: &mut FrameGraph, name: &str, bytes: usize) -> Resource {
     r
 }
 
-/// One atomic visibility layer spans the main and recovered lists. Current
-/// Hi-Z reads it directly; final visibility and depth are exported once.
+/// Seed once from complete opaque triangle depth, then resolve the combined brick list.
 pub(super) struct SoftwareRaster {
-    pub winners: Resource,
+    winners: Resource,
     ranges: Resource,
     metrics: Option<Resource>,
 }
@@ -49,7 +47,7 @@ impl SoftwareRaster {
         );
         g.pass_in(
             PassPhase::Raster,
-            "Main voxel brick visibility seed",
+            "Final voxel brick visibility seed",
             Op::Compute {
                 program: compute(
                     spirv!("brick_seed.comp"),
@@ -67,55 +65,39 @@ impl SoftwareRaster {
         }
     }
 
-    pub fn trace(
-        &self,
-        g: &mut FrameGraph,
-        scene: &ClusterScene,
-        bins: &BrickBins,
-        post_depth: Option<Resource>,
-        name: &str,
-    ) {
+    pub fn trace(&self, g: &mut FrameGraph, scene: &ClusterScene, jobs: &BrickJobs) {
         let palette = scene.palette.expect("brick assets carry a plant skeleton");
         let mut bindings = vec![
             (scene.assets, R),
             (scene.instances, R),
             (scene.view, R),
-            (bins.jobs.items, R),
+            (jobs.items, R),
             (palette, R),
             (self.ranges, R),
             (self.winners, RW),
         ];
-        if let Some(depth) = post_depth {
-            bindings.push((depth, Access::ComputeSample));
-        }
         if let Some(metrics) = self.metrics {
             bindings.push((metrics, RW));
         }
-        let shader: &'static [u8] = match (post_depth.is_some(), self.metrics.is_some()) {
-            (false, false) => spirv!("brick_raster.comp"),
-            (true, false) => spirv!("brick_raster_post.comp"),
-            (false, true) => spirv!("brick_raster_measure.comp"),
-            (true, true) => spirv!("brick_raster_post_measure.comp"),
+        let shader: &'static [u8] = if self.metrics.is_some() {
+            spirv!("brick_raster_measure.comp")
+        } else {
+            spirv!("brick_raster.comp")
         };
-        g.pass_in(
-            PassPhase::Raster,
-            name,
-            Op::ComputeIndirect {
-                program: compute(shader, &bindings, vec![]),
-                args: bins.jobs.args,
-                offset: 16,
-            },
-        );
+        for (push, offset) in jobs.dispatches() {
+            g.pass_in(
+                PassPhase::Raster,
+                "Final voxel brick visibility trace",
+                Op::ComputeIndirect {
+                    program: compute(shader, &bindings, push),
+                    args: jobs.args,
+                    offset,
+                },
+            );
+        }
     }
 
-    pub fn finish(
-        &self,
-        g: &mut FrameGraph,
-        t: &Targets,
-        scene: &ClusterScene,
-        main: &BrickBins,
-        post: &BrickBins,
-    ) {
+    pub fn finish(&self, g: &mut FrameGraph, t: &Targets, scene: &ClusterScene, jobs: &BrickJobs) {
         let [w, h] = g.extent;
         let pixels = w as usize * h as usize;
         let grid = [w.div_ceil(8), h.div_ceil(8), 1];
@@ -143,8 +125,7 @@ impl SoftwareRaster {
             },
         );
         if let Some(metrics) = self.metrics {
-            // Both rasterizers see the same two append lists and the same final
-            // opaque triangles. Reference draws are exclusive to comparisons.
+            // Replay the identical combined list against the same opaque triangles.
             let before = local(g, "Pre-brick visibility IDs", pixels * 8);
             g.pass(
                 "Save opaque IDs for raster comparison",
@@ -153,8 +134,7 @@ impl SoftwareRaster {
                     buffer: before,
                 },
             );
-            main.draw_mesh(g, t, scene, "Main voxel brick visibility");
-            post.draw_mesh(g, t, scene, "Post voxel brick visibility");
+            jobs.draw_mesh(g, t, scene);
             g.pass_in(
                 PassPhase::Counters,
                 "Compare same-list voxel IDs and depth",
@@ -196,99 +176,64 @@ impl SoftwareRaster {
     }
 }
 
-pub(super) struct BrickBins {
-    jobs: Work,
-    pub counts: Option<Resource>,
-    capacity: u32,
+pub(super) struct BrickJobs {
+    items: Resource,
+    args: Resource,
+    pages: u32,
 }
 
-impl BrickBins {
-    pub(super) fn new(g: &mut FrameGraph, name: &str, capacity: u32, mesh: bool) -> Option<Self> {
+impl BrickJobs {
+    pub(super) fn new(g: &mut FrameGraph, capacity: u32) -> Option<Self> {
         if capacity == 0 {
             return None;
         }
-        let items = g.append_list(name, 16 * capacity as usize);
-        let args = arguments(g, &format!("{name} dispatch"), 2);
-        let counts = mesh.then(|| {
-            let r = g.input(&format!("{name} counts"), vec![0; BUCKETS as usize * 4]);
-            g.prefer_local_buffer(r);
-            r
-        });
+        let items = g.append_list("Visible voxel brick jobs", 16 * capacity as usize);
         g.prefer_local_buffer(items);
-        Some(Self {
-            jobs: Work { items, args },
-            counts,
-            capacity,
+        let pages = capacity.div_ceil(DRAW_PAGE_SIZE);
+        let args = arguments(g, "Voxel brick indirect arguments", pages);
+        Some(Self { items, args, pages })
+    }
+
+    pub(super) fn outputs(&self) -> [(Resource, Access); 2] {
+        [(self.items, RW), (self.args, RW)]
+    }
+
+    fn dispatches(&self) -> impl Iterator<Item = (Vec<u8>, u64)> {
+        (0..self.pages).map(|page| {
+            (
+                bytemuck::bytes_of(&(page * DRAW_PAGE_SIZE)).to_vec(),
+                16 * u64::from(page),
+            )
         })
     }
 
-    pub(super) fn outputs(&self) -> impl Iterator<Item = (Resource, Access)> {
-        [self.jobs.items, self.jobs.args]
-            .into_iter()
-            .chain(self.counts)
-            .map(|r| (r, RW))
-    }
-
-    pub(super) fn draw_mesh(
-        &self,
-        g: &mut FrameGraph,
-        t: &Targets,
-        scene: &ClusterScene,
-        name: &str,
-    ) {
-        let counts = self.counts.expect("mesh raster needs depth bins");
-        let pages = self.capacity.div_ceil(DRAW_PAGE_SIZE);
-        let args = arguments(g, &format!("{name} indirect draws"), pages * BUCKETS);
-        let sorted = g.resource(
-            &format!("{name} sorted jobs"),
-            Storage::Buffer {
-                bytes: 16 * self.capacity as usize,
-                initial: None,
-            },
-        );
-        g.prefer_local_buffer(sorted);
-        g.pass_in(
-            PassPhase::Culling,
-            &format!("{name} depth bins"),
-            Op::ComputeIndirect {
-                program: compute(
-                    spirv!("brick_bins.comp"),
-                    &[(self.jobs.items, R), (counts, R), (sorted, W), (args, RW)],
-                    bytemuck::bytes_of(&[pages, DRAW_PAGE_SIZE]).to_vec(),
-                ),
-                args: self.jobs.args,
-                offset: 0,
-            },
-        );
+    pub(super) fn draw_mesh(&self, g: &mut FrameGraph, t: &Targets, scene: &ClusterScene) {
         let palette = scene.palette.expect("brick assets carry a plant skeleton");
-        for bucket in 0..BUCKETS {
-            for page in 0..pages {
-                g.pass_in(
-                    PassPhase::Raster,
-                    name,
-                    Op::Draw {
-                        program: Dispatch {
-                            shader: Shader::Mesh(spirv!("brick.mesh"), spirv!("brick.frag")),
-                            bindings: vec![
-                                (scene.assets, Access::MeshFragment),
-                                (scene.instances, M),
-                                (scene.view, M),
-                                (sorted, M),
-                                (palette, M),
-                                (counts, M),
-                            ],
-                            push: bytemuck::bytes_of(&[bucket, page * DRAW_PAGE_SIZE]).to_vec(),
-                        },
-                        color: t.visibility,
-                        depth: t.depth,
-                        clear: false,
-                        count: DrawCount::MeshIndirect {
-                            args,
-                            offset: 16 * u64::from(bucket * pages + page),
-                        },
+        for (push, offset) in self.dispatches() {
+            g.pass_in(
+                PassPhase::Raster,
+                "Final voxel brick visibility",
+                Op::Draw {
+                    program: Dispatch {
+                        shader: Shader::Mesh(spirv!("brick.mesh"), spirv!("brick.frag")),
+                        bindings: vec![
+                            (scene.assets, Access::MeshFragment),
+                            (scene.instances, M),
+                            (scene.view, M),
+                            (self.items, M),
+                            (palette, M),
+                        ],
+                        push,
                     },
-                );
-            }
+                    color: t.visibility,
+                    depth: t.depth,
+                    clear: false,
+                    count: DrawCount::MeshIndirect {
+                        args: self.args,
+                        offset,
+                    },
+                },
+            );
         }
     }
 }

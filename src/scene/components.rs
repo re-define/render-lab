@@ -19,12 +19,43 @@ impl<T: Serialize + Send + Sync + 'static> Stored for T {
 #[derive(Clone, Default)]
 pub(super) struct RuntimeComponents(BTreeMap<(Id, &'static str), Arc<dyn Stored>>);
 impl RuntimeComponents {
+    pub(super) fn remove_component(&mut self, id: Id, key: &'static str) {
+        self.0.remove(&(id, key));
+    }
     pub(super) fn remove_entity(&mut self, entity: Id) {
         self.0.retain(|(id, _), _| *id != entity);
     }
 }
 
 impl World {
+    pub(crate) fn restore_component_on_rollback(
+        &self,
+        id: Id,
+        key: &'static str,
+    ) -> impl FnOnce(&mut Self) + Send + use<> {
+        let previous = self.entities[&id].components.get(key).cloned();
+        let typed = self.runtime.0.get(&(id, key)).cloned();
+        move |world| {
+            let row = world
+                .entities
+                .get_mut(&id)
+                .expect("component rollback entity");
+            match previous {
+                Some(value) => {
+                    row.components.insert(key.into(), value);
+                }
+                None => {
+                    row.components.remove(key);
+                }
+            }
+            match typed {
+                Some(value) => {
+                    world.runtime.0.insert((id, key), value);
+                }
+                None => world.runtime.remove_component(id, key),
+            }
+        }
+    }
     /// First entity (in stable ID order) carrying this serialized extension key.
     /// Typed runtime components may store a JSON null marker here.
     pub fn first_raw_component(&self, key: &str) -> Option<(Id, &Value)> {

@@ -1,5 +1,7 @@
 # 程序化植被实验方案
 
+本文保留历次资产和光栅实验的数据。当前版本的混合子簇构建、末尾光栅、轮廓与性能对照见 [Nanite 体素专题](nanite-voxel-pipeline.md)。
+
 ## 虚幻引擎参考
 
 Epic 的 Procedural Vegetation Editor 先生成树冠和枝条的骨架，再沿骨架生成树干、分发叶片和导出渲染数据。Nanite Assemblies 利用重复枝叶零件减小几何体积，零件的变换可以绑定主骨架。植被骨骼风动有独立的屏幕尺寸阈值。 [Epic Procedural Vegetation Editor](https://dev.epicgames.com/documentation/unreal-engine/procedural-vegetation-editor-in-unreal-engine?application_version=5.9) · [Epic Nanite Assemblies](https://dev.epicgames.com/documentation/unreal-engine/nanite-assemblies)
@@ -16,7 +18,7 @@ Fortnite 的树冠也曾随距离变稀，严重时会突然变光秃。叶片�
 
 云杉的针叶小枝从下垂主枝两侧长出，树梢保留直立嫩枝。松树从更高的树干位置抽枝，针束朝外上方生长。桦树的短枝下垂，尖叶交替着生，白色树皮有横纹。橡树保留粗壮分叉，末端小枝长出具有起伏边缘的阔叶。细节通过不透明三角几何生成，运行时共享四种整树原型。枝条分发和几何化的细叶参考了 Epic 的植被制作流程。 [树形和分叉](../src/experiments/vegetation/generate/tree.rs) · [叶片和针束](../src/experiments/vegetation/generate/tree/shoots.rs) · [Epic Nanite Foliage](https://dev.epicgames.com/documentation/en-us/unreal-engine/nanite-foliage)
 
-每个原型生成时，把叶片面积累积到一个 16³ 网格，从五个上半球方向估算天空可见度，插值回叶顶点。网格随后释放。三角简化保留顶点属性，体素粗级按采样面积汇总同一属性。风动时着色沿用静息姿态的树冠遮蔽。体素简化的最小误差取单元空间对角线的一半，较大的孤立块需要更远才有资格进入屏幕误差预算。 [树冠遮蔽](../src/experiments/vegetation/generate/exposure.rs) · [材质](../shaders/vegetation_material.comp)
+每个原型生成时，把叶片面积累积到一个 16³ 网格，从五个上半球方向估算天空可见度，插值回叶顶点。网格随后释放。三角简化保留顶点属性，体素粗级从一条真实命中射线插值同一属性。风动时着色沿用静息姿态的树冠遮蔽。体素简化的最小误差取单元格宽，较大的孤立块需要更远才有资格进入屏幕误差预算。 [树冠遮蔽](../src/experiments/vegetation/generate/exposure.rs) · [材质](../shaders/vegetation_material.comp)
 
 对照固定相机、树木位置、光源和时间，关闭风动与后处理，使用默认的自动 LOD。录像单独开启风与 TAA。 [近景](../captures/trees-compare-near.png) · [总览](../captures/trees-compare-overview.png) · [远景](../captures/trees-compare-far.png) · [风动录像](../captures/trees-wind-taa.mp4)
 
@@ -48,27 +50,29 @@ cargo run --release --locked -- --experiment vegetation-scale --benchmark 40
 
 ## 混合 DAG
 
-三角简化粗级保留已有的面积补偿。构建原型时，沿 DAG 从细到粗收集每组的参考几何，分别将它、粗三角候选和体素候选投影到三个正交方向的 40×40 掩码。漏掉的叶片和填上的空隙各计一次误差。粗三角同时计入原简化位置误差。体素候选尝试七种格宽、三种密度阈值和两档单元预算，误差至少为半个单元对角线。候选排序还会惩罚沿投影方向堆叠的砖。只有综合分数更低且细组有唯一父组时，才采用整个替换。写入 DAG 的是几何误差，运行时按它选择 LOD。[体素构建器](../src/experiments/clusters/bvh/voxels.rs)
+混合路径以存档的叶层 meshlet 为输入，每层重新对实际生成的簇分组。少量簇可以混合归约，大层分别处理连接的三角簇和空间相近的体素兄弟。直接子簇里的三角提供相交格，已选体素子簇提供占用格及构建辅助格，二者汇入同一张父网格。原始叶层三角决定短射线的命中材质、UV、骨骼和法线。全三角组比较两种表示的误差，含体素的组按格数与父簇容量继续聚合，接受首个合格格长。同层独立组并行，三角简化锁定共享边界顶点，下一层可跨旧存档的分组边界。[逐层分组](../src/experiments/clusters/bvh/voxels/grouping.rs) [输入与属性采样](../src/experiments/clusters/bvh/voxels/children.rs) · [误差与预算](../src/experiments/clusters/bvh/voxels.rs)
 
 胜出的体素簇沿用被替换三角簇的细组链接。每个原型只有一套组表、簇表和 BVH。构建过程修正误差和误差球的单调性，保证父节点的屏幕误差界可用于提前剔除。GPU 先做实例视锥测试，再遍历 BVH。每个簇用所属组和细组的投影误差判断是否落入当前 LOD 切面。在过渡带，粗细簇按实例和屏幕像素生成互补掩码，两次 Hi-Z 剔除与可见性 ID 会处理同一张簇表。`Plant clusters in transition` 统计处于过渡的候选簇。[DAG 与 BVH 打包](../src/experiments/clusters/bvh.rs)
 
-每个体素簇最多容纳 128 块 4×4×4 的稀疏砖。当前构建预算还限制每次替换最多保留 128 个采样单元，实际砖数取决于它们在空间和骨骼上的分布。网格位于原型的静息模型空间，每块砖只跟随一根骨骼。同骨骼相邻格的内部面在构建时去掉。32 字节砖头存原点、格宽、64 位占据掩码、有效包围盒、属性起点及骨骼。每个有暴露面的单元另存 24 字节，包括平均 UV、最多三个带权法线方向及可见性命中映射。方向来自细三角插值法线，按主轴分组，以投影面积加权。着色时用像素、实例和单元的稳定散列从中取样，再按命中面选择双面叶片的半球。同一相机和姿态下，随机数不会随帧变化。[砖块编码](../src/experiments/clusters/bvh/voxels.rs) · [砖块解码](../shaders/plant_geometry.glsl) · [表面重建](../shaders/surface.glsl)
+每个体素簇最多容纳 128 块 4×4×4 的稀疏砖。直接子簇的实际三角数与砖数决定父簇数预算。砖原点可以移到剩余占用格的最小坐标，较大的组按砖位置拆成多个兄弟父簇，共用 LOD 误差。每簇按实际外露面检查命中页容量。网格位于原型的静息模型空间，每块砖只跟随一根骨骼。同骨骼相邻格的内部面在构建时去掉。32 字节砖头存原点、格宽、64 位占据掩码、有效包围盒、属性起点及骨骼。每个有暴露面的单元另存 24 字节，包括代表性射线命中的 UV、最多三个带权法线方向及可见性命中映射。方向来自细三角插值法线，按主轴分组，按独立命中射线累计权重。着色时用像素、实例和单元的稳定散列从中取样，再按命中面选择双面叶片的半球。同一相机和姿态下，随机数不会随帧变化。[砖块编码](../src/experiments/clusters/bvh/voxels.rs) · [砖块解码](../shaders/plant_geometry.glsl) · [表面重建](../shaders/surface.glsl)
 
 ## 体素计算光栅
 
 `vegetation raster auto` 在设备支持 64 位缓冲原子且场景的体素命中可编码时选择计算路径。每个原型登记一条连续的实例与体素页范围，32 位句柄即可还原着色对象及物理三角号，零留给硬件三角。超出范围或缺少设备能力时自动采用 mesh 路径。`vegetation raster compute` 和 `vegetation raster mesh` 用于独立计时。普通网格和三角簇仍使用 mesh shader。[后端选择与范围](../src/experiments/clusters/gpu.rs) · [Vulkan 设备能力](https://docs.vulkan.org/refpages/latest/refpages/source/VkPhysicalDeviceShaderAtomicInt64Features.html)
 
-1. 主绘制先栅格化三角，再从其 D32 深度初始化每像素 8 字节的竞争缓冲。每个计算工作组读同一实例和逻辑簇的最多八块砖，按当前骨骼变换投影，裁剪近面和屏幕边界。矩形面积的前缀和把像素任务分给全组 32 个线程。实际参与的分组数由 GPU 间接调度，计算路径使用一份砖任务列表。[砖工作分配](../shaders/brick_raster.comp)
+1. 主轮和补绘轮追加同一份砖列表，先绘制全部不透明三角，再用三角深度初始化每像素 8 字节的竞争缓冲。每组最多处理八块砖，32 个线程共享投影矩形的像素工作，按间接调度容量分页。[砖工作分配](../shaders/brick_raster.comp)
 2. 每个候选像素先检查 LOD 互补掩码，再比较砖的保守最近深度和该像素已经记录的最近深度。通过的像素沿像素中心射线在 4³ 网格中执行 DDA。命中外露面后将反序深度位及命中句柄作为一个 64 位值执行 `atomicMax`。相同浮点深度用句柄裁决，两项随同一次原子写入生效。[公共射线](../shaders/brick_project.glsl) · [DDA 和表面 ID](../shaders/brick_trace.glsl)
-3. 当帧 Hi-Z 直接取竞争缓冲的深度。第二轮先补绘三角，随后体素计算同时检查三角深度和已记录的体素命中。最后按最近深度解码每像素唯一结果，经 GPU 复制一次写回可见性与 D32 附件。窗口继续直接呈现。每个帧槽的三个光栅中间缓冲合计每像素 20 字节，1920×1080 对应 39.55 MiB，另有按原型计的范围表。[结果合并](../shaders/brick_resolve.comp) · [RDG 注册](../src/experiments/clusters/gpu/bricks.rs)
+3. 当帧用于复测的中间 Hi-Z 只取主轮三角和普通网格深度。末尾一次体素阶段结束后统一解析命中，把深度和 ID 写回附件，再为下一帧生成完整 Hi-Z。每帧槽三个光栅中间缓冲合计每像素 20 字节，1080p 为 39.55 MiB。[结果合并](../shaders/brick_resolve.comp) · [RDG 注册](../src/experiments/clusters/gpu/bricks.rs)
 
-`vegetation raster compare` 在同一帧保存三角背景，把同一份主绘制和补绘砖列表交给两条后端，比较最终像素的覆盖、完整 ID 和深度。参考 mesh 路径有四个深度桶，小于等于四个候选像素的砖在 mesh shader 内求交，其余砖投影矩形交给片元处理。两者共享像素射线与真实外表面深度，便于与三角 CLAS 对齐。独立计时关闭诊断原子计数和重复绘制。[同列表核验](../shaders/brick_compare.comp) · [测量入口](../examples/forest_overdraw.rs)
+`vegetation raster compare` 在同一帧保存三角背景，把同一份合并砖列表交给两条后端，比较最终像素的覆盖、完整 ID 和深度。参考 mesh 路径直接读取追加列表，小于等于四个候选像素的砖在 mesh shader 内求交，其余砖投影矩形交给片元处理。两者共享像素射线与真实外表面深度，便于与三角 CLAS 对齐。独立计时关闭诊断原子计数和重复绘制。[同列表核验](../shaders/brick_compare.comp) · [测量入口](../examples/forest_overdraw.rs)
 
-Epic 的公开概述描述了专用体素光栅和由近及远的深度分桶。用户提供的 UE 主分支资料给出更具体的配置，体素排在需要读取已有深度的阶段，一个体素 bin 内只有一个深度块。这里的计算后端在每轮三角之后消费一份体素列表。线程组用共享内存和矩形面积前缀和重分配像素任务。该分支资料描述的是 wave 前缀和与环形队列，以及命中格内射线段的中点深度。本引擎跟踪外露面的深度，以便材质重建、运动向量和硬件 CLAS 找到同一个表面。当前计算路径针对主相机透视可见性。[Epic 光栅流程](https://dev.epicgames.com/documentation/en-us/unreal-engine/nanite-foliage#nanite-voxels) · [投影与近面裁剪](../shaders/brick_project.glsl) · [命中深度](../shaders/brick_trace.glsl)
+UE 5.9 光栅排序、每块 256 桶、两轮 Hi-Z 的确切边界，以及本引擎末尾统一绘制与 UE 的差异见 [源码对照](nanite-voxel-pipeline.md)。
 
 LOD 选择以整个体素簇为单位。为兼容可见性 ID 的六位图元号及硬件三角 CLAS 的大小约束，原型另存每页最多 64 个顶点、64 个三角的命中映射。主视图射线命中后由这张表找到面及对角线两侧的三角号。启用 Mega Geometry 时，GPU 将同一张选簇列表和屏外投影簇展开成对应的页，按当前骨骼产生 CLAS。材质、TAA 运动向量和硬件命中可重建同一表面，软件阴影仍从自适应投影代理建 BVH。[CLAS 分页](../shaders/brick_clas.comp) · [共享运动向量](../shaders/surface_motion.comp) · [光追核验](../src/experiments/restir/studies/mega_tests.rs)
 
 ## 体素光栅同列表实测
+
+本节记录 11 月 23 日单桶计算版本的结果。四桶阶段及后续末尾光栅的同机位复测见 [Nanite 体素专题](nanite-voxel-pipeline.md)。当下生成的诊断 CSV 已移除分桶列，保留砖求交时间和初始化、解析、写回附件的时间。
 
 2026-11-23 在 Ryzen 7 9700X、RTX 5070、驱动 621.14 上运行 Release。程序化森林的五个机位用 800×500，岩柱森林的七个机位用 1920×1080。两组固定误差阈值、风姿和相机，关闭后处理。在同帧把主列表与补绘列表分别交给两种光栅，逐像素比较砖是否覆盖原三角、完整命中 ID 和归一化设备深度。共采集 46 帧，包含相机跳到下一机位的第一帧。另在相同机位用硬件查询重放几何以统计原始表面层数。逐机位独立计时每种后端预热 12 帧再取 30 帧，共 720 帧，关闭逐像素计数和参考重绘。[同列表与表面层数 CSV](../captures/forest-karst/voxel-software-visibility.csv) · [分项计时 CSV](../captures/forest-karst/voxel-software-stationary.csv)
 
@@ -301,7 +305,7 @@ cargo run --release --locked --example forest_shadows -- target/forest-shadow-zo
 
 新路径保住了更多远景叶片，也填上了更多枝叶之间的孔隙。当前每个已占格按实体处理，着色用最多三个方向近似原始叶片法线。模型空间格宽、构建候选预算以及这三项法线编码均是本引擎的选择。Epic 公布了绑定 DAG 的 4³ 稀疏砖、误差选择、深度分桶和逐像素采样法线分布的原则。[Epic Nanite Voxels](https://dev.epicgames.com/documentation/en-us/unreal-engine/nanite-foliage#nanite-voxels)
 
-从引擎根目录复跑以下命令。第一条的 `zoom.csv` 包含整帧、阴影、光栅、砖块分桶及可见砖数。后两条产生同一帧序列的自动和参考二值掩码。
+从引擎根目录复跑以下命令。第一条的 `zoom.csv` 包含整帧、阴影、体素光栅及可见砖数。当前实现生成的文件采用末尾光栅的口径。后两条产生同一帧序列的自动和参考二值掩码。
 
 ~~~powershell
 cargo run --locked --release --example forest_shadows -- target/karst-bricks zoom 2 --size 1920x1080 --gi direct --rays software

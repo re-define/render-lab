@@ -1,8 +1,20 @@
-//! Simulation stages share an immutable world and commit edits in registration order.
-use crate::scene::World;
+//! Dependency-ordered simulation with immutable reads and deterministic deferred writes.
+mod context;
+mod plan;
+mod transforms;
+use crate::scene::{Id, World};
 use anyhow::Result;
+use context::Change;
+pub use context::SystemContext;
+use plan::Plan;
 use rayon::{ThreadPool, prelude::*};
-use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
+pub use transforms::{TransformBindings, TransformTargets};
 
 pub type Edit = Box<dyn FnOnce(&mut World) + Send>;
 
@@ -11,14 +23,21 @@ pub type Edit = Box<dyn FnOnce(&mut World) + Send>;
 pub enum SimulationData {
     /// Unknown access or structural changes (including spawning and deleting entities).
     World,
+    /// Unbounded local transform access for systems that may visit any entity.
     LocalTransform,
+    /// Access restricted to the IDs supplied by SimulationSystem::transform_targets.
+    LocalTransformsById,
     Component(&'static str),
     Resource(&'static str),
 }
 impl SimulationData {
+    fn is_transform(self) -> bool {
+        matches!(self, Self::LocalTransform | Self::LocalTransformsById)
+    }
     fn overlap(self, rhs: Self) -> Option<Self> {
         match (self, rhs) {
             (Self::World, other) | (other, Self::World) => Some(other),
+            (a, b) if a.is_transform() && b.is_transform() => Some(Self::LocalTransform),
             (left, right) => (left == right).then_some(left),
         }
     }
@@ -28,6 +47,7 @@ impl fmt::Display for SimulationData {
         match self {
             Self::World => f.write_str("World"),
             Self::LocalTransform => f.write_str("LocalTransform"),
+            Self::LocalTransformsById => f.write_str("entity local transforms"),
             Self::Component(key) => write!(f, "component {key}"),
             Self::Resource(key) => write!(f, "resource {key}"),
         }
@@ -41,27 +61,87 @@ pub struct SystemAccess {
     pub writes: &'static [SimulationData],
 }
 impl SystemAccess {
-    fn hazards(self, next: Self) -> BTreeMap<SimulationData, &'static str> {
+    fn scoped(self) -> bool {
+        self.reads.contains(&SimulationData::LocalTransformsById)
+            || self.writes.contains(&SimulationData::LocalTransformsById)
+    }
+    fn require(&self, data: SimulationData, writing: bool) -> Result<()> {
+        let declared = if writing { self.writes } else { self.reads };
+        anyhow::ensure!(
+            declared.contains(&SimulationData::World) || declared.contains(&data),
+            "{}: undeclared {} of {data}",
+            self.name,
+            if writing { "write" } else { "read" }
+        );
+        Ok(())
+    }
+    fn hazards(
+        self,
+        next: Self,
+        left_targets: Option<&TransformTargets>,
+        right_targets: Option<&TransformTargets>,
+    ) -> BTreeMap<(SimulationData, Option<Id>), &'static str> {
         let mut hazards = BTreeMap::new();
-        for (kind, left, right) in [
-            ("write/write", self.writes, next.writes),
-            ("write/read", self.writes, next.reads),
-            ("read/write", self.reads, next.writes),
+        for (kind, left, right, lw, rw) in [
+            ("write/write", self.writes, next.writes, true, true),
+            ("write/read", self.writes, next.reads, true, false),
+            ("read/write", self.reads, next.writes, false, true),
         ] {
             for &a in left {
                 for &b in right {
                     if let Some(data) = a.overlap(b) {
-                        hazards.entry(data).or_insert(kind);
+                        let id = if a.is_transform() && b.is_transform() {
+                            let left = left_targets
+                                .filter(|_| a == SimulationData::LocalTransformsById)
+                                .map(|t| t.ids(lw));
+                            let right = right_targets
+                                .filter(|_| b == SimulationData::LocalTransformsById)
+                                .map(|t| t.ids(rw));
+                            let Some(witness) = transforms::overlap(left, right) else {
+                                continue;
+                            };
+                            witness
+                        } else {
+                            None
+                        };
+                        hazards.entry((data, id)).or_insert(kind);
                     }
                 }
             }
+        }
+        if hazards.is_empty()
+            && (self.writes.contains(&SimulationData::World)
+                || next.writes.contains(&SimulationData::World))
+        {
+            hazards.insert((SimulationData::World, None), "exclusive");
         }
         hazards
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct SystemOrder {
+    /// A stable, unique key for systems referenced by other modules.
+    pub key: Option<&'static str>,
+    pub after: &'static [&'static str],
+}
+
+/// Implement this interface for systems that can share a parallel simulation batch.
+pub trait SimulationSystem: Send + Sync {
+    fn access(&self) -> SystemAccess;
+    /// Resolve separate read and write sets from this snapshot. The selector may
+    /// read its declared component inputs and should have no side effects.
+    fn transform_targets(&self, _: &TransformBindings<'_>) -> Result<TransformTargets> {
+        Ok(TransformTargets::default())
+    }
+    fn order(&self) -> SystemOrder {
+        SystemOrder::default()
+    }
+    fn run(&self, context: &mut SystemContext<'_>, dt: f32) -> Result<()>;
+}
+
+/// Compatibility interface. An opaque update can inspect and change the entire world.
 pub trait System: Send + Sync {
-    /// Unannotated plugins retain their ordered stage semantics and are isolated in automatic groups.
     fn access(&self) -> SystemAccess {
         SystemAccess {
             name: std::any::type_name::<Self>(),
@@ -69,66 +149,148 @@ pub trait System: Send + Sync {
             writes: &[SimulationData::World],
         }
     }
-    /// Systems in a stage see the same snapshot. Edits commit in registration order.
+    fn order(&self) -> SystemOrder {
+        SystemOrder::default()
+    }
     fn update(&self, world: &World, dt: f32) -> Result<Edit>;
+    #[doc(hidden)]
+    fn checked(self: Arc<Self>) -> Option<Arc<dyn SimulationSystem>> {
+        None
+    }
 }
-#[derive(Default)]
-pub struct Schedule {
-    stages: Vec<Stage>,
+impl<T: SimulationSystem + 'static> System for T {
+    fn access(&self) -> SystemAccess {
+        SimulationSystem::access(self)
+    }
+    fn order(&self) -> SystemOrder {
+        SimulationSystem::order(self)
+    }
+    fn checked(self: Arc<Self>) -> Option<Arc<dyn SimulationSystem>> {
+        Some(self)
+    }
+    fn update(&self, world: &World, dt: f32) -> Result<Edit> {
+        let access = SimulationSystem::access(self);
+        let targets = resolve_targets(self, access, world)?;
+        let mut context = SystemContext::new(world, access, targets.as_ref());
+        self.run(&mut context, dt)?;
+        let changes = context.finish();
+        Ok(Box::new(move |world| {
+            for change in changes {
+                change.apply(world, None);
+            }
+        }))
+    }
 }
-struct Stage {
-    systems: Vec<Arc<dyn System>>,
-    access: Vec<SystemAccess>,
-    automatic: bool,
-    completed_steps: u64,
-    fixed: Option<FixedStep>,
+
+fn resolve_targets(
+    system: &dyn SimulationSystem,
+    access: SystemAccess,
+    world: &World,
+) -> Result<Option<TransformTargets>> {
+    if !access.scoped() {
+        return Ok(None);
+    }
+    let mut targets = system.transform_targets(&TransformBindings { world, access })?;
+    targets.normalize();
+    Ok(Some(targets))
 }
-impl Stage {
-    fn explicit(systems: Vec<Arc<dyn System>>, fixed: Option<FixedStep>) -> Self {
-        Self {
-            access: systems.iter().map(|system| system.access()).collect(),
-            systems,
-            fixed,
-            automatic: false,
-            completed_steps: 0,
+
+enum Implementation {
+    Checked(Arc<dyn SimulationSystem>),
+    Opaque(Arc<dyn System>),
+}
+struct Entry {
+    system: Implementation,
+    access: SystemAccess,
+    order: SystemOrder,
+}
+impl Entry {
+    fn new(system: Arc<dyn System>) -> Self {
+        if let Some(checked) = system.clone().checked() {
+            Self {
+                access: checked.access(),
+                order: checked.order(),
+                system: Implementation::Checked(checked),
+            }
+        } else {
+            Self {
+                access: SystemAccess {
+                    name: system.access().name,
+                    reads: &[SimulationData::World],
+                    writes: &[SimulationData::World],
+                },
+                order: system.order(),
+                system: Implementation::Opaque(system),
+            }
         }
     }
+    fn targets(&self, world: &World) -> Result<Option<TransformTargets>> {
+        match &self.system {
+            Implementation::Checked(s) => resolve_targets(s.as_ref(), self.access, world),
+            Implementation::Opaque(_) => Ok(None),
+        }
+    }
+    fn prepare(
+        &self,
+        world: &World,
+        dt: f32,
+        targets: Option<&TransformTargets>,
+    ) -> Result<Vec<Change>> {
+        match &self.system {
+            Implementation::Checked(system) => {
+                let mut context = SystemContext::new(world, self.access, targets);
+                system.run(&mut context, dt)?;
+                Ok(context.finish())
+            }
+            Implementation::Opaque(system) => Ok(vec![Change::Whole(system.update(world, dt)?)]),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct Schedule {
+    phases: Vec<Phase>,
+    compiled: OnceLock<std::result::Result<Plan, String>>,
+}
+#[derive(Default)]
+struct Phase {
+    entries: Vec<Entry>,
+    automatic: bool,
+    fixed: Option<FixedStep>,
+    completed: u64,
 }
 struct FixedStep {
     seconds: f64,
     remainder: f64,
     max_steps: u32,
 }
+
 impl Schedule {
-    /// Access declarations in commit order and the number of completed updates for each stage.
-    pub fn stages(&self) -> impl Iterator<Item = (&[SystemAccess], u64)> {
-        self.stages
-            .iter()
-            .map(|s| (s.access.as_slice(), s.completed_steps))
-    }
-    /// Group contiguous independent systems. An explicit stage or fixed clock always ends a group.
     pub fn add_system(&mut self, system: Arc<dyn System>) {
-        let access = system.access();
-        if let Some(last) = self.stages.last_mut()
-            && last.automatic
-            && last.access.iter().all(|a| a.hazards(access).is_empty())
-        {
-            last.access.push(access);
-            last.systems.push(system);
-        } else {
-            self.stages.push(Stage {
-                systems: vec![system],
-                access: vec![access],
+        self.compiled.take();
+        if self.phases.last().is_none_or(|p| !p.automatic) {
+            self.phases.push(Phase {
                 automatic: true,
-                completed_steps: 0,
-                fixed: None,
+                ..Default::default()
             });
         }
+        self.phases
+            .last_mut()
+            .unwrap()
+            .entries
+            .push(Entry::new(system));
     }
     pub fn stage(&mut self, systems: Vec<Arc<dyn System>>) {
-        self.stages.push(Stage::explicit(systems, None));
+        self.push_phase(systems, None);
     }
-    /// Run a fixed interval stage at most max_steps times per tick.
+    fn push_phase(&mut self, systems: Vec<Arc<dyn System>>, fixed: Option<FixedStep>) {
+        self.compiled.take();
+        self.phases.push(Phase {
+            entries: systems.into_iter().map(Entry::new).collect(),
+            fixed,
+            ..Default::default()
+        });
+    }
     pub fn fixed_stage(
         &mut self,
         step: Duration,
@@ -139,92 +301,160 @@ impl Schedule {
             !step.is_zero() && max_steps > 0,
             "invalid fixed simulation step"
         );
-        self.stages.push(Stage::explicit(
+        self.push_phase(
             systems,
             Some(FixedStep {
                 seconds: step.as_secs_f64(),
                 remainder: 0.,
                 max_steps,
             }),
-        ));
+        );
         Ok(())
     }
-    /// Registration order within each snapshot stage, successful substeps and declared hazards.
+    fn plan(&self) -> Result<&Plan> {
+        self.compiled
+            .get_or_init(|| Plan::compile(&self.phases).map_err(|e| e.to_string()))
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+    pub fn validate(&self) -> Result<()> {
+        self.plan().map(|_| ())
+    }
+    /// Resolve the schedule report against a snapshot. Execution binds again at
+    /// each substep boundary so it observes edits made by preceding systems.
+    pub fn bind_transforms(&mut self, world: &World) -> Result<()> {
+        self.validate()?;
+        let plan = self.compiled.get_mut().unwrap().as_mut().unwrap();
+        plan.preview(&self.phases, world)
+    }
+    pub fn stages(&self) -> impl Iterator<Item = (&[SystemAccess], u64)> {
+        self.plan()
+            .ok()
+            .into_iter()
+            .flat_map(|plan| plan.phases.iter().zip(&self.phases))
+            .flat_map(|(groups, phase)| {
+                groups
+                    .iter()
+                    .flat_map(|segment| &segment.batches)
+                    .map(move |g| (g.access.as_slice(), phase.completed))
+            })
+    }
     pub fn describe(&self) -> String {
         use fmt::Write;
-        let mut output = format!("Simulation stages: {}", self.stages.len());
-        for (index, stage) in self.stages.iter().enumerate() {
-            let clock = match &stage.fixed {
-                Some(fixed) => format!("fixed {:.6} s, max {}", fixed.seconds, fixed.max_steps),
-                None if stage.automatic => "variable, automatic".into(),
-                None => "variable, explicit".into(),
-            };
-            let _ = write!(
-                output,
-                "\n{} · {clock} · {} committed steps",
-                index + 1,
-                stage.completed_steps
+        let plan = match self.plan() {
+            Ok(p) => p,
+            Err(e) => return format!("Invalid simulation schedule: {e}"),
+        };
+        let mut out = format!(
+            "Simulation schedule: {} clock stages, {} batches",
+            self.phases.len(),
+            self.stages().count()
+        );
+        for (phase, (p, groups)) in self.phases.iter().zip(&plan.phases).enumerate() {
+            let clock = p.fixed.as_ref().map_or_else(
+                || "variable".into(),
+                |f| format!("fixed {:.6} s, max {}", f.seconds, f.max_steps),
             );
-            if stage.automatic && index > 0 && self.stages[index - 1].automatic {
-                let first = stage.access[0];
-                for earlier in &self.stages[index - 1].access {
-                    for (data, hazard) in earlier.hazards(first) {
+            for (level, (segment, g)) in groups
+                .iter()
+                .flat_map(|s| s.batches.iter().map(move |b| (s, b)))
+                .enumerate()
+            {
+                let _ = write!(
+                    out,
+                    "\nclock stage {} · {clock} · batch {} · {} committed steps",
+                    phase + 1,
+                    level + 1,
+                    p.completed
+                );
+                for (&i, a) in g.ids.iter().zip(&g.access) {
+                    let order = p.entries[i].order;
+                    let _ = write!(
+                        out,
+                        "\n  {} [{}]: read {:?}, write {:?}",
+                        a.name,
+                        order.key.unwrap_or("unnamed"),
+                        a.reads,
+                        a.writes
+                    );
+                    if let Some(targets) = segment.bindings.get(&i) {
                         let _ = write!(
-                            output,
-                            "\n  stage boundary: {hazard} {data}: {} → {}",
-                            earlier.name, first.name
+                            out,
+                            "; local entities: {} read, {} write",
+                            targets.reads.len(),
+                            targets.writes.len()
                         );
+                    } else if a.scoped() {
+                        out.push_str("; local entities pending binding");
+                    }
+                    for key in order.after {
+                        let _ = write!(out, "\n    after {key}");
                     }
                 }
-            }
-            for (i, system) in stage.access.iter().enumerate() {
-                let _ = write!(
-                    output,
-                    "\n  {}: read {:?}, write {:?}",
-                    system.name, system.reads, system.writes
-                );
-                for earlier in &stage.access[..i] {
-                    for (data, hazard) in earlier.hazards(*system) {
-                        let _ = write!(
-                            output,
-                            "\n    {hazard} {data}: {} → {}",
-                            earlier.name, system.name
-                        );
-                    }
+                for reason in &g.hazards {
+                    let _ = write!(out, "\n  stage boundary: {reason}");
                 }
             }
         }
-        output
+        out
     }
     pub fn tick(&mut self, world: &mut Arc<World>, dt: f32, pool: &ThreadPool) -> Result<()> {
         anyhow::ensure!(dt.is_finite() && dt >= 0., "invalid simulation time");
-        for stage in &mut self.stages {
-            let (steps, interval) = match &mut stage.fixed {
-                Some(fixed) => {
-                    fixed.remainder = (fixed.remainder + f64::from(dt))
-                        .min(fixed.seconds * f64::from(fixed.max_steps));
-                    let count = (fixed.remainder / fixed.seconds).floor() as u32;
-                    (count, fixed.seconds as f32)
+        self.validate()?;
+        let plan = self.compiled.get_mut().unwrap().as_mut().unwrap();
+        for (p, groups) in self.phases.iter_mut().zip(&mut plan.phases) {
+            let (steps, interval) = match &mut p.fixed {
+                Some(f) => {
+                    f.remainder =
+                        (f.remainder + f64::from(dt)).min(f.seconds * f64::from(f.max_steps));
+                    ((f.remainder / f.seconds).floor() as u32, f.seconds as f32)
                 }
                 None => (1, dt),
             };
             for _ in 0..steps {
-                let edits = pool.install(|| {
-                    stage
-                        .systems
-                        .par_iter()
-                        .map(|s| s.update(world, interval))
-                        .collect::<Result<Vec<_>>>()
-                })?;
-                for edit in edits {
-                    edit(Arc::make_mut(world));
+                run_substep(p, groups, world, interval, pool)?;
+                if let Some(f) = &mut p.fixed {
+                    f.remainder = (f.remainder - f.seconds).max(0.);
                 }
-                if let Some(fixed) = &mut stage.fixed {
-                    fixed.remainder = (fixed.remainder - fixed.seconds).max(0.);
-                }
-                stage.completed_steps += 1;
+                p.completed += 1;
             }
         }
         Ok(())
     }
+}
+
+fn run_substep(
+    phase: &Phase,
+    segments: &mut [plan::Segment],
+    world: &mut Arc<World>,
+    dt: f32,
+    pool: &ThreadPool,
+) -> Result<()> {
+    let mut undo = Vec::new();
+    let segment_count = segments.len();
+    let result = (|| {
+        for (index, segment) in segments.iter_mut().enumerate() {
+            segment.bind(phase, world, None)?;
+            for (level, batch) in segment.batches.iter().enumerate() {
+                let edits = pool.install(|| {
+                    batch
+                        .ids
+                        .par_iter()
+                        .map(|&i| phase.entries[i].prepare(world, dt, segment.bindings.get(&i)))
+                        .collect::<Result<Vec<_>>>()
+                })?;
+                let more = index + 1 < segment_count || level + 1 < segment.batches.len();
+                for change in edits.into_iter().flatten() {
+                    change.apply(Arc::make_mut(world), more.then_some(&mut undo));
+                }
+            }
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        for revert in undo.into_iter().rev() {
+            revert(Arc::make_mut(world));
+        }
+    }
+    result
 }

@@ -96,11 +96,13 @@ fn probes(g: &mut Graph) -> Result<()> {
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let preset = args.next().context(
-        "usage: forest_overdraw karst|forest auto|triangles WIDTHxHEIGHT [compare|compute|mesh]",
+        "usage: forest_overdraw karst|forest auto|triangles|reference WIDTHxHEIGHT [compare|compute|linear|mesh [image-directory]]",
     )?;
-    let mode = args.next().context("choose auto or triangles")?;
+    let mode = args
+        .next()
+        .context("choose auto, triangles or full-detail reference")?;
     ensure!(
-        matches!(mode.as_str(), "auto" | "triangles"),
+        matches!(mode.as_str(), "auto" | "triangles" | "reference"),
         "invalid vegetation mode"
     );
     let size = args.next().context("missing WIDTHxHEIGHT")?;
@@ -110,9 +112,13 @@ fn main() -> Result<()> {
     ensure!(
         backend
             .as_deref()
-            .is_none_or(|b| matches!(b, "mesh" | "compute" | "compare")),
+            .is_none_or(|b| matches!(b, "mesh" | "compute" | "linear" | "compare")),
         "invalid raster backend"
     );
+    let capture = args.next().map(std::path::PathBuf::from);
+    if let Some(dir) = &capture {
+        std::fs::create_dir_all(dir)?;
+    }
     ensure!(
         !extent.contains(&0) && args.next().is_none(),
         "invalid size or extra arguments"
@@ -124,10 +130,18 @@ fn main() -> Result<()> {
     };
     let mut engine = experiments::open(world)?;
     let mut console = Console::default();
+    let cut = if mode == "reference" {
+        "triangles"
+    } else {
+        mode.as_str()
+    };
+    if mode == "reference" {
+        console.execute(&mut engine, &[], "lod 0")?;
+    }
     for cmd in [
         "vegetation wind 0",
         "post off",
-        &format!("vegetation {mode}"),
+        &format!("vegetation {cut}"),
         &format!("vegetation raster {}", backend.as_deref().unwrap_or("mesh")),
     ] {
         console.execute(&mut engine, &[], cmd)?;
@@ -146,14 +160,14 @@ fn main() -> Result<()> {
     };
     if backend.is_some() {
         println!(
-            "stage,position,sample,candidates,lod_rejects,early_z_rejects,dda_calls,dda_hits,atomic_wins,mesh_changed,compute_changed,coverage_mismatch,id_mismatch,depth_delta_gt_1e_minus_5,id_mismatch_within_1ulp,post_candidates,post_dda_calls,max_depth_delta,visible_bricks,trace_ms,bridge_ms,bins_ms,gpu_ms"
+            "stage,position,sample,candidates,lod_rejects,early_z_rejects,dda_calls,dda_hits,atomic_wins,mesh_changed,compute_changed,coverage_mismatch,id_mismatch,depth_delta_gt_1e_minus_5,id_mismatch_within_1ulp,post_candidates,post_dda_calls,max_depth_delta,visible_bricks,trace_ms,bridge_ms,gpu_ms"
         );
     } else {
         println!(
             "stage,position,sample,foreground_px,voxel_px,raw_tri_samples,raw_brick_samples,brick_rect_samples,depth_pass_samples,brick_depth_pass_samples,fragment_invocations,brick_fragment_invocations"
         );
     }
-    let timed = matches!(backend.as_deref(), Some("compute" | "mesh"));
+    let timed = matches!(backend.as_deref(), Some("compute" | "linear" | "mesh"));
     let (warm, samples) = if timed { (12, 30) } else { (3, 3) };
     for (stage, &position) in positions.iter().enumerate() {
         engine.camera = origin;
@@ -178,6 +192,21 @@ fn main() -> Result<()> {
                 probes(&mut graph)?;
             }
             let frame = gpu.execute(graph.compile()?, &engine.tasks)?;
+            if i == warm + samples - 1
+                && let Some(dir) = &capture
+            {
+                let mut rgba = frame.pixels.clone();
+                for pixel in rgba.chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
+                image::save_buffer(
+                    dir.join(format!("{stage}.png")),
+                    &rgba,
+                    extent[0],
+                    extent[1],
+                    image::ColorType::Rgba8,
+                )?;
+            }
             let arrival = backend.as_deref() == Some("compare") && stage > 0 && i == 0;
             if i < warm && !arrival {
                 continue;
@@ -206,15 +235,13 @@ fn main() -> Result<()> {
                         "voxel work counters inconsistent"
                     );
                 }
-                let (mut trace, mut bridge, mut bins) = (0., 0., 0.);
+                let (mut trace, mut bridge) = (0., 0.);
                 for p in frame
                     .passes
                     .iter()
                     .filter(|p| p.name.contains("voxel brick visibility"))
                 {
-                    if p.name.ends_with("depth bins") {
-                        bins += p.ms;
-                    } else if p.name.ends_with(" trace") || p.name.ends_with(" visibility") {
+                    if p.name.ends_with(" trace") || p.name.ends_with(" visibility") {
                         trace += p.ms;
                     } else {
                         bridge += p.ms;
@@ -225,7 +252,7 @@ fn main() -> Result<()> {
                     print!(",{n}");
                 }
                 println!(
-                    ",{},{},{},{:.9},{},{trace:.6},{bridge:.6},{bins:.6},{:.6}",
+                    ",{},{},{},{:.9},{},{trace:.6},{bridge:.6},{:.6}",
                     counter("Brick ID differences within one depth ULP"),
                     counter("Recovered brick candidate pixels"),
                     counter("Recovered brick DDA calls"),

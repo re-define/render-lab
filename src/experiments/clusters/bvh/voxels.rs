@@ -1,6 +1,15 @@
 //! Build a voxel candidate for each complete DAG replacement.
 use super::*;
+mod bricks;
+mod children;
+mod coverage;
+mod grouping;
+mod levels;
+pub(super) use levels::Hierarchy;
+mod sampling;
+use children::{ChildCut, SourceSurface};
 use glam::Vec2;
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy)]
@@ -13,32 +22,12 @@ struct Cell {
 
 pub(super) struct Replacement {
     size: f32,
-    cells: Vec<Cell>,
-}
-
-#[derive(Default)]
-struct Sample {
-    area: Vec3,
-    // Each bit is a distinct orthographic ray through a cell face. Stacked
-    // leaves increase area, but the same ray only contributes coverage once.
-    rays: [u16; 3],
-    // Two-sided leaf normals are axes. Keep an area-weighted directional lobe
-    // for each dominant axis, including its mass for the shading distribution.
-    lobes: [Vec3; 3],
-    mass: [f32; 3],
-    uv: Vec2,
-    joint: u32,
-    strongest: f32,
-}
-
-fn projected_area(mesh: &Mesh, faces: &[u32]) -> Vec3 {
-    faces
-        .iter()
-        .map(|&f| {
-            let [a, b, c] = positions(mesh, f);
-            (b - a).cross(c - a).abs() * 0.5
-        })
-        .sum()
+    source_area: f32,
+    // Occupancy discarded from this cut may still seed a coarser grid.
+    // These coordinates are CPU build data and never enter the GPU brick stream.
+    extra_cells: Vec<[i32; 3]>,
+    layout: bricks::Layout,
+    parts: Vec<Vec<usize>>,
 }
 
 fn is_volume(mesh: &Mesh, faces: &[u32], tolerance: f32) -> bool {
@@ -60,79 +49,6 @@ fn is_volume(mesh: &Mesh, faces: &[u32], tolerance: f32) -> bool {
             .iter()
             .any(|p| (*p - point).dot(n).abs() > tolerance)
     })
-}
-
-// A brick ray contributes one surface sample for each occupied column,
-// regardless of how many cells it crosses along that axis.
-fn brick_projected_area(cells: &[Cell], size: f32) -> Vec3 {
-    let mut area = Vec3::ZERO;
-    for brick in cells.chunk_by(|a, b| brick_key(a) == brick_key(b)) {
-        let mut columns = [0u16; 3];
-        for cell in brick {
-            let [x, y, z] = cell.grid.map(|v| v.rem_euclid(4) as u32);
-            for (mask, bit) in columns.iter_mut().zip([y + 4 * z, x + 4 * z, x + 4 * y]) {
-                *mask |= 1 << bit;
-            }
-        }
-        area += Vec3::from_array(columns.map(|m| m.count_ones() as f32)) * size * size;
-    }
-    area
-}
-
-// Trace a 4x4 lattice of parallel rays per cell face. Barycentric intersection
-// gives the cell along the ray. The three views share a model-space lattice.
-fn sample_projected_rays(cells: &mut BTreeMap<[i32; 3], Sample>, vertices: [Vec3; 3]) {
-    for axis in 0..3 {
-        let u = (axis + 1) % 3;
-        let v = (axis + 2) % 3;
-        let [a, b, c] = vertices.map(|p| Vec2::new(p[u], p[v]) * 4.);
-        let ab = b - a;
-        let ac = c - a;
-        let det = ab.perp_dot(ac);
-        if det.abs() < 1e-7 {
-            continue;
-        }
-        let lo = (a.min(b).min(c) - 0.5).ceil().as_ivec2();
-        let hi = (a.max(b).max(c) - 0.5).floor().as_ivec2();
-        // Very large triangles remain eligible for the triangle path. Bound
-        // preprocessing for assets with an impractically small voxel grid.
-        if (hi - lo).max_element() > 96 {
-            continue;
-        }
-        for y in lo.y..=hi.y {
-            for x in lo.x..=hi.x {
-                let ap = Vec2::new(x as f32 + 0.5, y as f32 + 0.5) - a;
-                let s = ap.perp_dot(ac) / det;
-                let t = ab.perp_dot(ap) / det;
-                if s < 0. || t < 0. || s + t > 1. {
-                    continue;
-                }
-                let h = vertices[0][axis]
-                    + s * (vertices[1][axis] - vertices[0][axis])
-                    + t * (vertices[2][axis] - vertices[0][axis]);
-                let mut grid = [0; 3];
-                grid[axis] = h.floor() as i32;
-                grid[u] = x.div_euclid(4);
-                grid[v] = y.div_euclid(4);
-                if let Some(cell) = cells.get_mut(&grid) {
-                    cell.rays[axis] |= 1 << (x.rem_euclid(4) + 4 * y.rem_euclid(4));
-                }
-            }
-        }
-    }
-}
-
-impl Sample {
-    fn normals(&self) -> [u32; 3] {
-        let total = self.mass.iter().sum::<f32>();
-        std::array::from_fn(|i| {
-            let n = self.lobes[i].normalize_or_zero();
-            let [x, y, z] = n
-                .to_array()
-                .map(|v| (v.clamp(-1., 1.) * 127.).round() as i8 as u8);
-            u32::from_le_bytes([x, y, z, (self.mass[i] / total * 255.).round() as u8])
-        })
-    }
 }
 
 fn triangle(mesh: &Mesh, face: u32) -> [usize; 3] {
@@ -215,213 +131,97 @@ impl Probe {
         masks
     }
 
-    fn voxels(&self, size: f32, cells: &[Cell]) -> Footprint {
-        let mut masks = [[0; RES]; 3];
-        for cell in cells {
-            let lo =
-                (Vec3::from_array(cell.grid.map(|p| p as f32)) * size - self.origin) / self.pixel;
-            let hi = lo + size / self.pixel;
-            for (axis, rows) in masks.iter_mut().enumerate() {
-                let u = (axis + 1) % 3;
-                let v = (axis + 2) % 3;
-                // Center sampling, matching the triangle probe.
-                let x0 = ((lo[u] - 0.5).ceil() as i32).clamp(0, RES as i32) as usize;
-                let x1 = ((hi[u] - 0.5).ceil() as i32).clamp(0, RES as i32) as usize;
-                let y0 = ((lo[v] - 0.5).ceil() as i32).clamp(0, RES as i32) as usize;
-                let y1 = ((hi[v] - 0.5).ceil() as i32).clamp(0, RES as i32) as usize;
-                if x0 < x1 && y0 < y1 {
-                    let bits = ((1u64 << x1) - 1) ^ ((1u64 << x0) - 1);
-                    for row in &mut rows[y0..y1] {
-                        *row |= bits;
-                    }
-                }
-            }
-        }
-        masks
-    }
-
     fn error(&self, reference: &Footprint, candidate: &Footprint) -> f32 {
-        let disagreement: f32 = reference
+        let mismatch: u32 = reference
             .iter()
             .flatten()
             .zip(candidate.iter().flatten())
-            .map(|(a, b)| (a ^ b).count_ones() as f32)
+            .map(|(a, b)| (a ^ b).count_ones())
             .sum();
-        0.33 * self.pixel * (disagreement / 3.).sqrt()
+        0.33 * self.pixel * (mismatch as f32 / 3.).sqrt()
     }
 }
 
-fn sample_cells(mesh: &Mesh, faces: &[u32], size: f32) -> BTreeMap<[i32; 3], Sample> {
-    let mut cells = BTreeMap::<_, Sample>::new();
-    for &face in faces {
-        let vertex = triangle(mesh, face);
-        let [a, b, c] = vertex.map(|i| Vec3::from(mesh.positions[i]));
-        let cross = (b - a).cross(c - a);
-        if cross.length_squared() <= 1e-14 {
-            continue;
-        }
-        let steps = ((a.distance(b).max(b.distance(c)).max(c.distance(a)) / (0.5 * size)).ceil()
-            as u32)
-            .clamp(1, 22);
-        let count = (steps + 1) * (steps + 2) / 2;
-        let area = cross.abs() * (0.5 / count as f32);
-        let strength = area.element_sum();
-        let geometric = cross.normalize();
-        let normals = vertex.map(|i| mesh.normals.get(i).copied().map_or(geometric, Vec3::from));
-        let uvs = vertex.map(|i| mesh.uv.get(i).copied().map_or(Vec2::splat(0.5), Vec2::from));
-        for row in 0..=steps {
-            for col in 0..=steps - row {
-                let u = row as f32 / steps as f32;
-                let v = col as f32 / steps as f32;
-                let p = (a + (b - a) * u + (c - a) * v) / size;
-                let grid = p.floor();
-                let normal = (normals[0] * (1. - u - v) + normals[1] * u + normals[2] * v)
-                    .normalize_or(geometric);
-                let sample = cells.entry(grid.as_ivec3().to_array()).or_default();
-                sample.area += area;
-                let a = normal.abs();
-                let axis = if a.x >= a.y && a.x >= a.z {
-                    0
-                } else if a.y >= a.z {
-                    1
-                } else {
-                    2
-                };
-                sample.lobes[axis] += normal * (normal[axis].signum() * strength);
-                sample.mass[axis] += strength;
-                sample.uv += (uvs[0] * (1. - u - v) + uvs[1] * u + uvs[2] * v) * strength;
-                if strength > sample.strongest {
-                    let dominant = mesh.weights[vertex[0]]
-                        .iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1.total_cmp(b.1))
-                        .unwrap()
-                        .0;
-                    sample.joint = u32::from(mesh.joints[vertex[0]][dominant]);
-                    sample.strongest = strength;
-                }
-            }
-        }
-    }
-    for &face in faces {
-        sample_projected_rays(&mut cells, positions(mesh, face).map(|p| p / size));
-    }
-    cells
-}
-
-pub(super) fn choose(
+fn reduce(
     mesh: &Mesh,
-    nodes: &[ClusterNode],
-    meshlets: &[Meshlet],
+    surface: &SourceSurface,
+    cut: &ChildCut<'_>,
+    coarse: &[u32],
+    qem: Option<f32>,
+    radius: f32,
     base_size: f32,
-) -> (Vec<Option<Replacement>>, Vec<f32>) {
-    let mut incoming = vec![BTreeMap::<usize, Vec<u32>>::new(); nodes.len()];
-    for (owner, group) in nodes.iter().enumerate() {
-        for &id in &group.meshlets {
-            let cluster = &meshlets[id as usize];
-            if let Some(fine) = cluster.refined_group {
-                incoming[fine as usize]
-                    .entry(owner)
-                    .or_default()
-                    .extend(&cluster.triangles);
-            }
+) -> (Option<Replacement>, f32) {
+    let mut triangle_error = qem.unwrap_or(0.).max(cut.error_floor);
+    if cut.voxels.is_empty() {
+        let Some(probe) = Probe::new(mesh, &cut.triangles, coarse) else {
+            return (None, triangle_error);
+        };
+        if !coarse.is_empty() {
+            triangle_error = triangle_error.max(probe.error(
+                &probe.triangles(mesh, &cut.triangles),
+                &probe.triangles(mesh, coarse),
+            ));
+        }
+        if !is_volume(mesh, &cut.triangles, probe.pixel) {
+            return (None, triangle_error);
         }
     }
-    let mut reference = Vec::<Vec<u32>>::with_capacity(nodes.len());
-    let mut choices = Vec::with_capacity(nodes.len());
-    let mut errors = Vec::with_capacity(nodes.len());
-    for (id, group) in nodes.iter().enumerate() {
-        let mut fine = BTreeSet::new();
-        for &c in &group.meshlets {
-            let meshlet = &meshlets[c as usize];
-            match meshlet.refined_group {
-                Some(child) if incoming[child as usize].len() == 1 => {
-                    fine.extend(reference[child as usize].iter().copied());
-                }
-                _ => fine.extend(meshlet.triangles.iter().copied()),
-            }
-        }
-        let fine: Vec<u32> = fine.into_iter().collect();
-        let coarse: Vec<u32> = incoming[id].values().flatten().copied().collect();
-        let mut error = group.error;
-        let mut best = None;
-        if let Some(probe) = (!coarse.is_empty())
-            .then(|| Probe::new(mesh, &fine, &coarse))
-            .flatten()
-        {
-            let reference_mask = probe.triangles(mesh, &fine);
-            error = error.max(probe.error(&reference_mask, &probe.triangles(mesh, &coarse)));
-            // A complete replacement must have a single owner. Replacing a
-            // fraction of a shared group would duplicate or drop its coverage.
-            if incoming[id].len() == 1 && is_volume(mesh, &fine, probe.pixel) {
-                let triangle_area = projected_area(mesh, &coarse).element_sum().max(1e-12);
-                let mut best_score = error;
-                // Compact samples use 24 bytes and share their brick header.
-                let limit = coarse.len().div_ceil(3).clamp(8, 128);
-                for size in [0.5, 0.75, 1., 1.5, 2., 3., 4.].map(|scale| base_size * scale) {
-                    let mut samples: Vec<_> = sample_cells(mesh, &fine, size).into_iter().collect();
-                    samples
-                        .sort_by(|a, b| b.1.area.max_element().total_cmp(&a.1.area.max_element()));
-                    for (budget, density) in [limit.div_ceil(2), limit]
-                        .into_iter()
-                        .flat_map(|budget| [0.14, 0.30, 0.55].map(|density| (budget, density)))
-                    {
-                        let mut cells: Vec<_> = samples
-                            .iter()
-                            .take(budget)
-                            .take_while(|(_, s)| s.area.max_element() >= density * size * size)
-                            .filter(|(_, s)| {
-                                s.rays
-                                    .iter()
-                                    .any(|mask| mask.count_ones() as f32 >= density * 16.)
-                            })
-                            .map(|&(grid, ref s)| Cell {
-                                grid,
-                                normals: s.normals(),
-                                joint: s.joint,
-                                uv: s.uv / s.area.element_sum(),
-                            })
-                            .collect();
-                        if cells.is_empty() {
-                            continue;
-                        }
-                        cells.sort_by_key(|c| (brick_key(c), brick_bit(c)));
-                        // Bound the projected half-diagonal, including isolated canopy cells on the skyline.
-                        let voxel_error = (0.5 * 3.0_f32.sqrt() * size)
-                            .max(probe.error(&reference_mask, &probe.voxels(size, &cells)));
-                        // A coarse triangle cut can drop an entire spray of leaves. Charge
-                        // additional layers when ranking candidates, but let a better
-                        // silhouette win. Only geometric error drives runtime LOD.
-                        let layers =
-                            brick_projected_area(&cells, size).element_sum() / triangle_area;
-                        let score = voxel_error + probe.pixel * 0.25 * layers.max(1.).log2();
-                        if score < best_score {
-                            best_score = score;
-                            error = voxel_error;
-                            best = Some(Replacement { size, cells });
-                        }
-                    }
+    let elements = cut.triangles.len()
+        + cut
+            .voxels
+            .iter()
+            .map(|r| r.layout.bricks.len())
+            .sum::<usize>();
+    let parent_budget = elements.div_ceil(2 * bricks::MAX_BRICKS).max(1);
+    let target = (cut.vertices * 3 / 4).max(1);
+    let mut size = (0.75 * (cut.area / target as f32).sqrt())
+        .max(base_size * 0.5)
+        .max(cut.error_floor);
+    // A complete mixed group has no independent triangle simplification to beat.
+    // Cap an empty or unencodable group by its support diameter.
+    let limit = if qem.is_none() {
+        2. * (2. * radius).max(size)
+    } else {
+        triangle_error
+    };
+    while size.is_finite() && size > 0. && size < limit {
+        if let Some(samples) = sampling::sample(mesh, surface, cut, size) {
+            let retained = coverage::reduce(&samples);
+            let (cells, discarded): (Vec<_>, Vec<_>) = samples
+                .into_iter()
+                .zip(retained)
+                .partition(|(_, keep)| *keep);
+            if !cells.is_empty()
+                && cells.len() <= target
+                && (!cut.triangles.is_empty() || cells.len() < cut.vertices)
+            {
+                let layout =
+                    bricks::Layout::new(cells.into_iter().map(|(sample, _)| sample.cell).collect());
+                if let Some(parts) = layout.partition(parent_budget) {
+                    return (
+                        Some(Replacement {
+                            size,
+                            source_area: cut.area,
+                            layout,
+                            parts,
+                            extra_cells: discarded
+                                .into_iter()
+                                .map(|(sample, _)| sample.cell.grid)
+                                .collect(),
+                        }),
+                        size,
+                    );
                 }
             }
         }
-        choices.push(best);
-        errors.push(error);
-        reference.push(fine);
+        size *= 1.1;
     }
-    (choices, errors)
-}
-
-fn brick_key(cell: &Cell) -> ([i32; 3], u32) {
-    (cell.grid.map(|v| v.div_euclid(4)), cell.joint)
-}
-
-fn brick_bit(cell: &Cell) -> u32 {
-    let [x, y, z] = cell.grid.map(|v| v.rem_euclid(4) as u32);
-    x | y << 2 | z << 4
+    (None, triangle_error)
 }
 
 struct SurfaceCell<'a> {
     cell: &'a Cell,
+    origin: [i32; 3],
     faces: u32,
     page: u32,
     first_quad: u32,
@@ -434,9 +234,10 @@ fn write_bricks(words: &mut Vec<u32>, cells: &[SurfaceCell], size: f32) -> u32 {
     let start = words.len();
     words.push(0);
     let mut attributes = Vec::with_capacity(6 * cells.len());
-    for brick in cells.chunk_by(|a, b| brick_key(a.cell) == brick_key(b.cell)) {
-        let (coord, joint) = brick_key(brick[0].cell);
-        let origin = Vec3::from_array(coord.map(|v| v as f32)) * (4. * size);
+    for brick in cells.chunk_by(|a, b| a.origin == b.origin && a.cell.joint == b.cell.joint) {
+        let coord = brick[0].origin;
+        let joint = brick[0].cell.joint;
+        let origin = Vec3::from_array(coord.map(|v| v as f32)) * size;
         let first = (attributes.len() / 6) as u32;
         let mut mask = 0u64;
         let mut lo = [3u32; 3];
@@ -444,7 +245,7 @@ fn write_bricks(words: &mut Vec<u32>, cells: &[SurfaceCell], size: f32) -> u32 {
         let brick_index = words[start];
         for record in brick {
             let cell = record.cell;
-            let bit = brick_bit(cell);
+            let bit = bricks::bit(cell.grid, coord);
             mask |= 1 << bit;
             for axis in 0..3 {
                 let coord = (bit >> (2 * axis)) & 3;
@@ -480,92 +281,99 @@ impl Replacement {
         vertices: &mut Vec<u32>,
         indices: &mut Vec<u32>,
         pages: &mut Vec<Cluster>,
-        mut meta: [u32; 4],
+        meta: [u32; 4],
         bones: &[PlantBone],
-    ) -> Result<Cluster> {
-        let occupancy: BTreeMap<_, _> = self.cells.iter().map(|c| (c.grid, c.joint)).collect();
-        let first_page = pages.len();
-        let stream: u32 = vertices.len().try_into()?;
-        let half = self.size * 0.5;
-        let mut cells = Vec::with_capacity(self.cells.len());
-        let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
-        let mut primitives = 0;
-        for cell in &self.cells {
-            let faces = (0..6)
-                .filter(|&f| {
-                    let mut neighbor = cell.grid;
-                    neighbor[f / 2] += if f % 2 == 0 { -1 } else { 1 };
-                    occupancy.get(&neighbor) != Some(&cell.joint)
-                })
-                .fold(0u32, |bits, f| bits | 1 << f);
-            if faces == 0 {
+    ) -> Result<Vec<Cluster>> {
+        let mut parents = Vec::with_capacity(self.parts.len());
+        for part in &self.parts {
+            let mut meta = meta;
+            let first_page = pages.len();
+            let stream: u32 = vertices.len().try_into()?;
+            let half = self.size * 0.5;
+            let mut cells = Vec::new();
+            let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+            let mut primitives = 0;
+            for &id in part {
+                let brick = &self.layout.bricks[id];
+                for i in brick.cells.clone() {
+                    let cell = &self.layout.cells[i];
+                    let faces = u32::from(self.layout.faces[i]);
+                    if faces == 0 {
+                        continue;
+                    }
+                    let triangles = 2 * faces.count_ones();
+                    if pages.len() == first_page
+                        || pages
+                            .last()
+                            .is_some_and(|p| bricks::page_full(p.span[1], p.span[3], triangles))
+                    {
+                        let mut page_meta = meta;
+                        page_meta[3] = 1 | (cells.len() as u32) << 1;
+                        pages.push(Cluster {
+                            span: [stream, 0, indices.len().try_into()?, 0],
+                            sphere: [0.; 4],
+                            meta: page_meta,
+                        });
+                    }
+                    let relative_page = (pages.len() - first_page - 1) as u32;
+                    let page = pages.last_mut().unwrap();
+                    let slot = cells.len() as u32;
+                    cells.push(SurfaceCell {
+                        cell,
+                        origin: brick.origin,
+                        faces,
+                        page: relative_page,
+                        first_quad: page.span[3] / 2,
+                    });
+                    indices.extend(
+                        (0..6)
+                            .filter(|&f| faces & (1 << f) != 0)
+                            .map(|f| (slot << 3) | f),
+                    );
+                    page.span[1] += 8;
+                    page.span[3] += triangles;
+                    primitives += triangles;
+                    let center = Vec3::from_array(cell.grid.map(|p| p as f32)) * self.size + half;
+                    let mut joint = Some(cell.joint as usize);
+                    let mut displacement = 0.;
+                    while let Some(i) = joint {
+                        let bone = bones[i];
+                        let corner = (center - Vec3::from(bone.pivot)).abs() + half;
+                        displacement += 2. * bone.bend.sin() * corner.length();
+                        joint = bone.parent.map(usize::from);
+                    }
+                    let bound = half + displacement;
+                    lo = lo.min(center - bound);
+                    hi = hi.max(center + bound);
+                }
+            }
+            if cells.is_empty() {
                 continue;
             }
-            let triangles = 2 * faces.count_ones();
-            if pages.len() == first_page
-                || pages
-                    .last()
-                    .is_some_and(|p| p.span[1] == 64 || p.span[3] + triangles > 64)
-            {
-                let mut page_meta = meta;
-                page_meta[3] = 1 | (cells.len() as u32) << 1;
-                pages.push(Cluster {
-                    span: [stream, 0, indices.len().try_into()?, 0],
-                    sphere: [0.; 4],
-                    meta: page_meta,
-                });
-            }
-            let relative_page = (pages.len() - first_page - 1) as u32;
-            let page = pages.last_mut().unwrap();
-            let slot = cells.len() as u32;
-            cells.push(SurfaceCell {
-                cell,
-                faces,
-                page: relative_page,
-                first_quad: page.span[3] / 2,
-            });
-            indices.extend(
-                (0..6)
-                    .filter(|&f| faces & (1 << f) != 0)
-                    .map(|f| (slot << 3) | f),
+            let bricks = write_bricks(vertices, &cells, self.size);
+            ensure!(
+                (1..=bricks::MAX_BRICKS as u32).contains(&bricks)
+                    && pages.len() - first_page <= bricks::MAX_PAGES,
+                "voxel cluster exceeds brick or hit-page encoding"
             );
-            page.span[1] += 8;
-            page.span[3] += triangles;
-            primitives += triangles;
-            let center = Vec3::from_array(cell.grid.map(|p| p as f32)) * self.size + half;
-            let mut joint = Some(cell.joint as usize);
-            let mut displacement = 0.;
-            while let Some(i) = joint {
-                let bone = bones[i];
-                let corner = (center - Vec3::from(bone.pivot)).abs() + half;
-                displacement += 2. * bone.bend.sin() * corner.length();
-                joint = bone.parent.map(usize::from);
+            let bounds = sphere(lo, hi);
+            // Only the logical cluster is culled. Its CLAS pages inherit its
+            // transition and conservative caster bounds.
+            for page in &mut pages[first_page..] {
+                page.sphere = bounds;
             }
-            let bound = half + displacement;
-            lo = lo.min(center - bound);
-            hi = hi.max(center + bound);
+            meta[3] = 1 | bricks << 1;
+            parents.push(Cluster {
+                span: [
+                    stream,
+                    (pages.len() - first_page).try_into()?,
+                    first_page.try_into()?,
+                    primitives,
+                ],
+                sphere: bounds,
+                meta,
+            });
         }
-        let bricks = write_bricks(vertices, &cells, self.size);
-        ensure!(
-            (1..=128).contains(&bricks) && pages.len() - first_page <= 256,
-            "voxel cluster exceeds brick or hit-page encoding"
-        );
-        let bounds = sphere(lo, hi);
-        // Only the logical cluster is culled. Its CLAS pages inherit its
-        // transition and conservative caster bounds.
-        for page in &mut pages[first_page..] {
-            page.sphere = bounds;
-        }
-        meta[3] = 1 | bricks << 1;
-        Ok(Cluster {
-            span: [
-                stream,
-                (pages.len() - first_page).try_into()?,
-                first_page.try_into()?,
-                primitives,
-            ],
-            sphere: bounds,
-            meta,
-        })
+        Ok(parents)
     }
 }

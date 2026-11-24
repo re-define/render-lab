@@ -28,7 +28,7 @@ flowchart TB
 | 模块 | 输入、职责与去向 |
 | --- | --- |
 | [main](../src/main.rs) · [lib](../src/lib.rs) | 二进制解析参数，从[预设清单](../src/presets.rs)选择场景，启动窗口、benchmark、截图或固定步长录制。库入口导出运行时、渲染和实验模块。 |
-| [engine](../src/engine.rs) · [schedule](../src/engine/schedule.rs) | Engine 持有活动世界和相机，拥有两条工作线程与帧邮箱。Schedule 让同阶段系统并行读世界并按注册顺序提交修改，支持固定或可变步长。 |
+| [engine](../src/engine.rs) · [schedule](../src/engine/schedule.rs) | Engine 持有活动世界和相机，拥有两条工作线程与帧邮箱。Schedule 按显式依赖和 ECS 读写冲突编排每个固定或可变步长阶段。局部姿态用实体 ID 判断冲突，批内并行读快照，提交后再运行消费者。[依赖编译](../src/engine/schedule/plan.rs) · [访问检查](../src/engine/schedule/context.rs) |
 | [scene](../src/scene.rs) · [components](../src/scene/components.rs) · [light](../src/scene/light.rs) | 实体通过 ID 引用网格、材质、蒙皮和父节点。World 校验、迁移和保存场景。components 管理扩展键和类型化运行时值，light 定义光源及其校验。 |
 | [changes](../src/scene/changes.rs) · [incremental](../src/render/scene/incremental.rs) | 实体表在写入时记录 ID 和修改类别。提取器读取自己的游标，通过子节点、关节与 skin 的反向引用，更新快照中受影响的记录。[pages](../src/render/scene/pages.rs) 以 64 个实例为一页做写时复制。[routes](../src/render/scene/routes.rs) 分配稳定模型与材质槽位，并维护普通实例和按原型分组的簇实例。 |
 | [import](../src/import.rs) · [experiments](../src/experiments/mod.rs) | glTF 导入器把资源转换成实体，校验后发布到世界。实验配置根据组件选择 technique、相机、材质程序和模拟系统，也用于恢复存档。 |
@@ -45,9 +45,12 @@ flowchart TB
     snap["Snapshot · 场景、相机、材质注册表"] -->|实例、网格、姿态| geom["geometry · 普通网格与 GPU 蒙皮"]
     snap -->|效果设置与河道网格| effects["effects · 水面重建"]
     snap -->|原型、风姿、屏幕误差| lod["clusters · BVH、DAG 与两阶段 Hi-Z"]
-    geom -->|mesh shader 写入| vis["可见性 ID 与深度"]
-    effects -->|mesh shader 写入| vis
-    lod -->|mesh shader 写入| vis
+    geom -->|普通网格 ID 与深度| opaque["不透明三角光栅"]
+    effects -->|效果几何 ID 与深度| opaque
+    lod -->|主轮与恢复三角簇| opaque
+    lod -->|合并的砖任务| bricks["末尾体素光栅 · 计算或 mesh shader"]
+    opaque -->|完整三角深度与 ID| bricks
+    bricks -->|保留三角或更新为体素命中| vis["最终可见性 ID 与深度"]
     vis -->|像素归属| bins["visibility · 分类、分配、散射"]
     mat["材质程序、实例表与纹理 atlas"] -->|材质槽与几何地址| bins
     vis -->|重建当前表面| mv["motion · 表面上一帧的位置"]
@@ -79,8 +82,10 @@ flowchart TB
 ~~~mermaid
 flowchart TB
     p["植被、风骨骼及混合三角和体素 DAG"] -->|实例与误差数据| cut["GPU 选簇列表"]
-    cut -->|两阶段 Hi-Z 后的三角簇| v["可见性、深度和材质桶"]
-    cut -->|两阶段 Hi-Z 后的体素簇| bricks["稀疏砖块按深度分桶"]
+    cut -->|主轮与补绘轮的三角簇| tri["不透明三角光栅"]
+    cut -->|两轮共用的砖列表| bricks["末尾体素光栅"]
+    tri -->|全部三角深度| bricks
+    tri -->|初始 ID 与深度| v["可见性、深度和材质桶"]
     bricks -->|逐像素命中面及深度| v
     anim["Motion Matching"] -->|ECS 骨骼姿态| c["蒙皮角色与卡通材质"]
     c -->|当帧几何| v
@@ -103,7 +108,7 @@ flowchart TB
 
 | 实验及入口 | 内部模块如何协作 |
 | --- | --- |
-| [Cluster LOD](../src/experiments/clusters.rs) | [dragons](../src/experiments/clusters/dragons.rs) 创建多龙与普通网格共存的场景。[foliage](../src/experiments/clusters/foliage.rs) 在简化时校正叶片面积。[bvh](../src/experiments/clusters/bvh.rs) 构建 group 层次并打包资源，[voxels](../src/experiments/clusters/bvh/voxels.rs) 比较三角与体素候选的投影覆盖误差。[gpu](../src/experiments/clusters/gpu.rs) 将实例剔除、全局节点列表、cluster 列表、Hi-Z 和 mesh shader 绘制接入 RDG。 |
+| [Cluster LOD](../src/experiments/clusters.rs) | [dragons](../src/experiments/clusters/dragons.rs) 创建多龙与普通网格共存的场景。[foliage](../src/experiments/clusters/foliage.rs) 在简化时校正叶片面积。[bvh](../src/experiments/clusters/bvh.rs) 构建 group 层次并打包资源，[voxels](../src/experiments/clusters/bvh/voxels.rs) 按子几何预算归约混合输入，[层级构建](../src/experiments/clusters/bvh/voxels/levels.rs) 将本轮父簇交给[下一轮分组](../src/experiments/clusters/bvh/voxels/grouping.rs)，[砖布局](../src/experiments/clusters/bvh/voxels/bricks.rs) 把稀疏砖划给共享 LOD 阈值的兄弟父簇。[gpu](../src/experiments/clusters/gpu.rs) 将实例剔除、全局节点列表、cluster 列表、Hi-Z 和 mesh shader 绘制接入 RDG。 |
 | [程序化植被](../src/experiments/vegetation.rs) | [generate](../src/experiments/vegetation/generate.rs) 生成树草网格、天空可见度、骨骼及权重，[landscape](../src/experiments/vegetation/landscape.rs) 生成地面和树冠遮蔽纹理。[river_forest](../src/experiments/vegetation/river_forest.rs) 布置河岸植被，[karst](../src/experiments/vegetation/karst.rs) 构建岩柱、碎石坡及其林地。场景复用 cluster 路径，主线程推进风场时间，GPU 生成骨骼调色板。 |
 | [Motion Matching 参考实现](../src/experiments/motion.rs) · [银狼](../src/experiments/motion/silver.rs) | 参考骨架支持外部剪辑库。银狼用 [locomotion](../src/experiments/motion/silver/locomotion.rs) 推进角色和预测轨迹，用 [search](../src/experiments/motion/silver/search.rs) 按相同归一化特征执行 PCA/KD-tree 或扫描查询。[trajectory_view](../src/experiments/motion/silver/trajectory_view.rs) 将预测轨迹提取并合成到角色画面。 |
 | [流水与破碎消融](../src/experiments/effects.rs) | [water](../src/experiments/effects/water.rs) 把水体采样点的重力和阶面碰撞、法线重建注册为 GPU pass。[fracture](../src/experiments/effects/fracture.rs) 用有封口的 Voronoi 单元分割晶体，ECS 更新碎块变换。消融物体在可见性光栅时裁掉表面，材质按同一个侵蚀场绘制亮边。[river](../src/experiments/effects/river.rs) 维护河道几何和水面反射，与台阶水流分用两套计算着色器。 |
@@ -157,6 +162,6 @@ flowchart TB
 
 森林选簇的 [mega](../src/experiments/clusters/gpu/mega.rs) 将光栅选簇交给原生 AS 构建，[proxy](../src/experiments/clusters/gpu/proxy.rs) 和 [detail](../src/experiments/clusters/gpu/proxy/detail.rs) 生成软件投影几何。两路共享姿态，几何精度与建造成本保留独立对照。[同机位阴影测量](../examples/forest_shadows.rs) · [森林流水录像](../examples/forest_river_film.rs)
 
-主视图的体素分支消费两轮 Hi-Z 输出的砖列表。计算路径负责像素任务分配、深度拒绝和命中竞争，mesh 路径供硬件回退与同列表对照。两条路径共享像素中心射线、DDA、骨骼姿态和物理命中页。最终表面 ID 同时供材质、运动向量与硬件光追使用。[RDG 注册](../src/experiments/clusters/gpu/bricks.rs) · [计算光栅](../shaders/brick_raster.comp) · [数据与测量](procedural-vegetation.md#体素计算光栅)
+主视图的体素分支在两轮 Hi-Z 中追加同一份砖任务列表，等全部不透明三角写完深度后执行一次体素光栅阶段。计算路径负责像素任务分配、深度拒绝和命中竞争，mesh 路径供硬件回退与同列表对照。两条路径共享像素中心射线、DDA、骨骼姿态和物理命中页。最终表面 ID 同时供材质、运动向量与硬件光追使用。[RDG 注册](../src/experiments/clusters/gpu/bricks.rs) · [计算光栅](../shaders/brick_raster.comp) · [混合子簇构建、末尾光栅与测量](nanite-voxel-pipeline.md)
 
 具体算法与测量结果见[架构与帧流程](architecture.md)，修改模块时的约定见[开发规范](../CONTRIBUTING.md)。

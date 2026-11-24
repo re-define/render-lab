@@ -16,13 +16,27 @@
 
 ## 模拟阶段如何读写
 
-`System::access` 声明系统名称以及读取、写入的数据。扩展组件按键区分，局部变换作为一组，可通过具名资源声明全局状态。会增删实体的系统应声明整世界写入。沿用旧接口的插件默认读写整个世界。声明是插件与调度器的约定，新增系统需要覆盖其实际访问。[模拟调度器](../src/engine/schedule.rs)
+新系统实现 `SimulationSystem`。在 `access()` 中分别声明输入和输出。局部变换使用 `LocalTransformsById`，在 `transform_targets()` 中返回本次要读、写的两组实体 ID。扩展组件使用 `Component(key)`，全局资源使用 `Resource(key)`。需要任意实体局部变换的系统可以显式声明整列 `LocalTransform`。若一个系统要读旧值再写新值，需要同时声明读和写。动画、植被风和效果播放都从 `SystemContext` 读取快照并排队提交修改。上下文会检查每次 ECS 访问，越权错误带有系统名、操作和数据名。结构性编辑通过同时声明整世界读写的 `edit_world` 运行。旧的 `System::update(&World, dt) -> Edit` 插件可以继续注册，调度器为这一接口保留整世界独占权限。[访问接口](../src/engine/schedule/context.rs) · [实体绑定与集合求交](../src/engine/schedule/transforms.rs)
 
-`Schedule::add_system` 按注册顺序组建每 tick 运行的阶段。两个系统只读同一数据时可以并行。读写、写读或双写重叠时，新系统开启下一阶段，从而可以读取上一阶段已提交的结果。森林与流水共存时，植被风和河流播放各自更新独立的设置，可以并行。破碎播放会写碎块局部变换，与写骨骼局部变换的角色系统分组执行。控制台输入 `schedule` 可查看分组、读写声明、形成阶段边界的冲突、显式阶段内的冲突及成功提交的步数。[实验安装](../src/experiments/mod.rs) · [效果播放](../src/experiments/effects.rs) · [控制台](../src/console.rs)
+在 `order()` 里注册稳定的 `key`，并用 `after` 引用前驱系统的键，即可表达数据以外的顺序。可以先注册消费者，再注册生产者。场景装配时统一校验未知前驱、重复键、循环以及指向后续时钟阶段的依赖。动态添加系统会使已有计划失效，下次执行前重新编译。早期阶段可以作为后续阶段的前驱；若早期固定时钟本 tick 没有到期，后续阶段读取它上一次提交的结果。需要每个物理子步都更新的动画和物理应放在同一个 `fixed_stage`。[调度计划](../src/engine/schedule/plan.rs) · [场景装配](../src/experiments/assembly.rs)
 
-显式 `stage` 和 `fixed_stage` 保留调用者指定的边界。阶段中所有 `System::update(&World, dt)` 在 Rayon 上并行读取同一份世界，全部成功后才按注册顺序提交返回的 `Edit`。显式安排的两个写者可以从同一个初值计算，此时后注册者的写入最后生效。`fixed_stage` 各自保存固定间隔、时间余量与单 tick 最大子步数。成功提交一个子步才扣除相应余量，计算失败时保留尚未提交的时间。累计时间超过单 tick 上限的部分会舍弃。[阶段行为测试](../tests/framework.rs) · [分组与固定步回放测试](../tests/simulation_schedule.rs)
+编译器先满足显式顺序，再按稳定顺序处理写读、读写及双写冲突，两个读者可以共享快照。局部变换只有在两组 ID 相交且至少一方写入时才产生依赖，读取同一关节的系统可以并行。每个子步从当前场景绑定实体集合。若前面的系统会修改绑定所读的组件或世界结构，调度器先提交那些写入，再解析后续系统的目标。在一次绑定所覆盖的范围内，各系统进入满足前驱约束的最早批次。目标 ID 的顺序和重复项不影响分组，集合不变时复用批次。一个批次内通过 Rayon 并行计算，全部成功后按注册顺序提交；下一批读取刚提交的结果。`stage` 和 `fixed_stage` 指定阶段或时钟边界，其中有冲突的系统会分成多个批次。控制台输入 `schedule` 可以查看每批的系统、读写集合、显式前驱、实际读写的局部变换实体数、冲突的一个实体 ID 和已完成的步数。尚未执行的绑定若依赖上游写入，预览会显示 `pending binding`。[调度执行](../src/engine/schedule.rs) · [控制台](../src/console.rs)
 
-骨骼、角色根节点和碎块使用 `LocalPose` 批量提交局部变换。计算阶段检查整批实体是否存在、矩阵是否有限。提交时按输入顺序更新仍存在的实体，仅把实际变化的行写入 ECS 日志。动作系统通过组件拥有者索引找到播放器，提取器据日志更新受影响的世界变换和蒙皮调色板。回放测试让同一段动作分别使用 1 个和 4 个 worker，分别按每秒 30 帧和 60 帧推进相同的 60 个固定子步，比较整个持久化世界和下一次快照的提取计数。[姿态写入](../src/scene/changes.rs) · [银狼动作更新](../src/experiments/motion/silver.rs) · [回放测试](../tests/simulation_schedule.rs)
+固定阶段累计时间并限制每个 tick 的子步数。若某一批返回错误，当前批次的待写内容丢弃，并回滚本阶段本子步较早批次的 ECS 修改。以前已完成的子步保留，失败子步保留时间余量。普通姿态、组件与运行期资源只为实际修改的目标保留回滚数据；提前提交的整世界闭包需要整世界备份。直接访问的文件、设备和系统私有可变状态由实现者负责。具名运行期资源以 Rust 类型存储，读档后由系统重建；需要保存的状态使用场景组件。[固定步、并行和回滚测试](../tests/simulation_schedule.rs)
+
+森林里的风和流水播放各自推进独立的配置值，可以进入同一 CPU 批次。流水的 GPU 积分仍由 RDG 调度。银狼动作匹配器读取并写入角色根节点和受驱关节，碎块播放读取并写入已装配的碎块实体。两组 ID 分离时两者同批运行。把一个关节重新绑定到碎块时，两个系统分批执行，后一个系统能读到先提交的姿态。通用动作匹配器只写它绑定的骨骼。[银狼与碎块的组合测试](../src/experiments/motion/silver.rs) · [效果播放](../src/experiments/effects.rs) · [植被风](../src/experiments/vegetation.rs)
+
+从引擎根目录运行 `cargo run --release -- --experiment confluence --command schedule`，或在窗口控制台输入 `schedule`。默认组合的同一批次含 `lab.surface-effects`、`lab.vegetation` 和 `lab.silver_wolf.motion`，其中只有银狼系统读写局部变换。固定步回放测试还比较了 1 和 4 个 worker、每秒 30 和 60 次 tick 下的持久化世界与场景提取统计。[组合场景](scene-composition.md) · [回放测试](../tests/simulation_schedule.rs)
+
+### 接入新的模拟系统
+
+| 需求 | 声明方式 |
+| --- | --- |
+| 只更新某批刚体或关节 | 声明写入 `LocalTransformsById`，在 `transform_targets()` 返回这些实体 ID。若模拟会读取它们的旧姿态，同时登记读取并填写读集合。 |
+| 从组件找目标 | 把该组件放入 `access().reads`，通过 `TransformBindings` 查找所属实体并读取绑定。选取器在子步执行前运行，可以读取到此前已提交的组件。 |
+| 动画要消费本子步的物理输出 | 在动画的 `after` 引用物理系统的稳定键，将两者放进同一个 `fixed_stage`。若通过运行期资源交接，两边分别声明同一个 `Resource(key)` 的写和读。 |
+
+通过 `SystemContext::local` 取姿态，通过 `set_pose` 批量登记新姿态。调度器在提交前验证目标 ID 和矩阵。一个批次内共享只读快照，后续批次可以在当前子步读取前一批提交的姿态。[变换绑定](../src/engine/schedule/transforms.rs) · [访问入口](../src/engine/schedule/context.rs) · [固定步与并发回归](../tests/simulation_schedule.rs)
 
 ## 场景数据与资产
 

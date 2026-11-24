@@ -190,6 +190,16 @@ cargo run --release --locked -- --experiment motion --fps 25 --duration 8 --comm
 
 两种查询模式分别录制了这组输入。8 秒内所选片段与样本的切换记录完全一致，两份 MP4 解码后的 200 帧图像哈希逐帧一致。[银狼动作匹配 GIF](../captures/silver-wolf-motion.gif) · [同一段画面的 MP4](../captures/silver-wolf-motion.mp4)
 
+## 在运行时检查调度
+
+窗口控制台中的 `schedule` 显示 CPU 系统批次、显式前驱、局部姿态的实体数及冲突 ID。先运行组合场景可以同屏查看流水、风和银狼的调度。关闭角色图层或加载场景时，装配器按当前组件重新准备调度器。[模拟调度](runtime-and-scene.md#模拟阶段如何读写)
+
+~~~powershell
+cargo run --release --locked -- --experiment confluence --command schedule
+~~~
+
+GPU 侧输入 `timeline frame.json` 导出最近完成帧的物理队列和等待关系。在 Perfetto 查看主视图光栅与 BLAS 构建的重叠时，按 GPU 时间戳区间判断。跨队列重叠时，各 pass 用时之和可能大于整帧 GPU 跨度。窗口帧间隔还包括 CPU 与呈现等待。[同步口径与调试](render-pipeline.md#如何读一帧的报告) · [队列策略对照](forest-architecture-benchmark.md#rdg-屏障与跨队列交接)
+
 ## Cluster LOD 的历史性能基线
 
 在原生窗口运行 `cargo run --release --locked -- --experiment clusters --benchmark 900`，固定相机，预热 60 帧后采样并退出。在 PowerShell 中通过 `$env:RENDER_LAB_WORKERS="1"` 或 `"16"` 对照同一场景的录制开销。性能测量关闭验证层，正确性测试单独启用验证层。
@@ -208,4 +218,4 @@ cargo run --release --locked -- --experiment motion --fps 25 --duration 8 --comm
 
 采用全局列表后，在相同视口、0.25 像素误差、16 个 worker 下对新旧版本各预热 60 帧并采样 300 帧。新路径有 4 轮 BVH 派发，最宽一层有 403 个待处理节点。进入 cluster 测试的条目由 14,479 降至 11,031。两条路径的主阶段均绘制 5,319 个 cluster，各 LOD 三角数一致。剔除相关 pass 的 GPU 耗时之和 P50 从 0.0090 ms 增至 0.0268 ms，整帧 GPU 跨度 P50 分别为 3.491 ms 和 2.972 ms。新图共有 43 个 pass，120 项资源屏障需求合并为 42 次屏障调用，时间线等待为 11 项。
 
-植被体素专题分别给出 Nanite 与 Render Lab 的构建和逐帧光栅流程，附森林轮廓、单桶与四桶对照数据。[构建与光栅化对照](nanite-voxel-pipeline.md)
+植被体素专题分别给出 Nanite 与 Render Lab 的构建和逐帧光栅流程，附源码依据、森林轮廓和各版光栅对照数据。[构建与光栅化对照](nanite-voxel-pipeline.md)

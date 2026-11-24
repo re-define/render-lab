@@ -18,9 +18,11 @@ layout(set=0,binding=9,std430) buffer Dispatch{uvec4 postArgs;};
 #define BRICK_BASE 10
 #endif
 layout(set=0,binding=BRICK_BASE,std430) buffer BrickJobs { uvec4 brickHead; uvec4 brickJobs[]; };
-layout(set=0,binding=BRICK_BASE+1,std430) buffer BrickDispatch { uvec4 binDispatch; uvec4 rasterDispatch; };
-#ifndef SOFTWARE_ONLY
-layout(set=0,binding=BRICK_BASE+2,std430) buffer DepthBins { uint binCount[4]; };
+layout(set=0,binding=BRICK_BASE+1,std430) buffer BrickDispatch { uvec4 brickArgs[]; };
+#ifdef POST
+const uint RECOVERED_JOB=1u;
+#else
+const uint RECOVERED_JOB=0u;
 #endif
 #endif
 
@@ -73,21 +75,17 @@ void main(){
     if ((c.meta.w & VOXEL_CLUSTER) != 0u) {
         uint groups=((c.meta.w>>1u)+7u)/8u;
         atomicAdd(counters[26],c.meta.w>>1u);
-        uint bin=0u,rank=0u;
-#ifndef SOFTWARE_ONLY
-        vec4 center=view.vp*obj.model*vec4(c.sphere.xyz,1.);
-        float nearest=max(0.,center.w-c.sphere.w*obj.params.z);
-        bin=uint(nearest>=32.)+uint(nearest>=96.)+uint(nearest>=256.);
-        rank=atomicAdd(binCount[bin],groups);
-#endif
         uint slot=atomicAdd(brickHead.x,groups);
-        for(uint i=0u;i<groups;i++) brickJobs[slot+i]=uvec4(pair,bin|(8u*i<<2u),rank+i);
-#ifndef SOFTWARE_ONLY
-        PUBLISH_WORK(binDispatch,slot,groups,64u);
-#endif
-#if defined(SOFTWARE_ONLY) || defined(COMPARE)
-        PUBLISH_WORK(rasterDispatch,slot,groups,1u);
-#endif
+        for(uint i=0u;i<groups;i++) brickJobs[slot+i]=uvec4(pair,8u*i,RECOVERED_JOB);
+        // Page only to bound indirect mesh workgroup counts. A reservation
+        // can straddle a page even though all its jobs belong to one cluster.
+        uint job=slot, remaining=groups;
+        while(remaining>0u) {
+            uint page=job/view.screen.w, local=job%view.screen.w;
+            uint n=min(remaining,view.screen.w-local);
+            PUBLISH_WORK(brickArgs[page],local,n,1u);
+            job+=n; remaining-=n;
+        }
         return;
     }
 #endif

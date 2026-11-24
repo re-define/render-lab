@@ -1,12 +1,12 @@
 # Render Lab 开发规范
 
-从引擎根目录运行本文中的命令。项目入口和实验命令见 [README](README.md)，模块职责和依赖见[全引擎模块图](docs/module-map.md)。
+从引擎根目录运行本文中的命令。首次启动见[项目 README](README.md)，各模块契约和实验测量见[文档索引](docs/README.md)。
 
 ## 代码放在哪里
 
 | 改动 | 归属与约定 |
 | --- | --- |
-| 场景数据与模拟 | `scene` 拥有可保存的实体、组件和资产 ID。`engine::Schedule` 内的系统并行读同一阶段的 `World`，返回的 `Edit` 按注册顺序提交。需要固定步长的模拟使用 `fixed_stage`。 |
+| 场景数据与模拟 | `scene` 拥有可保存的实体、组件和资产 ID。新模块实现 `SimulationSystem`，使用 `SystemContext` 按声明读写组件、局部变换和运行期资源。能列举姿态目标时，声明 `LocalTransformsById`，从 `transform_targets()` 分别返回读取和写入的实体 ID。选择目标所读的组件也要登记。需要指定前驱时登记稳定键和 `after`。同一固定子步内有先后关系的系统放进同一个 `fixed_stage`。旧式整世界闭包独占执行。 |
 | 渲染前端 | `render::SceneExtractor` 从 ECS 提取只读快照。材质、几何和灯光程序从快照获取输入。持久数据使用实体或资产 ID，GPU 槽号限于生成它的注册表或帧。 |
 | 实验 | 在 `experiments` 下按研究对象组织。场景构建、控制命令与 GPU 算法各自有明确入口。接入时同时考虑首次创建和从存档恢复。优先复用已有的几何准备、材质注册和后处理入口。 |
 | GPU 资源与同步 | 语义 pass 使用 `Graph::pass_in` 指定稳定统计分类。pass 在 RDG 中声明读写、图像用途、地址表引用和历史资源。RHI 负责 Vulkan 对象、录制、队列同步与资源退役。修改共享资源生命周期时，用至少两个在途帧验证。 |
@@ -41,12 +41,18 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 ~~~
 
-涉及 RDG、shader、RHI、呈现或录制时，在具备项目所需 Vulkan 扩展、窗口环境、测试资产和 FFmpeg 的机器上运行相应集成测试。下面的命令串行运行本构建包含的全部 Rust 测试，包括通常跳过的 GPU 实验。
+涉及 RDG、shader、RHI、呈现或录制时，在具备项目所需 Vulkan 扩展、桌面环境和 FFmpeg 的机器上运行 GPU 集成测试。验证层开启同步校验。NGX 集成用例需要本机装有 SDK 和运行时 DLL，单独关闭验证层运行。
 
 ~~~powershell
 $env:VK_INSTANCE_LAYERS = "VK_LAYER_KHRONOS_validation"
 $env:VK_LAYER_VALIDATE_SYNC = "1"
-cargo test --locked --all-targets -- --include-ignored --test-threads=1
+cargo test --locked --release --all-targets -- --include-ignored --test-threads=1 --skip ngx_resolves_nonempty
+Remove-Item Env:VK_INSTANCE_LAYERS, Env:VK_LAYER_VALIDATE_SYNC
+
+# 配置 NGX SDK 和运行时后执行
+cargo test --locked --release --lib ngx_resolves_nonempty -- --ignored --test-threads=1
 ~~~
 
-涉及高斯打包格式时，在含 NumPy、plyfile 的 Python 环境运行 `python -m unittest discover -s tools -p "test_*.py"`。SDK 功能单独按[后处理文档](docs/viewport-post.md)验证。提交说明写清验证过的路径、已知限制和行为变化。
+NGX 路径和录制依赖的设置见[后处理文档](docs/viewport-post.md)与[实验手册](docs/experiment-guide.md)。
+
+涉及高斯打包格式时，在含 NumPy、plyfile 的 Python 环境运行 `python -m unittest discover -s tools -p "test_*.py"`。提交说明写清验证过的路径、已知限制和行为变化。

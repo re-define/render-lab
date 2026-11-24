@@ -11,14 +11,30 @@ impl LocalPose {
         world: &World,
         transforms: impl IntoIterator<Item = (Id, Mat4)>,
     ) -> Result<Self> {
+        Self::prepare_checked(world, transforms, |_| Ok(()))
+    }
+    pub(crate) fn prepare_checked(
+        world: &World,
+        transforms: impl IntoIterator<Item = (Id, Mat4)>,
+        check: impl Fn(Id) -> Result<()>,
+    ) -> Result<Self> {
         let transforms: Vec<_> = transforms.into_iter().collect();
         for (id, local) in &transforms {
+            check(*id)?;
             anyhow::ensure!(world.entities.contains_key(id), "missing pose entity {id}");
             anyhow::ensure!(local.is_finite(), "non-finite local pose for entity {id}");
         }
         Ok(Self(transforms))
     }
-    /// Preserve input order for duplicate joints. An earlier explicit stage edit may remove a row.
+    pub(crate) fn previous(&self, world: &World) -> Self {
+        Self(
+            self.0
+                .iter()
+                .filter_map(|(id, _)| world.entities.get(id).map(|e| (*id, e.local)))
+                .collect(),
+        )
+    }
+    /// Preserve input order for duplicate joints. An earlier structural edit may have removed a row.
     pub fn apply(self, world: &mut World) {
         for (id, local) in self.0 {
             world.entities.set_local_if_present(id, local);
@@ -220,6 +236,7 @@ impl World {
         key: &'static str,
         value: Value,
     ) -> Option<()> {
+        self.runtime.remove_component(id, key);
         self.entities
             .edit(id, Write::Component(key))?
             .components
