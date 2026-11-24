@@ -25,7 +25,7 @@
 
 | 主题 | 执行流程与算法 |
 | --- | --- |
-| 动画 | [Unreal Animation Framework](unreal-animation-framework.md) · Trait 遍历、姿态采样、同步组、Dead Blending 与 Pose Search |
+| 动画 | [Unreal Animation Framework](unreal-animation-framework.md) · Trait 与姿态求值、Pose Search、精确接触、骨骼重定向、物理反馈 |
 | 物理 | [Chaos 物理与破碎](chaos-physics.md) · CCD、接触有效质量与摩擦、求解岛、破碎与回退 |
 
 ## 专题与测量
