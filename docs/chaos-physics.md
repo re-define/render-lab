@@ -1,132 +1,160 @@
-# Chaos 物理与破碎实现调研
+# Chaos 刚体、碰撞与破碎算法
 
-本文依据 Epic 的 UE 5.8 分支提交 `f97cae4acf019789ed431e0ac28d47e15422784c`，关注世界刚体、碰撞、约束、破碎和动画接入。源码链接需要 Epic GitHub 仓库访问权限。Chaos 还覆盖布料等独立求解器，这里的刚体流程以 `FPBDRigidsEvolutionGBF` 的实现为准。 [Chaos 类型索引][chaos-api] · [刚体求解器 API][solver-api]
+本文沿 UE 5.8 分支的固定提交 `f97cae4acf019789ed431e0ac28d47e15422784c` 追踪世界刚体求解器 `FPBDRigidsSolver` 及其 `FPBDRigidsEvolutionGBF`。接触公式以可直接对照的标量 Gauss–Seidel 路径为准。具体工程可选 SIMD、Partial Jacobi、CCD 模式及不同损伤模型。源码链接需要 Epic GitHub 仓库访问权限。 [求解器 API][rigids] · [求解路径选择][solver-mode]
 
-## 1. 外部对象和内部求解状态
+## 1. 一个物理子步从哪开始
 
-| 部件 | 职责 |
-| --- | --- |
-| Physics Proxy | 隔离游戏线程对象和物理线程粒子。刚体、Geometry Collection、关节等有自己的代理。外部用句柄更新属性，内部以求解器粒子及关联的形状运行。 |
-| `FPBDRigidsSolver` | 管理粒子、约束容器、材质、代理、时间和回调，持有 `FPBDRigidsEvolutionGBF`。负责消费输入和缓冲结果。 |
-| 粒子数据 | `FPBDRigidsSOAs` 组织粒子数据和筛选视图。可动体存质心与惯量、速度、角速度、当前和预测变换。静态或运动学对象为动态体的约束提供边界条件。 |
-| `FChaosMarshallingManager` | 在外部输入与内部求解间用时间戳、物理步编号和前后队列交接。支持收集脏代理、命令及子步数据、回收缓冲和可选历史。 |
-| 外部结果 | 求解器按类型写入脏刚体、Geometry Collection、簇及部分约束的输出。单体代理消费带时间戳的结果，在异步路径有前后记录时可插值。 |
+游戏线程经物理代理提交对象、形状、运动学目标和命令。`FChaosMarshallingManager` 给输入包分配外部时间戳、内部步编号和区间序号。一个外部包可生成多个子步包，将有持续效力的数据传给后续子步。物理线程应用已消费的输入到自己的粒子存储，读取并清除一次冲量项。求解结束后输出带模拟起止时刻和已消费时间戳的脏结果。异步显示可在相邻已发布结果之间插值。游戏线程和求解线程如何交接，与一个求解步内有多少工作任务，是两条独立的调度链。 [推送包与拉取包][marshal] · [输入消费][push-apply] · [结果缓冲][buffer] · [单体代理插值][pull] · [子步设置][substep]
 
-游戏线程与物理求解的异步交接，以及一次求解中工作任务的并行，是两个独立维度。可在保留固定子步和独立约束岛的前提下选择同步提交。 [求解器与任务类型][solver-header] · [输入发布][push] · [输入消费][process] · [带时间戳的数据队列][marshal] · [脏输出打包][buffer] · [单体代理回写与插值][pull]
-
-~~~mermaid
-flowchart TD
-    G["游戏线程 · 输入及脏代理"] -->|时间戳和步编号| P["物理线程 · 应用输入"]
-    P --> I["速度和姿态预测 · 运动学目标"]
-    I --> B["更新空间索引 · 宽相候选"]
-    B --> C["中相、精确接触和 CCD"]
-    C --> D["接触与关节构成约束图"]
-    D --> S["分组求解岛 · Gather / Solve / Scatter"]
-    S --> F["睡眠、破碎、姿态与事件"]
-    F -->|脏结果缓冲| O["游戏线程 · 消费结果和显示插值"]
+~~~text
+消费本步输入
+并行积分动态体，应用运动学目标，更新空间索引
+宽相收集候选，中相管理形状对，窄相计算接触流形
+处理扫掠接触与 CCD
+更新约束图，组装和求解岛
+做求解后的 CCD 校正，处理睡眠与破碎
+捕获所需历史，提交粒子姿态并发布脏结果
 ~~~
 
-## 2. 时钟和线程交接
+实际步骤还穿插回调、图维护、修正与调试采集。下面按有效数据依赖展开。 [Evolution 子步前半][advance] · [求解与收尾][finish]
 
-输入以外部帧和物理子步分别编号。`FChaosMarshallingManager::Step_External` 可以用一次外部提交生成多个子步条目，设置区间索引，并为后续子步复制必要输入。求解任务消费一份带时间戳的推送，应用属性、回调和命令。持续力在覆盖的子步持续生效，一次性冲量应按输入约定只应用一次，运动学目标可随子步分段。子步越小通常越有利于保持堆叠和关节稳定，但会增加碰撞和求解次数。UE 项目设置分别提供最大子步长和数目、异步 tick 及其固定步长。 [输入队列][marshal] · [子步与力的处理][substep] · [Chaos 项目设置][settings]
+## 2. 积分、宽相与 GJK
 
-后端将求解完成的变更存到 pull 记录，标记已消费的外部时间戳及模拟的起止时间。异步游戏线程读到的是已发布的物理结果。插值以该结果的模拟时刻为基准，事件也随物理子步排序。精确查询正在求解的接触或形状，需要使用求解时的物理上下文或从已发布的查询场景查询。 [Pull 数据的时间][marshal] · [消费与时间插值][pull]
+### 2.1 用速度预测质心姿态
 
-## 3. 预测、宽相、中相、窄相与 CCD
+粒子分别保留步初姿态 `X/R` 与预测姿态 `P/Q`。积分在质心空间推进。简化写法是 `v₁ = v₀ + aΔt + Δv_impulse`，角速度同理；清空冲量输入后再应用阻尼、可选陀螺修正和速度上限。预测质心用 `P = X_com + v₁Δt`，`Q` 用角速度积分当前质心旋转。运动学刚体按目标分段推进，作为动态体的移动边界。派生形状姿态和预测 AABB 可沿速度扩张，快速运动的 CCD 体还可生成扫掠包围。 [积分和包围][integrate] · [运动学目标][kinematic]
 
-`AdvanceOneTimeStepImpl` 先积分动态体，处理运动学目标，并维护内部空间加速结构。位置和旋转预测使用当前速度、角速度和施加的力。速度或碰撞厚度可扩张包围盒，运动大的 CCD 物体可用扫掠包围盒。预测让后续阶段在待求解的位姿上查找候选。 [一子步的积分与空间结构][advance-start] · [预测、包围和 CCD 标记][integrate]
+### 2.2 从可能相交的粒子到接触点
 
-| 阶段 | 输入与输出 |
+| 阶段 | 算法与结果 |
 | --- | --- |
-| Broad phase | 按 AABB 查询空间加速结构，收集可能重叠的粒子对。用过滤逻辑和每线程上下文压缩候选，交给对应的粒子对处理中相。 |
-| Mid phase | 管理同一粒子对内的形状对与缓存。遇到复合形状或层级几何时深入其子形状或 BVH，避免组合枚举，也可沿用仍有效的接触对象。 |
-| Narrow phase | 按类型做精确接触，形成接触点、局部锚点、法线和分离距离等流形数据。按配置检查接触流形是否可恢复，否则更新；清理过期的碰撞记录。 |
-| CCD | 筛选需要连续检测的对象及形状对，扫掠查询接触时刻。处理顺序允许在约束图构建前回退碰撞涉及的预测状态，更新接触；求解后还有校正路径。 |
+| 宽相 | 先在内部空间结构查询 AABB 重叠，以粒子状态与过滤条件排除不需检测的对。上下文收集候选，再找或建相应粒子对的 midphase。 |
+| 中相 | 将一个粒子对拆成可能接触的形状对。复合形状可遍历子形状或局部隐式 BVH。按形状对维护窄相缓存，以免每步重建接触对象和稳定摩擦锚点。 |
+| 窄相 | 根据形状组合调用专门的球、胶囊、凸体、三角面等算法。保存形状局部接触点、法线与分离量，重用仍有效的流形，必要时重算。 |
+| CCD 提交 | 对穿越风险较高的形状对，求出扫掠接触时刻及其约束，另交给 CCD manager，之后收敛到常规约束数据。 |
 
-宽相候选是可能接触，流形才为求解器提供实际约束。CCD 的碰撞回退针对当前子步的运动。网络重模拟的回退则从历史步重新运行。 [宽相收集][broad] · [中相与流形恢复][mid] · [形状扫掠][sweep] · [CCD 与约束图的执行顺序][advance-ccd]
+这些阶段有不同工作量指标。宽相增多说明潜在体对增多。稳定接触缓存命中高时，中相对象数与本步实际窄相调用数也可能不同。 [宽相重叠][broad] · [中相的 BVH 分派][mid-bvh] · [复用和更新流形][manifold] · [扫掠接触][swept-contact]
 
-## 4. 约束岛、并行和迭代求解
+**一个可对照的窄相实例。** 球对凸体先把球心变到凸体空间，对凸体与半径为零的球心点做 GJK 距离测试，再把真实球半径计入接触。在常见的分离路径，GJK 用支持点 `S_A(d)−S_B(−d)` 隐式访问 Minkowski 差，通过单纯形上距原点最近的点迭代更新方向，重心坐标也能回推出两形体上的最近点。对球心深埋的情况，这个形状特化会检查凸体平面以构造接触。其他形状对还有自己的流形算法。GJK 扫掠的若干初始重叠路径可调用 EPA 估计分离方向及深度。 [球对凸体分支][sphere-convex] · [GJK 距离算法][gjk] · [扫掠中的 EPA 分支][epa]
 
-1. **建图。** 将当前接触和关节连接到粒子节点。能互相影响的动态体构成岛。一个静态地面或运动学边界可以为多个岛提供约束输入，岛边界以动态可写状态是否相交为准。已有关系会维护和更新，删去约束可能让岛拆分。 [岛管理][island]
-2. **分配工作。** `FPBDIslandGroupManager::BuildGroups` 估计各岛的约束量，按配置可从重到轻分配，将多个小岛合成工作量较均衡的组。独立组能并行；大岛仍可能成为关键路径。源码保留多种执行组织，一条任务式路径先 Gather Bodies，再分批 Gather Constraints，完成并求解后 Scatter Constraints，最后 Scatter Bodies。 [负载分组][groups] · [执行依赖][gather]
-3. **逐阶段求解。** 组从粒子收集求解体与约束数据。`IslandGroupManager` 运行位置、速度以及配置启用的投影阶段。接触位置阶段修正互穿及部分摩擦约束，速度阶段处理相对速度、反弹和摩擦。法向约束单侧生效，接触可推开物体，切向摩擦受法向响应与材质限制。关节约束可限制线性和角向自由度。碰撞容器的投影接口在这条实现中为空。Evolution 可选择 Gauss–Seidel、SIMD Gauss–Seidel 或 Partial Jacobi 等接触求解策略，具体路径依设置。顺序 Gauss–Seidel 处理后续约束时可看到本轮已修正的姿态，有共享刚体的接触不能直接无序并行写同一状态。 [组内阶段][apply] · [碰撞约束求解][collision-solve] · [求解器选择][solver-mode] · [关节和求解变体][chaos-api]
-4. **提交和休眠。** 迭代结束后写回修正结果，仍活跃的接触数据可被下一步沿用。Evolution 在这里处理睡眠和停用，推进簇破碎，按配置捕获回退数据，再发布脏粒子变换。休眠减少参与积分和求解的对象，外力或新接触可唤醒。 [子步收尾][advance-end] · [唤醒和岛更新][island]
+## 3. CCD 怎样处理跨过物体的一步
 
-复现稳定性时应同时记录子步长、迭代数、形状、接触偏移和质量比例。只测一个大堆叠会偏向大岛串行瓶颈，多个独立堆叠才能分辨岛并行及任务分组的成本。
+离散检测只检查步末，薄障碍可能被高速体一步跨过。扫掠检测给出步内归一化的碰撞时刻 TOI。管理器先把共享动态体的扫掠约束组成临时 CCD 岛，再在每岛内按 TOI 升序处理。多次处理路径在最早事件处将相关体推进到碰撞时刻，应用响应，并根据剩余时间重新扫掠受影响的邻接约束。速度或预测终点改变会让后续 TOI 更新，余下事件需要重排。约束有处理次数上限，达到上限时可裁剪相关体的剩余运动。不同 CCD 岛可以并行。设置单次处理时走更简单的循环，后续离散求解负责剩余接触。完成时更新受影响的常规约束，Evolution 在主求解后还可做 CCD 校正。 [CCD 分组及模式][ccd-mode] · [事件顺序与响应][ccd-order] · [重扫并更新 TOI][ccd-resweep] · [Evolution 中的调用][advance-ccd]
 
-## 5. Chaos Destruction
+## 4. 约束岛怎样分工
 
-**离线资产。** Geometry Collection 将预切碎块、每块局部变换、碰撞形状、层级和物性集中起来。编辑器构建 Voronoi 等碎块及邻接关系。运行时由 `FGeometryCollectionPhysicsProxy` 建立粒子和簇。一个完整簇可作为一个活动刚体求解，其质心、惯量和碰撞形状来自成员。层级控制释放粒度，邻接图控制成员断开后哪些片段仍连在一起。 [Geometry Collection 工作流][destruction] · [组件数据][gc-api] · [代理初始化][gc-init] · [质量与簇创建][cluster-create]
+约束图以刚体为节点，以接触或关节为边。共享可写动态体的约束留在一个岛。两个岛可共用只读的静态地面或运动学边界。Island Manager 增量维护图。新边可把已有岛加入合并集，删边后只检查需要分裂的岛，沿剩余边重新找连通分量。这样，静态地面上的多堆物体可分别求解，而相互碰撞的堆会合并。 [岛和运动学边界][island] · [合并及分裂][island-updates]
 
-**运行期。** 子步求解后，`FRigidClustering::AdvanceClustering` 使用碰撞约束累计冲量等数据处理破碎。`ReleaseClusterParticlesImpl` 这条路径以子体内部阈值与碰撞／外部应变比较，按配置传播破损和冲击，释放子体并可为剩余连接部分创建新簇。Physics Fields 也能施加力、锚定或改变可破坏状态。求解器记录每次破碎和实体状态变化，外部消费结果以驱动渲染和效果。每步处理数量可设上限，剩余候选按预算续做。这里的“应变”是可配置的破损度量，具体算法和数据转换由损伤模式决定。 [释放条件与传播][release] · [每步破碎预算][break-budget] · [官方描述][destruction]
+组管理器按约束量划分工作，将许多小岛放入组。任务式路径先 gather bodies，再 gather constraints，之后 solve、scatter constraints、scatter bodies。约束必须等求解体数据准备好，约束写回也可能读取求解体的修正姿态，因此这条路径有对应的依赖。Gauss–Seidel 迭代按顺序用前一条约束的最新修正处理下一条。大岛内若要再并行，必须按不相交体集分批或使用具有独立累积语义的变体。 [组预算][groups] · [任务依赖][gather] · [顺序迭代][group-solve]
 
-**先看现有实验。** Render Lab 已生成 Voronoi 碎片，按播放时间计算弹道、角速度和地板接触下限，再按实体 ID 写局部矩阵。碎片没有互撞求解，溶解属于渲染覆盖。现有几何可以转化为破碎资产的输入，试验中再比较按时间触发和撞击触发的行为。 [现有碎片与弹道][lab-fracture] · [效果播放][lab-playback]
+## 5. 一条接触怎样推出位移、速度与摩擦
 
-## 6. 历史与调试
+以下用一条接触和单位法线 `n` 描述标量路径，选择法线由体 1 指向体 0。忽略可选软层、分离偏移或分裂冲量时，位置算法可直接写成下述式子。 [世界接触与目标速度][contact-gather] · [标量求解器][position]
 
-`FRewindData` 按物理帧和阶段保存用于回退的刚体与关节数据，检查目标是否落在有效历史范围内。重模拟还依赖 marshalling 保留的输入和命令。网络校正时，恢复旧步、应用权威状态并向前重播；显示层可对结果做校正插值。这个机制需要历史内存和重播预算，固定步和排序能减少变化来源，跨机或不同后端的逐位一致仍需单独验证。 [历史捕获入口][rewind-capture] · [回退检查及执行][rewind] · [网络物理文档][network]
+### 5.1 有效质量和位置约束
 
-Chaos Visual Debugger 能录制、回放并检查物理帧及子阶段。对照画面时应能定位对应物理步的输入、活动粒子、碰撞对、接触、岛和破碎事件，调试器可据此区分碰撞漏检、穿透、质量异常、睡眠误判和渲染插值不连续。 [Chaos Visual Debugger][cvd] · [Evolution 的阶段标记][advance-ccd]
+两个形状的局部接触点先变到世界坐标，求解器取共同接触位置，记录从两质心到它的力臂 `r₀,r₁`。沿方向 `d` 的逆有效质量为
 
-## 7. 建议的独立 Rust 刚体模块
+~~~text
+k(d) = inv_m0 + inv_m1
+     + (r0 × d) · inv_I0 (r0 × d)
+     + (r1 × d) · inv_I1 (r1 × d)
+M(d) = 1 / k(d)   # k 足够大时
+~~~
 
-| 边界 | 第一版的实现重点 |
-| --- | --- |
-| 资产与句柄 | 用稳定实体 ID 连接带代际编号的刚体句柄。把碰撞形状、局部形状变换、过滤组、质量、质心及惯量放进物理数据。刚体使用米、秒、千克，单测导入缩放。三角层级与光追 AS 由渲染侧按自己的用途管理。 |
-| 空间查询 | 先接静态地形和运动学胶囊、球、盒及凸体。查询独立发布一份带步号的快照，提供 ray、shape cast、overlap。窄相先用解析几何及凸体配对，最后加入复杂复合几何与 CCD。 |
-| 求解 | 固定步半隐式积分，先做接触与关节。以稳定的体对与形状对 ID 保留流形，记录法向、摩擦、恢复和迭代误差。动态岛并行，岛内可先串行，观测大岛再决定 SIMD、分色或 Jacobi。 |
-| 破碎 | 后续复用现有 Voronoi 资产，加入质量与惯量聚合、局部碎块变换、连接图和分层激活。用代表形状模拟未破坏的簇，破碎时给子体继承父体的线速度和角速度，按已释放质心计算对应速度。 |
-| 验收与观测 | 堆叠比较最大穿透与静止速度；摆锤比较关节误差；高速体比较 CCD 命中；晶体检查破碎顺序、事件、质量和动量误差。量宽／窄相、岛、求解和提交 P95，同时记录活跃体数、候选数、接触数与每岛约束数。 |
+静态／运动学端的不可写自由度不给有效质量贡献。平移相同的两个物体，偏离质心的接触还会引起转动，因此不能只按质量分摊。相同计算也用于切向的两个基向量。 [法向与切向有效质量][mass]
 
-## 8. Render Lab 接入草案
+定义 `Cₙ` 为本轮包含已有修正的法向误差，互穿时为负。方向性累积位置乘子 `λₙ` 的简化更新为
 
-拟用现有 `Schedule::fixed_stage` 作为首先验证的时钟。一个子步先提交角色意图与运动学目标，再让刚体求解拥有该步唯一的物理状态，随后用结果推进动画后处理和姿态发布。不同固定阶段有各自的累计时间，因此互相依赖的步骤放进同一个固定阶段。 [现有固定步及执行][lab-schedule] · [动画输入、姿态与根运动](unreal-animation-framework.md#4-render-lab-接入草案)
+~~~text
+Δλ_raw = −stiffness × M(n) × Cn
+λ_next = max(0, λ_old + Δλ_raw)
+Δλ     = λ_next − λ_old
+~~~
 
-| 子步 | 输入与提交 |
-| --- | --- |
-| 动画前置／运动控制 | 获取已接受的输入、上一物理结果和动画历史，生成胶囊移动或根运动请求。动画试算状态随本子步走，供后置步骤复用。 |
-| 求解 | 消费本子步的命令，推进物理世界，产生带步编号的碰撞查询快照、脏刚体姿态与事件。先实现同步栅栏内的并行岛。需要异步时再引入有界命令队列与已完成区间的结果发布。 |
-| 姿态合成和提交 | 用当前物理结果做 IK 或 ragdoll 混合。物理提交为动态根或碎块提供变换，动画提交负责角色骨骼，每个变换有唯一的发布者。ECS 中若有父节点，按父变换将物理世界姿态换回局部坐标。 |
-| 渲染 | 从已完成的状态生成调色板和实例快照。渲染帧可在两个固定步样本之间插值，瞬移、改绑或重播会使相应历史失效。现有 GPU 蒙皮与运动向量读取实际发布的相邻渲染状态。 |
+体 0 加 `inv_m0 × Δλ n`，体 1 减相应量，角向沿 `inv_I(r × n)` 更新。分离后允许撤销前一轮过大的推出量，累计量仍受单侧约束。举例，两个 1 kg 物体的质心正碰，侵入 2 cm、刚度取 1 且忽略其他选项时，逆有效质量是 2，计算出的修正令双方沿法线各移动 1 cm。多接触时误差会受相邻约束后续修正影响，需多轮迭代。 [位置推出与单侧截断][position] · [推出作用到位姿][pos-apply]
 
-现有 ECS 回滚只还原已登记的可撤销编辑。拟将求解输出和事件先暂存，在子步成功后发布；有状态求解器的私有粒子、缓存和时间必须有可回滚的提交边界。碰撞条件依赖物理资源顺序，姿态写回再按实际实体范围声明。同一子步失败后重试时，冲量、触发和破碎事件需要按步号去重。 [模拟调度与回滚][lab-runtime]
+### 5.2 静摩擦、先前锚点与摩擦锥
 
-建议先用碰撞、台阶和堆叠场景核对固定步与查询，再接现有晶体破碎，然后接银狼根运动、脚部放置和 ragdoll。等同步执行的行为可回放确认后，再决定异步物理线程、重模拟、车辆和布料的实现边界。
+接触可保留上一时刻的局部锚点以估计沿切面的偏移，缺少可靠锚点时可以按相对接触速度乘 `Δt` 估计。位置阶段先算法向，再沿两个切向求校正，比较累计切向量和 `μ_s × λ_normal` 的界限。超过静摩擦界限时，沿原切向方向缩放到动摩擦界限 `μ_d × λ_normal`。实现还包含最小摩擦基准和仅在最后若干位置迭代启用摩擦的设置。 [摩擦锚点][contact-gather] · [摩擦锥裁剪][cone] · [摩擦迭代设置][iterations]
 
-[chaos-api]: https://dev.epicgames.com/documentation/unreal-engine/API/Runtime/Chaos?application_version=5.8
-[solver-api]: https://dev.epicgames.com/documentation/unreal-engine/API/Runtime/Chaos/FPBDRigidsSolver_1?application_version=5.8
-[settings]: https://dev.epicgames.com/documentation/en-us/unreal-engine/physics-settings-in-the-unreal-engine-project-settings?application_version=5.8
+### 5.3 重建速度，再求反弹和动摩擦
+
+位置迭代后，速度阶段先把实际用于速度重建的已累积位移除以 `Δt` 加入速度，角速度同理，分裂冲量修正可被扣除。接触相对速度取 `v₀ + ω₀×r₀ − v₁ − ω₁×r₁`。若初始撞击速度越过恢复阈值，目标法向速度为 `−e × v_initial_normal`，否则为 0。将 `uₙ` 记为当前相对法向速度，`u_target` 为目标速度，`jₙ` 为本步累计法向速度冲量。位置阶段已推开的量折算为 `j_pos` 后，标量速度修正可写为
+
+~~~text
+Δj_raw = −stiffness × M(n) × (u_n − u_target)
+j_next = max(min(0, −j_pos), j_old + Δj_raw)
+Δj     = j_next − j_old
+~~~
+
+其中 `j_pos = (λ_hard + λ_soft)/Δt`。这个下限允许速度阶段抵消位置修正造成的多余分离速度。切向动摩擦预算也以位置和速度的合计法向贡献为基础，并判断已有切向位置修正占了多少预算。 [重建隐式速度][implicit-phase] · [速度公式][implicit] · [恢复目标][contact-gather] · [冲量截断和摩擦][velocity] · [接触速度循环][velocity-loop]
+
+### 5.4 关节的锚点与角度限制
+
+点关节先把双方局部连接点转到世界空间，形成三维误差 `C = anchor₁−anchor₀`。两个动态体的标量 C++ 路径构造两侧 3×3 响应矩阵 `K₀,K₁`，各自包含逆质量和力臂引起的转动。用 `Δp = stiffness × (K₀+K₁)⁻¹ C` 得到修正，分别施加相反的线向与角向改变量。点关节两侧都能施力，所以这里没有接触法线的单侧截断。 [关节阶段][joint] · [双动态体点约束][joint-point]
+
+角约束用双方连接坐标系求相对旋转。Twist 限位取绕关节轴的角度，仅修正超出 ±上限的部分，负侧超限时翻转修正轴。Swing 可从两个方向的上限构造椭圆锥，只修正偏出该锥的角度。软限制还使用刚度、阻尼和累计乘子。投影阶段用于支持它的约束类型，标量碰撞容器的投影接口为空。 [Twist 与 Swing 限位][joint-angular] · [接触容器的投影接口][projection]
+
+## 6. 破碎怎样从一个刚体变成多个
+
+Geometry Collection 在运行前提供碎片、局部变换、形状和碎片层级。连接图可由资产提供，也可按配置用形状近邻或 Delaunay 邻域建立，再按包围和连接条件筛选。未断开的父簇作为一个活动刚体。成员的质量与质心先换到父空间，质心是质量加权平均。惯量先旋转到同一坐标系，再按平行轴定理叠加到共同质心，即各子体贡献为 `Rᵢ Iᵢ Rᵢᵀ + mᵢ (‖rᵢ‖² E − rᵢrᵢᵀ)`。这里 `rᵢ` 是子质心相对父质心的偏移，`E` 是单位矩阵。最后对角化得到主惯量与惯量旋转。 [Geometry Collection 流程][destruction] · [连接图选项][connections] · [父空间质量聚合][cluster-mass] · [质心和惯量合并][mass-combine]
+
+在一次主求解后，聚类阶段可将碰撞累计冲量转成作用于簇成员的损伤指标，也可接收场输入。`ReleaseClusterParticlesImpl` 对子体比较 `max(碰撞指标, 外部应变) ≥ 内部阈值`。满足条件的孩子从父节点释放，记录破碎事件。一种传播使用断裂后剩余应变，另一种按冲击因子传播未断裂的响应。断开后按配置清理连接并检查仍关联的子集，可以为仍相连的块生成新簇。该过程受每步破碎预算约束。阈值与冲量属性是资产和损伤模式的一部分。 [碰撞冲量累积路径][impact] · [释放条件][release] · [传播与后续连通性][propagate] · [每步阈值与预算入口][break-budget]
+
+## 7. 历史回退与可观察结果
+
+步末统一处理岛休眠、失活和新碎片，将脏粒子排入发布。`FRewindData` 按帧与阶段记录所需物理状态，检查目标帧与缓存范围。重模拟从历史帧恢复状态，应用校正并重播之后输入，因而还要保留对应的推送包。相比 CCD 的步内 TOI，网络重播依赖跨步历史和输入。Chaos Visual Debugger 则能记录碰撞、求解和其他阶段供回放检查。观察堆叠时可分别查看候选对、最终流形、岛大小、位置迭代、速度迭代和破碎输出，找到最先偏离预期的步骤。 [步末提交][finish] · [历史范围及恢复][rewind] · [网络重模拟][network] · [Chaos Visual Debugger][cvd]
+
+[rigids]: https://dev.epicgames.com/documentation/unreal-engine/API/Runtime/Chaos/FPBDRigidsSolver_1?application_version=5.8
 [substep]: https://dev.epicgames.com/documentation/en-us/unreal-engine/physics-sub-stepping-in-unreal-engine?application_version=5.8
 [destruction]: https://dev.epicgames.com/documentation/en-us/unreal-engine/destruction-overview?application_version=5.8
-[gc-api]: https://dev.epicgames.com/documentation/unreal-engine/API/Runtime/GeometryCollectionEngine/UGeometryCollectionComponent?application_version=5.8
-[cvd]: https://dev.epicgames.com/documentation/en-us/unreal-engine/chaos-visual-debugger-in-unreal-engine?application_version=5.8
 [network]: https://dev.epicgames.com/documentation/en-us/unreal-engine/networked-physics-overview?application_version=5.8
-[solver-header]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Public/Chaos/Framework/PhysicsSolverBase.h#L108-L250
-[push]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/PBDRigidsSolver.cpp#L1500-L1620
-[process]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/PBDRigidsSolver.cpp#L1974-L2180
+[cvd]: https://dev.epicgames.com/documentation/en-us/unreal-engine/chaos-visual-debugger-in-unreal-engine?application_version=5.8
 [solver-mode]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/PBDRigidsEvolutionGBF.cpp#L503-L527
 [marshal]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/ChaosMarshallingManager.cpp#L42-L136
+[push-apply]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/PBDRigidsSolver.cpp#L1974-L2180
 [buffer]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/PBDRigidsSolver.cpp#L2996-L3126
 [pull]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/PhysicsProxy/SingleParticlePhysicsProxy.cpp#L272-L408
-[advance-start]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/PBDRigidsEvolutionGBF.cpp#L529-L661
-[integrate]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/PBDRigidsEvolutionGBF.cpp#L868-L1048
-[advance-ccd]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/PBDRigidsEvolutionGBF.cpp#L659-L760
-[advance-end]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/PBDRigidsEvolutionGBF.cpp#L765-L829
-[broad]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Collision/SpatialAccelerationBroadPhase.cpp#L17-L152
-[mid]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Collision/ParticlePairMidPhase.cpp#L471-L567
-[sweep]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Collision/ParticlePairMidPhase.cpp#L572-L682
+[advance]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/PBDRigidsEvolutionGBF.cpp#L529-L723
+[finish]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/PBDRigidsEvolutionGBF.cpp#L729-L829
+[integrate]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/PBDRigidsEvolutionGBF.cpp#L906-L1048
+[kinematic]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/PBDRigidsEvolutionGBF.cpp#L1080-L1264
+[broad]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Collision/SpatialAccelerationBroadPhase.cpp#L17-L153
+[mid-bvh]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Collision/ParticlePairMidPhase.cpp#L1308-L1452
+[manifold]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Collision/ParticlePairMidPhase.cpp#L471-L567
+[swept-contact]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Collision/ParticlePairMidPhase.cpp#L572-L682
+[sphere-convex]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Collision/SphereConvexContactPoint.cpp#L45-L115
+[gjk]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Public/Chaos/GJK.h#L2086-L2170
+[epa]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Public/Chaos/GJK.h#L1795-L1899
+[ccd-mode]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/CCDUtilities.cpp#L100-L135
+[ccd-order]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/CCDUtilities.cpp#L517-L624
+[ccd-resweep]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/CCDUtilities.cpp#L640-L752
+[advance-ccd]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/PBDRigidsEvolutionGBF.cpp#L655-L760
 [island]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Island/IslandManager.cpp#L1637-L1735
+[island-updates]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Island/IslandManager.cpp#L2065-L2268
 [groups]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Island/IslandGroupManager.cpp#L120-L218
 [gather]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Island/IslandGroupManager.cpp#L493-L617
-[apply]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Island/IslandGroupManager.cpp#L259-L290
-[collision-solve]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Collision/PBDCollisionContainerSolver.cpp#L734-L932
-[gc-init]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/PhysicsProxy/GeometryCollectionPhysicsProxy.cpp#L1300-L1450
-[cluster-create]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/PBDRigidClustering.cpp#L233-L332
-[release]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/PBDRigidClustering.cpp#L1109-L1325
+[group-solve]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Evolution/ConstraintGroupSolver.cpp#L422-L437
+[contact-gather]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Collision/PBDCollisionContainerSolver.cpp#L74-L177
+[mass]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Public/Chaos/Collision/PBDCollisionSolver.h#L781-L834
+[position]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Public/Chaos/Collision/PBDCollisionSolver.h#L452-L471
+[pos-apply]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Public/Chaos/Collision/PBDCollisionSolver.h#L593-L652
+[cone]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Public/Chaos/Collision/PBDCollisionSolver.h#L487-L534
+[iterations]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Collision/PBDCollisionContainerSolver.cpp#L837-L905
+[implicit-phase]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Evolution/ConstraintGroupSolver.cpp#L465-L476
+[implicit]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Public/Chaos/Evolution/SolverBody.h#L137-L150
+[velocity]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Public/Chaos/Collision/PBDCollisionSolver.h#L660-L737
+[velocity-loop]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Public/Chaos/Collision/PBDCollisionSolver.h#L1151-L1242
+[joint]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Joint/PBDJointSolverGaussSeidel.cpp#L221-L283
+[joint-point]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Joint/PBDJointSolverGaussSeidel.cpp#L1973-L2019
+[joint-angular]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Joint/PBDJointSolverGaussSeidel.cpp#L1595-L1682
+[projection]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/Collision/PBDCollisionContainerSolver.cpp#L734-L767
+[connections]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/PBDRigidClustering.cpp#L2113-L2168
+[cluster-mass]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/PBDRigidClusteringAlgo.cpp#L46-L104
+[mass-combine]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/MassProperties.cpp#L274-L345
+[impact]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/PBDRigidClustering.cpp#L2251-L2381
+[release]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/PBDRigidClustering.cpp#L1165-L1247
+[propagate]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/PBDRigidClustering.cpp#L1257-L1427
 [break-budget]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/Chaos/PBDRigidClustering.cpp#L1656-L1750
-[rewind-capture]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/PBDRigidsSolver.cpp#L1272-L1313
 [rewind]: https://github.com/EpicGames/UnrealEngine/blob/f97cae4acf019789ed431e0ac28d47e15422784c/Engine/Source/Runtime/Experimental/Chaos/Private/RewindData.cpp#L901-L1072
-[lab-fracture]: ../src/experiments/effects/fracture.rs#L164
-[lab-playback]: ../src/experiments/effects.rs#L137
-[lab-schedule]: ../src/engine/schedule.rs#L294
-[lab-runtime]: runtime-and-scene.md#模拟阶段如何读写

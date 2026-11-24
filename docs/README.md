@@ -21,12 +21,12 @@
 | 如何接入 KHR 管线、内联查询或 NV 簇几何 | [光追 RHI 能力矩阵](ray-tracing-rhi.md) |
 | 提交前如何校验代码、资产和 GPU 路径 | [开发与验证规范](../CONTRIBUTING.md) |
 
-## 后续架构调研
+## 虚幻引擎源码调研
 
-| 主题 | 实现与接入草案 |
+| 主题 | 执行流程与算法 |
 | --- | --- |
-| 动画 | [Unreal Animation Framework](unreal-animation-framework.md) · 模块、trait 图、求值程序、Pose Search 与银狼迁移 |
-| 物理 | [Chaos 物理与破碎](chaos-physics.md) · 固定步、线程交接、碰撞、求解岛和角色姿态交接 |
+| 动画 | [Unreal Animation Framework](unreal-animation-framework.md) · Trait 遍历、姿态采样、同步组、Dead Blending 与 Pose Search |
+| 物理 | [Chaos 物理与破碎](chaos-physics.md) · CCD、接触有效质量与摩擦、求解岛、破碎与回退 |
 
 ## 专题与测量
 
