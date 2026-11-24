@@ -3,7 +3,7 @@
 在支持 VK_NV_cluster_acceleration_structure 的设备上运行森林实验。
 
 ~~~powershell
-cargo run --release --locked -- --experiment forest-mega
+cargo run --release --locked -- --experiment gi12-forest --command "vegetation shadows mega" --command "restir gi direct"
 ~~~
 
 `vegetation shadows mega` 选择 NV 簇几何，`vegetation shadows adaptive` 选择近景精细、远景简化的代理几何。`restir rays hardware` 和 `restir rays software` 同时控制 ReSTIR 与 GI 的求交。标准 KHR 与软件模式可遍历同一批代理三角形。选择 Mega 后切到软件模式时使用自适应代理，切回硬件恢复 CLAS。旧命令 `restir proxy-rays` 仍可使用。显式选择的硬件能力缺失时，RHI 会报告错误。[岩柱森林同几何对照](procedural-vegetation.md#岩柱森林的多跳光追)

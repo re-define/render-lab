@@ -1,6 +1,6 @@
 # 实验目录与组合边界
 
-可执行程序提供 20 个命名预设。预设决定怎样构造初始世界，同一套实验设置也可从场景 JSON 恢复。每个预设进入同一个三线程引擎，使用快照、RDG 和 Vulkan 后端。下表中的命令可以在控制台输入，也可通过启动参数 `--command` 传入。[CLI 预设分派](../src/main.rs) · [场景配置与恢复](../src/experiments/mod.rs) · [资产来源与许可](../assets/README.md)
+运行 `cargo run --locked -- --list-experiments` 可列出当前构建中的 20 个命名预设。预设决定怎样构造初始世界，同一套实验设置也可从场景 JSON 恢复。每个预设进入同一个三线程引擎，使用快照、RDG 和 Vulkan 后端。下表中的命令可以在控制台输入，也可通过启动参数 `--command` 传入。[CLI 预设清单与建场函数](../src/presets.rs) · [场景配置与恢复](../src/experiments/mod.rs) · [资产来源与许可](../assets/README.md)
 
 ## 几何、植被和程序化效果
 
@@ -31,18 +31,33 @@
 | `restir` | 在柱廊中从大量点光源抽样。初始 RIS、时空 reservoir 复用和可见性查询输出直接光。系统可选择空间 à-trous 或带重投影、方差估计的 SVGF 风格滤波。 | `restir uniform`、`restir ris`、`restir reuse` 与 `restir reference` 区分估计器。`restir denoise off` 隔离采样误差。运动中的银狼另有专门的重投影对照。[帧图](../src/experiments/restir/graph.rs) · [银狼逐帧误差实验](lighting-comparison.md) |
 | `ibl` | 从 Studio Small 02 HDR 环境图烘焙漫反射辐照度、分粗糙度的 GGX 预过滤环境和 BRDF LUT。材质用 split-sum 合成环境反射，球阵改变金属度和粗糙度。 | `ibl yaw 90` 转动环境。烘焙在启动时进行并在进程内复用，显式表面反射射线另由 RT 实验研究。[环境预计算](../src/experiments/ibl/bake.rs) · [材质输入与控制](../src/experiments/ibl.rs) |
 | `gi12-forest`、`gi12-silver` | 在风动森林和运动角色上组合 ReSTIR DI、固定分辨率屏幕探针与世界辐亮度缓存。漫反射命中点用 UV 采样材质定义的 GI 反射色和自发光。延迟的第二跳辐亮度反馈给缓存。 | `restir gi direct`、`restir gi single`、`restir gi multi` 比较直接光、单跳与两跳。实现范围是 GI-1.2 的漫反射缓存思路，当前反弹深度为两跳。[传播机制、画面与限制](gi12.md) |
-| `forest-mega` | 复用 `gi12-forest` 世界，启动时选择直接光和 Mega Geometry。主视图按屏幕误差选中的簇与可能投影进来的屏外簇，在 GPU 上应用风姿态，生成 CLAS、聚合 Cluster BLAS，再与普通网格汇入 TLAS。 | 需 NVIDIA 的 `VK_NV_cluster_acceleration_structure` 与原生 RT。`vegetation shadows adaptive` 选择近远代理，`restir rays software` 切换软件遍历。硬件实验按实例、簇和几何版本复用 CLAS，每帧提交当前选簇的地址与 LOD 覆盖。专题列出缓存与强制重建对照。[实测、回归与复拍](forest-mega.md) |
 | `forest-karst` | 用岩柱、碎石坡与混交林研究薄叶逆光和树冠内外亮度。默认开启 ReSTIR DI、GI-1.2 两跳漫反射、自适应代理的硬件光追和 TAA。 | `vegetation camera karst` 与 `vegetation camera karst-grove` 复拍俯视和谷内机位。`restir rays software`、`restir rays hardware` 切换场景射线后端。[机位与实验图](procedural-vegetation.md#岩柱森林的树冠受光) · [同路径光追开销](procedural-vegetation.md#岩柱森林的多跳光追) |
+
+## 森林的 Mega Geometry 对照
+
+旧入口 `forest-mega` 与 `gi12-forest` 使用同一个建场函数。复现原先的默认画面时，先选择簇投影再选择仅直接光。几何、机位、资产和存档组件沿用同一套定义。需要支持 NV 簇加速结构的设备。[硬件阴影与原始录像](forest-mega.md)
+
+~~~powershell
+cargo run --release --locked -- --experiment gi12-forest --command "vegetation shadows mega" --command "restir gi direct"
+~~~
 
 ## 组合与默认场景
 
 `mixed` 在 ReSTIR 柱廊中同时启用 IBL 和 ReSTIR，将两路贡献交给同一套 PBR、Toon 材质分桶。对照程序固定材质、相机和几何，分别保留环境光、直接光或两者。[场景构造](../src/experiments/mixed.rs) · [三组同机位图](lighting-comparison.md)
 
-`confluence` 将树林、台阶流水和银狼合入一个世界。普通几何、蒙皮、水和簇写同一份可见性与深度。时域消费者按需共享表面运动，流水反射、植被大气和卡通覆盖在相应模块启用时追加。控制台 `feature water off` 会保留石阶并停用水带，`feature restir off` 会去掉直接光生产者。可开关的五层是 `forest`、`water`、`actor`、`ibl` 和 `restir`。组合设置、实例显隐与模拟状态存在场景，切换时保留当前相机。当前建场把森林和台阶等静态布景的已知资产引用重新映射到角色世界。该合并函数只接受扁平、无蒙皮与动画的布景，角色骨架和层级保留在原世界。[建场与 ID 重映射](../src/experiments/composition/scene.rs)[组合与测量](scene-composition.md)
+`confluence` 将树林、台阶流水和银狼合入一个世界。普通几何、蒙皮、水和簇写同一份可见性与深度。时域消费者按需共享表面运动，流水反射、植被大气和卡通覆盖在相应模块启用时追加。控制台 `feature water off` 会保留石阶并停用水带，`feature restir off` 会去掉直接光生产者。可开关的五层是 `forest`、`water`、`actor`、`ibl` 和 `restir`。组合设置、实例显隐与模拟状态存在场景，切换时保留当前相机。当前建场把森林和台阶等静态布景的已知资产引用重新映射到角色世界。该合并函数只接受扁平、无蒙皮与动画的布景，角色骨架和层级保留在原世界。[建场与 ID 重映射](../src/experiments/composition/scene.rs) · [组合与测量](scene-composition.md)
 
 省略 `--experiment` 会打开默认的 PBR 与 Toon 演示。`--scene` 可打开普通 glTF、GLB 或已保存的引擎 JSON。`--experiment clusters --scene FILE` 额外准备簇几何。`toon` 对自定义 glTF 还要求能找到约定的头节点与面部材质。[启动分派](../src/main.rs) · [卡通配置](../src/experiments/cartoon.rs)
 
 组合器依据已有组件键组装几何、覆盖和光照。光照注册表目前提供直接光与环境光两个主通道，每个通道只接受一个生产者。GI 间接漫反射作为光照贡献的附加资源，部分自定义材质按程序名接收它。独立 GI、阴影、主射线、神经纹理和高斯实验在场景配置中另选专用 Technique。将这些实验接入 `confluence` 时，还需要明确贡献的阶段、资源和材质消费者。[光照贡献契约](../src/experiments/light_stack.rs) · [组合适配](../src/experiments/composition.rs) · [专用路径选择](../src/experiments/mod.rs)
+
+## 替换实验模块
+
+- **模拟**。实现 `engine::System`，调用 `Schedule::stage` 或 `Schedule::fixed_stage` 注册。同阶段的系统读取同一个世界快照，返回编辑操作，按注册顺序提交。需要消费上一阶段结果的物理、约束或动画系统放入后续阶段。系统内部也可以使用 Rayon 并行处理实体。
+- **渲染**。实现 `render::Technique`，从 `Snapshot` 构建 `rdg::Graph`。仅替换几何选择时可实现 `GeometrySelection` 并复用 `VisibilityRenderer`。新增 compute/graphics pass 可提供自己的 SPIR-V 与资源绑定。示例中的 GPU 压紧与间接绘制经过普通 RDG 接口。
+- **同步**。按资源生产、消费的顺序声明 pass，可以额外声明 `after` 边。编译器检查未初始化读取、非法用途和环，追踪 RAW、WAR、WAW，以及颜色与深度图像布局。同一访问阶段的连续读取共享同步。后端把一个 pass 前的 buffer 依赖合成一个内存屏障，连同图像转换一次下发 `vkCmdPipelineBarrier2`。当前粒度是整项资源。
+- **实体**。`World` 使用稳定 ID 关联资产、节点和实例。网格顶点流、meshlet、分层加速数据、边面拓扑、材质路径、描边、骨骼绑定和扩展组件可以组合。大块几何与图像通过 Arc 共享。新系统的命名空间组件可存入 `Entity::components` 并随场景往返。
+- **导入与存档**。glTF 节点、共享图元、基础色纹理和材质、皮肤以及动画轨道转换为实体。三角形列表、条带和扇形统一成三角形列表。存档带版本号，加载时校验引用与层次，保存时原子替换文件。导入失败时保留原有世界。当前材质预览着重基础色、金属度和粗糙度，动画实验的动作库采用下面的固定采样格式。
 
 ## 运行、离线工具与证据
 

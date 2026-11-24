@@ -181,7 +181,7 @@ cargo run --locked --release --example forest_shadows -- target/forest-reference
 
 叶片着色法线向局部天空可见度增大的方向弯曲，保留细叶本身的朝向差异。ReSTIR 候选权重和可见光照对薄叶使用同一套双面反射与透射近似，方向光与有角半径的太阳都可照亮背光叶片。冠内对天空补光的衰减来自静息姿态的遮蔽烘焙。参考用的树木仍有四种几何原型，岩缝深处的环境遮蔽也受半球近似限制。[树冠烘焙](../src/experiments/vegetation/generate/exposure.rs) · [薄叶响应](../shaders/leaf_light.glsl) · [阴影与透射](../shaders/restir_visibility.glsl)
 
-从引擎根目录复拍总览。控制台 `vegetation camera karst-grove` 切换到谷内机位。两张图均停风并预热 18 帧。原森林的近景对照使用 `forest-mega`、`vegetation camera near`、同一组灯和 800×500 分辨率，停风、关闭后处理并预热 12 帧。以截图左上角为原点，云杉冠内 `x=[400,480), y=[160,300)` 的显示亮度中位数从 5.1 变为 41.3。亮度按 8 位截图 RGB 的 0.2126、0.7152、0.0722 权重计算。[总览](../captures/forest-karst/overlook.png) · [谷内](../captures/forest-karst/grove.png) · [同机位改前与改后](../captures/forest-karst/meadow-comparison.png)
+从引擎根目录复拍总览。控制台 `vegetation camera karst-grove` 切换到谷内机位。两张图均停风并预热 18 帧。原森林的近景对照使用 `gi12-forest` 的 Mega Geometry 直接光配置、`vegetation camera near`、同一组灯和 800×500 分辨率，停风、关闭后处理并预热 12 帧。以截图左上角为原点，云杉冠内 `x=[400,480), y=[160,300)` 的显示亮度中位数从 5.1 变为 41.3。亮度按 8 位截图 RGB 的 0.2126、0.7152、0.0722 权重计算。[总览](../captures/forest-karst/overlook.png) · [谷内](../captures/forest-karst/grove.png) · [同机位改前与改后](../captures/forest-karst/meadow-comparison.png)
 
 ~~~powershell
 cargo run --release --locked -- --experiment forest-karst --command "vegetation wind 0" --command "restir gi direct" --command "restir rays software" --size 1600x660 --warmup 18 --capture captures/forest-karst/overlook.png

@@ -108,8 +108,8 @@ impl Graph {
             Op::BuildBlas {
                 vertices,
                 indices,
+                topology,
                 output,
-                ..
             } => {
                 let Some(AccelerationShape::Triangles { count, vertices: n }) =
                     acceleration(output)
@@ -125,6 +125,7 @@ impl Graph {
                     "invalid ray geometry streams"
                 );
                 ensure!(!defined[output.0], "duplicate BLAS build");
+                ensure!(fits(topology, 1), "invalid BLAS topology version buffer");
             }
             Op::BuildTlas {
                 ref instances,
@@ -156,11 +157,24 @@ impl Graph {
                 );
             }
             Op::TraceRays {
-                tlas, ref blases, ..
-            } => ensure!(
-                tlas_sources.get(&tlas) == Some(&blases.iter().copied().collect()),
-                "ray trace must declare all referenced BLAS"
-            ),
+                tlas,
+                ref blases,
+                ref program,
+                ..
+            } => {
+                ensure!(
+                    tlas_sources.get(&tlas) == Some(&blases.iter().copied().collect()),
+                    "ray trace must declare all referenced BLAS"
+                );
+                ensure!(
+                    program.shader.supports_clusters()
+                        || !blases.iter().any(|&r| matches!(
+                            acceleration(r),
+                            Some(AccelerationShape::ClusterBottom { .. })
+                        )),
+                    "tracing a cluster BLAS requires a cluster-capable ray pipeline"
+                );
+            }
             Op::Dlss(dlss) => {
                 let source = |format| {
                     Some(ImageDesc {
@@ -318,5 +332,75 @@ impl Storage {
                 Access::AccelerationWrite | Access::AccelerationRead | Access::RayAcceleration
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_pipeline_must_support_the_referenced_cluster_bottom() {
+        let mut graph = Graph::new([1, 1]);
+        let bottom = graph.resource(
+            "cluster BLAS",
+            Storage::Acceleration(AccelerationShape::ClusterBottom { count: 1 }),
+        );
+        let tlas = graph.resource(
+            "TLAS",
+            Storage::Acceleration(AccelerationShape::Instances { count: 1 }),
+        );
+        let mut sources = BTreeMap::from([(tlas, BTreeSet::from([bottom]))]);
+        for shader in [
+            Shader::RayTracing(&[], &[], &[]),
+            Shader::ClusterShadows(&[], &[], &[]),
+        ] {
+            let index = graph.pass(
+                "probe",
+                Op::TraceRays {
+                    extent: [1, 1],
+                    tlas,
+                    blases: vec![bottom],
+                    program: Dispatch {
+                        shader,
+                        bindings: vec![],
+                        push: vec![],
+                    },
+                },
+            );
+            let result = graph.validate_pass(&graph.passes[index], &[true; 2], &mut sources);
+            assert_eq!(result.is_ok(), shader.supports_clusters());
+        }
+    }
+
+    #[test]
+    fn blas_version_must_reference_a_buffer_before_preparing_the_frame() {
+        let mut graph = Graph::new([1, 1]);
+        let vertices = graph.input("vertices", vec![0; 96]);
+        let indices = graph.input("indices", vec![0; 12]);
+        let output = graph.resource(
+            "BLAS",
+            Storage::Acceleration(AccelerationShape::Triangles {
+                count: 1,
+                vertices: 3,
+            }),
+        );
+        graph.pass(
+            "build",
+            Op::BuildBlas {
+                vertices,
+                indices,
+                topology: Resource(usize::MAX),
+                output,
+            },
+        );
+        assert!(
+            graph
+                .compile()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("topology")
+        );
     }
 }

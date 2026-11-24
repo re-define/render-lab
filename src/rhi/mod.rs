@@ -349,16 +349,24 @@ impl Backend {
                 _ => vec![],
             })
             .collect();
-        if graph
-            .passes
-            .iter()
-            .any(|pass| matches!(pass.op, Op::Dlss(_)))
-        {
-            ensure!(
-                g.ngx.is_some(),
-                "{}",
-                g.dlss_unavailable.as_deref().unwrap_or("DLSS unavailable")
-            );
+        for pass in &graph.passes {
+            match &pass.op {
+                Op::TraceRays {
+                    extent, program, ..
+                } => {
+                    g.ray
+                        .as_ref()
+                        .context("RT experiment requires VK_KHR_ray_tracing_pipeline")?
+                        .validate_dispatch(*extent, program.shader, &g.limits)
+                        .with_context(|| format!("ray pass {}", pass.name))?;
+                }
+                Op::Dlss(_) => ensure!(
+                    g.ngx.is_some(),
+                    "{}",
+                    g.dlss_unavailable.as_deref().unwrap_or("DLSS unavailable")
+                ),
+                _ => {}
+            }
         }
         ensure!(
             ray_vertices.is_empty() || g.ray.is_some(),
@@ -699,20 +707,6 @@ impl Backend {
                 if let std::collections::hash_map::Entry::Vacant(e) = self.pipes.entry(key) {
                     e.insert(Pipeline::new(g, d, slot.heap.stride)?);
                 }
-            }
-            if let Op::TraceRays { extent: [w, h], .. } = p.op {
-                let props = &g
-                    .ray
-                    .as_ref()
-                    .context("RT experiment requires VK_KHR_ray_tracing_pipeline")?
-                    .pipeline;
-                ensure!(
-                    w > 0
-                        && h > 0
-                        && u64::from(w) * u64::from(h)
-                            <= u64::from(props.max_ray_dispatch_invocation_count),
-                    "ray dispatch exceeds device limits"
-                );
             }
             if let Op::Compute { groups, .. } = p.op {
                 ensure!(

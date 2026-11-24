@@ -4,6 +4,34 @@ use vulkanalia::vk::{
     KhrAccelerationStructureExtensionDeviceCommands, KhrRayTracingPipelineExtensionDeviceCommands,
 };
 
+impl device::RayProperties {
+    pub(super) fn validate_dispatch(
+        &self,
+        extent: [u32; 2],
+        shader: Shader,
+        limits: &vk::PhysicalDeviceLimits,
+    ) -> Result<()> {
+        ensure!(
+            !shader.supports_clusters() || self.clusters.is_some(),
+            "cluster ray pipeline requires VK_NV_cluster_acceleration_structure"
+        );
+        for (axis, size) in extent.into_iter().enumerate() {
+            let maximum = u64::from(limits.max_compute_work_group_count[axis])
+                * u64::from(limits.max_compute_work_group_size[axis]);
+            ensure!(
+                size > 0 && u64::from(size) <= maximum,
+                "ray dispatch axis {axis} size {size} outside 1..={maximum}"
+            );
+        }
+        ensure!(
+            u64::from(extent[0]) * u64::from(extent[1])
+                <= u64::from(self.pipeline.max_ray_dispatch_invocation_count),
+            "ray dispatch exceeds device invocation limit"
+        );
+        Ok(())
+    }
+}
+
 pub(super) struct Acceleration {
     gpu: Arc<Gpu>,
     pub raw: vk::AccelerationStructureKHR,
@@ -319,5 +347,36 @@ impl ShaderTable {
     ) {
         let [rgen, miss, hit] = &self.regions;
         device.cmd_trace_rays_khr(cmd, rgen, miss, hit, &Default::default(), width, height, 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_dispatch_checks_optional_cluster_feature_axes_and_invocations() {
+        let limits = vk::PhysicalDeviceLimits {
+            max_compute_work_group_count: [2, 3, 1],
+            max_compute_work_group_size: [4, 2, 1],
+            ..Default::default()
+        };
+        let mut caps = device::RayProperties {
+            pipeline: vk::PhysicalDeviceRayTracingPipelinePropertiesKHR {
+                max_ray_dispatch_invocation_count: 32,
+                ..Default::default()
+            },
+            acceleration: Default::default(),
+            clusters: None,
+        };
+        let plain = Shader::RayTracing(&[], &[], &[]);
+        let cluster = Shader::ClusterRays(&[], &[], &[], &[]);
+        assert!(caps.validate_dispatch([8, 4], plain, &limits).is_ok());
+        for size in [[9, 1], [1, 7], [8, 5], [0, 1]] {
+            assert!(caps.validate_dispatch(size, plain, &limits).is_err());
+        }
+        assert!(caps.validate_dispatch([1, 1], cluster, &limits).is_err());
+        caps.clusters = Some(Default::default());
+        assert!(caps.validate_dispatch([1, 6], cluster, &limits).is_ok());
     }
 }

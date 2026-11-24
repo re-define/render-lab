@@ -27,7 +27,7 @@ flowchart TB
 
 | 模块 | 输入、职责与去向 |
 | --- | --- |
-| [main](../src/main.rs) · [lib](../src/lib.rs) | 二进制解析参数、选择场景，启动窗口、benchmark、截图或固定步长录制。库入口导出运行时、渲染和实验模块。 |
+| [main](../src/main.rs) · [lib](../src/lib.rs) | 二进制解析参数，从[预设清单](../src/presets.rs)选择场景，启动窗口、benchmark、截图或固定步长录制。库入口导出运行时、渲染和实验模块。 |
 | [engine](../src/engine.rs) · [schedule](../src/engine/schedule.rs) | Engine 持有活动世界和相机，拥有两条工作线程与帧邮箱。Schedule 让同阶段系统并行读世界并按注册顺序提交修改，支持固定或可变步长。 |
 | [scene](../src/scene.rs) · [components](../src/scene/components.rs) · [light](../src/scene/light.rs) | 实体通过 ID 引用网格、材质、蒙皮和父节点。World 校验、迁移和保存场景。components 管理扩展键和类型化运行时值，light 定义光源及其校验。 |
 | [changes](../src/scene/changes.rs) · [incremental](../src/render/scene/incremental.rs) | 实体表在写入时记录 ID 和修改类别。提取器读取自己的游标，通过子节点、关节与 skin 的反向引用，更新快照中受影响的记录。[pages](../src/render/scene/pages.rs) 以 64 个实例为一页做写时复制。[routes](../src/render/scene/routes.rs) 分配稳定模型与材质槽位，并维护普通实例和按原型分组的簇实例。 |
@@ -141,6 +141,8 @@ flowchart TB
 | [transient](../src/rhi/transient.rs) | 帧内临时缓冲规划按物理队列的最后访问决定哪些逻辑资源可以共用同一个缓冲，交接进入原有的屏障和时间线提交流程。 |
 | [frame](../src/rhi/frame.rs) | Frame、PassReport、FrameProfile 和 FrameMemory 向 UI、benchmark、采集和测试提供统一的完成帧数据。 |
 
+对森林直接光或 GI，`render::rays` 和实验模块选取当帧几何，`rdg` 建立 BLAS、TLAS 与追踪 pass 之间的依赖，`rhi::ray` 创建原生结构、SBT 和派发命令，`rhi::pipeline` 选择并缓存管线，`rhi::clusters` 承担 NV 簇构建。使用普通代理的 KHR 路径和使用选中簇的 NV 路径最终都在 TLAS 上追踪。[森林射线数据流与能力矩阵](ray-tracing-rhi.md)
+
 ## 构建、资产与验证入口
 
 | 入口 | 与运行时的关系 |
@@ -148,7 +150,7 @@ flowchart TB
 | [build.rs](../build.rs) · [shaders](../shaders) · [材质 shader](../shaders/materials) | 在构建时生成 SPIR-V，Rust 各 pass 引用对应产物。构建配置也控制可选 NGX 桥及 Windows 清单。[Windows 清单](../windows.manifest) |
 | [资产清单](../assets/README.md) · [Kimodo 生成](../tools/generate_kimodo.py) · [银狼重定向与烘焙](../tools/bake_silver_wolf.py) · [动作索引](../tools/motion_index.py) | 离线动作、姿态和搜索索引供银狼实验加载。场景、角色和环境资产由相应实验导入或装载。 |
 | [神经纹理训练](../tools/train_texture_grid.py) · [高斯拟合与打包](../tools/gaussian_texture.py) · [剪枝与消融](../tools/gaussian_ablation.py) | 离线工具产生材质解码器消费的载荷。[CUDA 梯度检查](../tools/check_2dgaussian_gradients.cu)和[反向传播补丁](../tools/2dgaussian-backward.patch)对应原高斯训练实现。 |
-| [光照对照](../examples/lighting_comparison.rs) · [森林基准](../examples/vegetation_sweep.rs) · [框架](../tests/framework.rs) · [实验](../tests/experiments.rs) · [导入](../tests/import.rs) · [录制](../tests/recording.rs) | 示例走真实引擎入口采样。集成测试覆盖 API、存档、GPU 结果及录制，[测试目录辅助](../tests/support/mod.rs) 管理临时数据。 |
+| [光照对照](../examples/lighting_comparison.rs) · [森林基准](../examples/vegetation_sweep.rs) · [框架](../tests/framework.rs) · [实验](../tests/experiments.rs) · [导入](../tests/import.rs) · [录制](../tests/recording.rs) | 示例走真实引擎入口采样。集成测试覆盖 API、存档、GPU 结果及录制。导入与录制测试各自创建临时目录。 |
 | [光照 GPU 测试](../src/experiments/lighting/tests.rs) · [WSI 测试](../src/rhi/present/tests.rs) · [高斯解码对照](../tools/test_gaussian_texture.py) | 分别验证照明依赖与像素、交换链呈现与缩放、打包纹素与独立参考结果。其他就地单元测试随所属模块维护。 |
 
 森林选簇的 [mega](../src/experiments/clusters/gpu/mega.rs) 将光栅选簇交给原生 AS 构建，[proxy](../src/experiments/clusters/gpu/proxy.rs) 和 [detail](../src/experiments/clusters/gpu/proxy/detail.rs) 生成软件投影几何。两路共享姿态，几何精度与建造成本保留独立对照。[同机位阴影测量](../examples/forest_shadows.rs) · [森林流水录像](../examples/forest_river_film.rs)

@@ -49,7 +49,7 @@ BVH 解码本场景地砖的速度是扫描的 15.9 倍。tile 以单次目录�
 | 地砖 Gaussian tile | 262,160 高斯记录 | 3,140 目录 + 60,856 候选 ID（含对齐） | 32 | 326,188 |
 | 地砖 Gaussian BVH | 262,160 高斯记录 | 37,040 节点（2,315 × 16 B） | 32 | 299,232 |
 
-单独比较同一张 894 × 894 地砖，RGBA8 为 3,196,944 B，MLP 为 403,344 B（省 87.38%，41.78 dB），Gaussian tile 为 326,188 B（省 89.80%），Gaussian BVH 为 299,232 B（省 90.64%）。两种 Gaussian 索引使用同一份 30.65 dB 的拟合。BVH 比 tile 少 26,956 B，比地砖 MLP 少 104,112 B。Gaussian 实验中的木纹和壁纸走 RGBA8。所有基线均为单层纹理，引擎使用最近邻采样。[三张贴图的训练与分项画质](../README.md#modern-hall-神经纹理压缩)
+单独比较同一张 894 × 894 地砖，RGBA8 为 3,196,944 B，MLP 为 403,344 B（省 87.38%，41.78 dB），Gaussian tile 为 326,188 B（省 89.80%），Gaussian BVH 为 299,232 B（省 90.64%）。两种 Gaussian 索引使用同一份 30.65 dB 的拟合。BVH 比 tile 少 26,956 B，比地砖 MLP 少 104,112 B。Gaussian 实验中的木纹和壁纸走 RGBA8。所有基线均为单层纹理，引擎使用最近邻采样。[三张贴图的训练与分项画质](experiment-guide.md#modern-hall-神经纹理压缩)
 
 可在 `render_lab` 目录复测。`BENCHMARK` JSON 的 `memory.atlas_buffer_bytes` 是逻辑长度，`memory.atlas.allocated_bytes` 是计入驱动对齐的分配，`memory.device_local_bytes` 和 `nonlocal_bytes` 分别是 RHI 显式分配到两类堆的总量。
 
