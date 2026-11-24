@@ -15,6 +15,8 @@ use std::cell::Cell;
 #[cfg(test)]
 use std::sync::Arc;
 
+type DeviceCheck = fn(&World, crate::rhi::RayCapabilities) -> Result<()>;
+
 pub(super) struct Registration {
     pub key: &'static str,
     pub feature: &'static str,
@@ -22,6 +24,7 @@ pub(super) struct Registration {
     pub inputs: &'static [LightingInput],
     pub open: fn(&World, &rayon::ThreadPool) -> Result<Box<dyn Producer>>,
     pub camera: fn() -> Result<Camera>,
+    pub validate_device: Option<DeviceCheck>,
 }
 pub(super) struct MaterialShader {
     pub name: &'static str,

@@ -5,7 +5,7 @@ use super::{
     motion, restir, vegetation,
 };
 use crate::{
-    engine::{Engine, Schedule},
+    engine::Engine,
     render::FrameGraph,
     render::{Camera, Forward, MaterialPrograms, Snapshot, Technique},
     scene::*,
@@ -41,52 +41,32 @@ fn layer_enabled(settings: Option<&serde_json::Value>, layer: &str) -> bool {
         .unwrap_or(true)
 }
 pub(super) type Configured = (Arc<dyn Technique>, Camera);
-pub(super) fn open(
+#[derive(Default)]
+pub(super) struct GeometryModules {
+    pub cluster: bool,
+    pub plants: bool,
+    pub effects: bool,
+    pub cartoon: bool,
+}
+pub(super) fn assemble(
     world: &World,
     tasks: &rayon::ThreadPool,
     materials: &mut MaterialPrograms,
-    schedule: &mut Schedule,
-) -> Result<Option<Configured>> {
-    let has = |key| world.first_raw_component(key).is_some();
-    let cluster = has(clusters::SETTING);
-    let plants = has(vegetation::SETTING);
-    let effects = has(effects::SETTING);
-    let cartoon = has(cartoon::SETTING);
-    let lighting = light_stack::REGISTRY.iter().any(|r| has(r.key));
-    if !(cluster || plants || effects || cartoon || lighting) {
-        return Ok(None);
-    }
-    let mut camera = None;
-    if plants {
-        vegetation::configure(world, materials)?;
-        camera = Some(vegetation::initial_camera(world)?);
-    }
-    if effects {
-        camera = Some(effects::configure(
-            world,
-            materials,
-            schedule,
-            enabled(world, "water"),
-        )?);
-    }
-    if cartoon {
-        cartoon::Cartoon::register(materials)?;
-        let moving = has(motion::silver::PLAYER);
-        let mut c = cartoon::camera(world, if moving { "full" } else { "face" })?;
-        if moving {
-            c.distance *= 1.72;
-            c.yaw = 0.62;
-            c.pitch = 0.4;
-            c.target.y -= 0.24;
-        }
-        camera = Some(c);
-    }
+    geometry: GeometryModules,
+    camera: Option<Camera>,
+) -> Result<Configured> {
+    let GeometryModules {
+        cluster,
+        plants,
+        effects,
+        cartoon,
+    } = geometry;
     let extended = cluster || plants || effects || cartoon;
     let lights = LightStack::open_modules(world, materials, tasks, extended)?;
     let (lights, light_camera) = lights.map_or((None, None), |(l, c)| (Some(l), Some(c)));
     let camera = if let Some(c) = restir::studies::camera(world)? {
         c
-    } else if has(SETTING) {
+    } else if is_scene(world) {
         Camera {
             target: Vec3::new(0., 1.15, 0.),
             distance: 10.8,
@@ -114,7 +94,7 @@ pub(super) fn open(
             plants: plants && cl,
         }),
     };
-    Ok(Some((technique, camera)))
+    Ok((technique, camera))
 }
 struct Modules {
     cluster: Option<clusters::ClusterLod>,
@@ -232,9 +212,11 @@ pub fn command(engine: &mut Engine, arg: &str) -> Result<String> {
             e.components.insert(HIDDEN.into(), true.into());
         }
     }
-    let camera = engine.camera;
-    super::replace(engine, world)?;
-    engine.camera = camera;
+    world.validate()?;
+    let prepared = super::SceneConfiguration::prepare(&world, &engine.tasks, engine.ray_caps)?;
+    let lighting_only = light_stack::REGISTRY.iter().any(|r| r.feature == *layer);
+    engine.world = Arc::new(world);
+    prepared.apply_layers(engine, lighting_only);
     Ok(format!("{layer} {state}"))
 }
 
@@ -265,7 +247,17 @@ mod tests {
             ("ibl on", [true, true, true, true, true]),
         ] {
             if !cmd.is_empty() {
+                let light_change = cmd.starts_with("ibl ") || cmd.starts_with("restir ");
+                if light_change {
+                    engine
+                        .schedule
+                        .tick(&mut engine.world, 1. / 60., &engine.tasks)?;
+                }
+                let before = engine.schedule.describe();
                 command(&mut engine, cmd)?;
+                if light_change {
+                    assert_eq!(before, engine.schedule.describe());
+                }
             }
             let expected: Vec<_> = [
                 (state[1], "Effect playback"),

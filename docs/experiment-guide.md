@@ -10,6 +10,7 @@ W/S 沿视线前进和后退，A/D 左右平移，在视口内按住鼠标右键
 
 | 命令 | 效果 |
 | --- | --- |
+| `timeline frame.json` | 导出最近完成帧的 GPU 各队列区间、等待来源和依赖链，可用 Perfetto 打开。 |
 | `help`、`stats` | 查看命令、实体数、pass 数和 GPU 区间耗时之和 |
 | `fit`、`pause`、`rdg` | 重新取景、切换模拟暂停、切换依赖图 |
 | `hud on`、`hud off` | 在视口上显示或隐藏 GPU 时间、呈现模式和抗锯齿状态 |
@@ -75,7 +76,7 @@ RTX 5070 的 800×500 固定机位截图中，取画面 `x=100..699, y=150..479`
 
 **阴影** 带细栅栏、接触地面的球、留出 0.42 米和 1.15 米间隙的悬空球、远端球及倾斜接收面。硬阴影、PCF、PCSS 从同一光源机位光栅化深度。PCSS 先搜索遮挡物，再根据深度差估计过滤半径。`shadow ray` 在同一几何上对面积光执行 16 次可见性采样，提供对照。`shadow view visibility` 用灰度直接显示光源可见度，`shadow size 0` 可把 PCSS 恢复为点光源比较。[PCSS 算法](https://developer.nvidia.com/gpugems/gpugems3/part-ii-light-and-shadows/chapter-8-summed-area-variance-shadow-maps)
 
-**硬件光追** 用镜面、金属球、遮挡物和镜头外的绿色立柱测试实际的 GPU 遍历。RDG 分别记录构建三角形 BLAS、构建实例化 TLAS 和追踪光线，RHI 管理构建缓冲、同步和 shader binding table。光追程序通过 `vkCmdTraceRaysKHR` 调度 raygen、miss 和 closest-hit。raygen 依次发送主光线、可见性光线和一次镜面反射，便于逐阶段观察。静态 BLAS 按帧槽复用，兼容拓扑的变形可使用 UPDATE。可用 `rays software` 和 `rays hardware` 比较固定点光源的遮挡结果，`rays normals` 查看射线几何法线，`rays off` 返回材质画面。运行此场景需要 `VK_KHR_acceleration_structure` 和 `VK_KHR_ray_tracing_pipeline`，GI 和阴影使用普通计算着色器和现有的可见性缓冲渲染。[Vulkan 光追指南](https://docs.vulkan.org/guide/latest/extensions/ray_tracing.html)
+**硬件光追** 用镜面、金属球、遮挡物和镜头外的绿色立柱测试实际的 GPU 遍历。RDG 分别记录构建三角形 BLAS、构建实例化 TLAS 和追踪光线，RHI 管理构建缓冲、同步和 shader binding table。光追程序通过 `vkCmdTraceRaysKHR` 调度 raygen、miss 和 closest-hit。raygen 依次发送主光线、可见性光线和一次镜面反射，便于逐阶段观察。静态 BLAS 按不可变几何版本跨帧槽共享，兼容拓扑的变形可使用 UPDATE。可用 `rays software` 和 `rays hardware` 比较固定点光源的遮挡结果，`rays normals` 查看射线几何法线，`rays off` 返回材质画面。运行此场景需要 `VK_KHR_acceleration_structure` 和 `VK_KHR_ray_tracing_pipeline`，GI 和阴影使用普通计算着色器和现有的可见性缓冲渲染。[Vulkan 光追指南](https://docs.vulkan.org/guide/latest/extensions/ray_tracing.html)
 
 场景由引擎生成，几何、材质和实验设置可以用 `save`、`load` 保存和恢复。抓取固定机位时，可用 `--command` 设置比较模式。
 
@@ -177,7 +178,7 @@ cargo run --release --locked -- --experiment motion --command "motion 1.35 0" --
 cargo run --release --locked -- --experiment motion --command "motion 1.35 0" --command "motionsearch scan" --benchmark 600
 ```
 
-岩柱森林默认开启 ReSTIR DI、GI-1.2 两跳漫反射和 Vulkan 硬件光追。控制台运行 `restir rays toggle` 可在软硬件后端间往返，也可用 `restir rays software` 或 `restir rays hardware` 指定后端。这一设置同时控制太阳阴影、漫反射命中和命中点到光源的遮挡查询。`vegetation shadows adaptive` 使用近景精细、远景简化的投影几何，`vegetation shadows mega` 在硬件模式下追踪主视图选簇及屏幕外补充簇。[岩柱森林逐帧开销](../docs/procedural-vegetation.md#岩柱森林的多跳光追) · [Mega Geometry](../docs/forest-mega.md)
+岩柱森林默认开启 ReSTIR DI、GI-1.2 两跳漫反射和 Vulkan 硬件光追。控制台运行 `restir rays toggle` 可在软硬件后端间往返，也可用 `restir rays software`、`restir rays inline` 或 `restir rays hardware` 指定后端。`restir rays status` 显示实际能力与所选遍历路径。这一设置同时控制太阳阴影、漫反射命中和命中点到光源的遮挡查询。`vegetation shadows adaptive` 使用近景精细、远景简化的投影几何，`vegetation shadows mega` 在硬件模式下追踪主视图选簇及屏幕外补充簇。[岩柱森林逐帧开销](../docs/procedural-vegetation.md#岩柱森林的多跳光追) · [Mega Geometry](../docs/forest-mega.md)
 
 ### 录制实验
 

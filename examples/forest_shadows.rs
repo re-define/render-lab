@@ -29,7 +29,7 @@ fn frame(e: &mut Engine, dt: f32, extent: [u32; 2]) -> Result<Frame> {
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let dir = PathBuf::from(args.next().context(
-        "usage: forest_shadows OUTPUT reference|realtime [frames] [rounds], proxy-images, or zoom [laps] [purposes] [--size WIDTHxHEIGHT] [--raster auto|mesh|compute] [--rays software|hardware] [--gi direct|single|multi]",
+        "usage: forest_shadows OUTPUT reference|realtime [frames] [rounds], proxy-images, or zoom [laps] [purposes] [--size WIDTHxHEIGHT] [--raster auto|mesh|compute] [--rays auto|software|hardware|inline] [--gi direct|single|multi]",
     )?);
     let sampling = args.next().context("missing sampling mode")?;
     if sampling == "proxy-images" {
@@ -54,9 +54,11 @@ fn main() -> Result<()> {
                     gi = Some(value);
                 }
                 "--rays" | "--proxy-rays" => {
-                    let value = args.next().context("--rays needs software or hardware")?;
+                    let value = args
+                        .next()
+                        .context("--rays needs auto, software, hardware or inline")?;
                     ensure!(
-                        matches!(value.as_str(), "hardware" | "software"),
+                        matches!(value.as_str(), "hardware" | "inline" | "auto" | "software"),
                         "invalid ray backend"
                     );
                     ray_backend = Some(value);

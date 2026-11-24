@@ -34,7 +34,7 @@ cargo run --release --locked -- --scene assets/scenes/cornell-box/cornell_box_co
 
 | 想了解的问题 | 文档 |
 | --- | --- |
-| 谁拥有场景、帧快照、依赖图和 Vulkan 对象 | [架构与改进顺序](docs/architecture.md) · [模块关系图](docs/module-map.md) |
+| 谁拥有场景、帧快照、依赖图和 Vulkan 对象 | [架构与数据寿命](docs/architecture.md) · [模块关系图](docs/module-map.md) |
 | 模拟系统如何并行、ECS 怎样提取、场景怎样保存 | [运行时与场景](docs/runtime-and-scene.md) |
 | 可见性、材质、时域历史如何连接，队列如何等待和退役 | [渲染管线](docs/render-pipeline.md) |
 | 一条射线如何从几何到达 BLAS、TLAS、SBT 和命中着色 | [光追 RHI 审查](docs/ray-tracing-rhi.md) |

@@ -1,4 +1,17 @@
 //! Motion matching on poses retargeted from Kimodo to the imported Silver Wolf rig.
+use crate::experiments::assembly::{Primary, Registration as SceneModule};
+pub(in crate::experiments) const MODULE: SceneModule = SceneModule {
+    key: PLAYER,
+    primary: Primary::Simulation,
+    restore: Some(hydrate),
+    install: |world, a| {
+        if crate::experiments::composition::enabled(world, "actor") {
+            a.schedule
+                .add_system(std::sync::Arc::new(SilverMatcher::load()?));
+        }
+        Ok(())
+    },
+};
 use super::*;
 mod locomotion;
 mod search;

@@ -61,6 +61,11 @@ pub(super) fn scope(a: Access) -> (S, A, L) {
             A::ACCELERATION_STRUCTURE_WRITE_KHR,
             L::UNDEFINED,
         ),
+        ComputeAcceleration => (
+            S::COMPUTE_SHADER,
+            A::ACCELERATION_STRUCTURE_READ_KHR,
+            L::UNDEFINED,
+        ),
         RayAcceleration => (
             S::RAY_TRACING_SHADER_KHR,
             A::ACCELERATION_STRUCTURE_READ_KHR,
@@ -119,6 +124,7 @@ impl Recorder {
                 ),
                 Physical::Buffer(_)
                 | Physical::SharedBuffer(_)
+                | Physical::StaticBlas { .. }
                 | Physical::Acceleration(_)
                 | Physical::Clusters(_)
                     if !src.is_empty() =>
@@ -194,7 +200,7 @@ impl Recorder {
                 .flat_map(|(r, _)| (r.0 as u32).to_ne_bytes())
                 .collect::<Vec<_>>();
             data.extend(&p.push);
-            if let Op::TraceRays { tlas, .. } = *op {
+            if let Op::TraceRays { tlas, .. } | Op::RayQuery { tlas, .. } = *op {
                 let Physical::Acceleration(tlas) = &res[tlas.0] else {
                     unreachable!()
                 };
@@ -297,7 +303,10 @@ impl Recorder {
                 }
                 d.cmd_end_rendering(cmd);
             }
-            Op::Compute {
+            Op::RayQuery {
+                groups: [x, y, z], ..
+            }
+            | Op::Compute {
                 groups: [x, y, z], ..
             } => d.cmd_dispatch(cmd, x, y, z),
             Op::ComputeIndirect { args, offset, .. } => {
@@ -348,10 +357,14 @@ impl Recorder {
                 output,
                 ..
             } => {
-                let Physical::Acceleration(acceleration) = &res[output.0] else {
-                    unreachable!()
+                let (acceleration, build) = match &res[output.0] {
+                    Physical::StaticBlas { blas, scratch } => {
+                        (&blas.acceleration, scratch.is_some())
+                    }
+                    Physical::Acceleration(a) => (a.as_ref(), a.needs_build),
+                    _ => unreachable!(),
                 };
-                if acceleration.needs_build {
+                if build {
                     acceleration.record(
                         cmd,
                         Some((

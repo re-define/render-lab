@@ -200,6 +200,7 @@ mod tests {
         let mut console = Console::default();
         for cmd in [
             "vegetation shadows adaptive",
+            "restir rays software",
             "restir gi direct",
             "restir reference",
             "restir denoise off",
@@ -217,6 +218,7 @@ mod tests {
                 engine.materials.clone(),
             )?;
             view.buffer_atomic64 = gpu.buffer_atomic64();
+            view.ray_caps = gpu.ray_capabilities();
             gpu.execute(engine.technique.build(&view)?.compile()?, &engine.tasks)
         };
         let has = |f: &crate::rhi::Frame, name: &str| f.passes.iter().any(|p| p.name == name);
@@ -248,6 +250,14 @@ mod tests {
             mismatch < n / 100,
             "different RGB pixels at fixed wind phase: {mismatch}/{n}"
         );
+        console.execute(&mut engine, &[], "restir rays inline")?;
+        let inline = capture(&engine)?;
+        assert!(has(&inline, "Trace inline proxy shadow rays"));
+        assert!(different(&hardware.pixels, &inline.pixels) < n / 100);
+        console.execute(&mut engine, &[], "restir gi multi")?;
+        assert!(has(&capture(&engine)?, "GI-1.2 trace inline probe paths"));
+        console.execute(&mut engine, &[], "restir gi direct")?;
+        console.execute(&mut engine, &[], "restir rays hardware")?;
         console.execute(&mut engine, &[], "vegetation time 1.7")?;
         let gust = capture(&engine)?;
         assert!(gust.profile.acceleration_updates > 0);

@@ -201,6 +201,7 @@ impl SceneExtractor {
         self.previous = Some(scene.clone());
         Ok(Snapshot {
             buffer_atomic64: false,
+            ray_caps: Default::default(),
             scene,
             materials,
             camera,

@@ -2,7 +2,30 @@
 #ifdef SCENE_RAY_CLOSEST
 #include "scene_ray_hit.glsl"
 #endif
-#ifdef SCENE_RAY_HARDWARE
+#ifdef SCENE_RAY_INLINE
+layout(push_constant) uniform RayScene { layout(offset=TLAS_OFFSET) uvec2 tlas; } rayScene;
+bool rayOccluded(vec3 origin, vec3 direction, float limit) {
+    rayQueryEXT q;
+    rayQueryInitializeEXT(q,accelerationStructureEXT(rayScene.tlas),gl_RayFlagsTerminateOnFirstHitEXT,255,origin,0.0001,direction,limit);
+    while(rayQueryProceedEXT(q)) {}
+    return rayQueryGetIntersectionTypeEXT(q,true)==gl_RayQueryCommittedIntersectionTriangleEXT;
+}
+#ifdef SCENE_RAY_CLOSEST
+#include "ray_triangle_hit.glsl"
+bool rayClosest(vec3 origin, vec3 direction, float limit, out SceneRayHit hit) {
+    rayQueryEXT q;
+    rayQueryInitializeEXT(q,accelerationStructureEXT(rayScene.tlas),gl_RayFlagsNoneEXT,255,origin,0.0001,direction,limit);
+    while(rayQueryProceedEXT(q)) {}
+    if(rayQueryGetIntersectionTypeEXT(q,true)!=gl_RayQueryCommittedIntersectionTriangleEXT) return false;
+    vec2 bary=rayQueryGetIntersectionBarycentricsEXT(q,true);
+    hit.distance=rayQueryGetIntersectionTEXT(q,true);
+    triangleHit(uint(rayQueryGetIntersectionInstanceIdEXT(q,true)),uint(rayQueryGetIntersectionPrimitiveIndexEXT(q,true)),
+        vec3(1.-bary.x-bary.y,bary),mat3(rayQueryGetIntersectionWorldToObjectEXT(q,true)),
+        mat3(rayQueryGetIntersectionObjectToWorldEXT(q,true)),hit);
+    return true;
+}
+#endif
+#elif defined(SCENE_RAY_HARDWARE)
 layout(push_constant) uniform RayScene { layout(offset=TLAS_OFFSET) uvec2 tlas; } rayScene;
 #ifdef SCENE_RAY_CLOSEST
 layout(location=0) rayPayloadEXT SceneRayHit rayResult;

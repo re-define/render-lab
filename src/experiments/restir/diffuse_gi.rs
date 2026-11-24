@@ -96,21 +96,29 @@ pub(super) fn build(
     trace_inputs.extend(i.scene.probe_inputs(atlas)?.into_iter().map(|r| (r, R)));
     trace_inputs.extend([(cache, RW), (scratch, RW), (paths, W)]);
     if let RayScene::Hardware(native) = i.scene {
-        let bindings = trace_inputs
-            .into_iter()
-            .map(|(r, a)| {
-                (
-                    r,
-                    match a {
-                        R => Access::RayRead,
-                        W => Access::RayWrite,
-                        RW => Access::RayReadWrite,
-                        _ => unreachable!(),
-                    },
-                )
-            })
-            .collect();
-        native.probes(g, [tiles[0] * 8, tiles[1]], bindings, i.raster);
+        if native.inline_queries {
+            g.pass_in(
+                crate::rdg::PassPhase::Lighting,
+                "GI-1.2 trace inline probe paths",
+                native.inline(tiles, shader!("inline"), trace_inputs),
+            );
+        } else {
+            let bindings = trace_inputs
+                .into_iter()
+                .map(|(r, a)| {
+                    (
+                        r,
+                        match a {
+                            R => Access::RayRead,
+                            W => Access::RayWrite,
+                            RW => Access::RayReadWrite,
+                            _ => unreachable!(),
+                        },
+                    )
+                })
+                .collect();
+            native.probes(g, [tiles[0] * 8, tiles[1]], bindings, i.raster);
+        }
     } else {
         dispatch(
             g,

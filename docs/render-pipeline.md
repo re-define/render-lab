@@ -64,6 +64,8 @@ TAA 读取颜色、深度和运动，在历史有效的像素做邻域约束与�
 
 硬件追踪有两层校验。图编译时核对拓扑版本的缓冲引用、TLAS 中实际使用的 BLAS 集合以及程序对簇几何的支持；提交准备时用设备属性检查簇能力、二维派发各轴上限和总 invocation 上限。前者可以在无 GPU 的单元测试中定位非法图，后者在准备帧槽和创建管线前报告本机限制。[图校验](../src/rdg/validate.rs) · [设备限制](../src/rhi/ray.rs) · [光追能力与扩展方向](ray-tracing-rhi.md)
 
+控制台 `timeline capture.json` 导出当前完成帧的 Chrome Trace JSON。Perfetto 的每一行对应一个物理队列，方块是 pass 的 GPU 时间戳区间。点击方块可见 pass 编号、RDG 前驱、资源屏障、提交 signal 和等待的队列/值。依赖跨帧或阶段等待与生产者的时间范围重叠时，导出器在消费提交上标记等待。设备缺少跨队列公共时钟时仍能测量单 pass 耗时。设置 `RENDER_LAB_GPU_QUEUES=1` 可用同一条相机路径测量单队列。[导出器](../src/rhi/timeline.rs) · [岩柱森林对照](forest-architecture-benchmark.md)
+
 ## 如何读一帧的报告
 
 | 需要定位的问题 | 对应证据 |

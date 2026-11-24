@@ -80,7 +80,7 @@ impl Benchmark {
                 .map(|(k, v)| (k, summarize(v)))
                 .collect::<BTreeMap<_, _>>()
         };
-        let rows=f.passes.iter().map(|p|json!({"name":p.name,"phase":p.phase.key(),"queue":format!("{:?}",p.queue),"parents":p.parents,"resource_barriers":p.barriers.len()})).collect::<Vec<_>>();
+        let rows=f.passes.iter().map(|p|json!({"name":p.name,"phase":p.phase.key(),"queue":format!("{:?}",p.queue),"physical_queue":p.batch.queue,"signal":p.batch.signal,"waits":p.batch.waits,"interval_ms":p.interval,"parents":p.parents,"resource_barriers":p.barriers.len()})).collect::<Vec<_>>();
         println!(
             "BENCHMARK {}",
             json!({"gpu":f.gpu,"extent":f.extent,"mode":f.presentation,"profile":if cfg!(debug_assertions){"dev"}else{"release"},"warmup":WARMUP,"samples":self.target,

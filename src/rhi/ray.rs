@@ -38,12 +38,63 @@ pub(super) struct Acceleration {
     pub address: u64,
     pub shape: AccelerationShape,
     backing: Buffer,
-    scratch: Buffer,
+    scratch: Option<Buffer>,
     scratch_address: u64,
     instance: Option<Buffer>,
     source: Option<BuildSource>,
     pub needs_build: bool,
     pub update: bool,
+}
+
+/// The CPU versions keep pointer-based keys unique until every referencing frame retires.
+pub(super) struct StaticBlas {
+    pub acceleration: Acceleration,
+    _sources: [Arc<[u8]>; 2],
+    pub ready: std::sync::OnceLock<(usize, u64)>,
+}
+
+#[derive(Default)]
+pub(super) struct StaticCache(HashMap<(usize, usize, u32, u32), Weak<StaticBlas>>);
+
+impl StaticCache {
+    pub fn prune(&mut self) {
+        self.0.retain(|_, v| v.strong_count() != 0);
+    }
+
+    pub fn bind(
+        &mut self,
+        g: &Arc<Gpu>,
+        shape: AccelerationShape,
+        sources: [&Arc<[u8]>; 2],
+        tag: Purpose<'_>,
+    ) -> Result<Physical> {
+        let AccelerationShape::Triangles { vertices, count } = shape else {
+            unreachable!()
+        };
+        let key = (
+            sources[0].as_ptr() as usize,
+            sources[1].as_ptr() as usize,
+            vertices,
+            count,
+        );
+        if let Some(blas) = self.0.get(&key).and_then(Weak::upgrade)
+            && blas.ready.get().is_some()
+        {
+            return Ok(Physical::StaticBlas {
+                blas,
+                scratch: None,
+            });
+        }
+        let mut acceleration = Acceleration::new(g, shape, Purpose { slot: None, ..tag })?;
+        let scratch = acceleration.scratch.take();
+        let blas = Arc::new(StaticBlas {
+            acceleration,
+            _sources: sources.map(Arc::clone),
+            ready: Default::default(),
+        });
+        self.0.insert(key, Arc::downgrade(&blas));
+        Ok(Physical::StaticBlas { blas, scratch })
+    }
 }
 
 enum BuildSource {
@@ -104,7 +155,11 @@ fn level(shape: AccelerationShape) -> vk::AccelerationStructureTypeKHR {
 impl Acceleration {
     pub fn new(gpu: &Arc<Gpu>, shape: AccelerationShape, tag: Purpose<'_>) -> Result<Self> {
         unsafe {
-            let properties = &gpu.ray.as_ref().context("RT experiment requires VK_KHR_ray_tracing_pipeline and VK_KHR_acceleration_structure")?.acceleration;
+            let properties = &gpu
+                .ray
+                .as_ref()
+                .context("acceleration structure builds require VK_KHR_acceleration_structure")?
+                .acceleration;
             if let AccelerationShape::Triangles { count, .. } = shape {
                 ensure!(
                     count > 0
@@ -188,7 +243,7 @@ impl Acceleration {
                 shape,
                 update: false,
                 backing,
-                scratch,
+                scratch: Some(scratch),
                 scratch_address,
                 instance,
                 source: None,
@@ -274,8 +329,8 @@ impl Acceleration {
     }
 
     pub fn allocations(&self) -> impl Iterator<Item = &AllocationInfo> {
-        [&self.backing.allocation, &self.scratch.allocation]
-            .into_iter()
+        std::iter::once(&self.backing.allocation)
+            .chain(self.scratch.iter().map(|b| &b.allocation))
             .chain(self.instance.iter().map(|buffer| &buffer.allocation))
     }
 }

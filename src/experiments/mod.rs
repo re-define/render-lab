@@ -1,3 +1,4 @@
+mod assembly;
 pub mod cartoon;
 pub mod clusters;
 pub mod composition;
@@ -5,6 +6,7 @@ pub mod effects;
 pub mod gaussian;
 pub mod ibl;
 mod light_stack;
+use assembly::SceneConfiguration;
 pub mod lighting;
 pub mod mixed;
 pub mod motion;
@@ -67,83 +69,24 @@ pub(crate) fn snapshot_components() -> impl Iterator<Item = SnapshotComponent> {
     )
 }
 
-struct SceneConfiguration {
-    camera: Camera,
-    materials: Arc<MaterialPrograms>,
-    schedule: Schedule,
-    technique: Arc<dyn Technique>,
-}
-
-impl SceneConfiguration {
-    fn prepare(world: &World, tasks: &rayon::ThreadPool) -> Result<Self> {
-        let has = |key| world.first_raw_component(key).is_some();
-        let mut materials = MaterialPrograms::default();
-        let mut schedule = Schedule::default();
-        let (technique, camera): (Arc<dyn Technique>, Camera) = if let Some(modules) =
-            composition::open(world, tasks, &mut materials, &mut schedule)?
-        {
-            modules
-        } else if has(lighting::SETTING) {
-            let camera = lighting::configure(world, &mut materials)?;
-            (Arc::new(lighting::Lighting::default()), camera)
-        } else if has(gaussian::SETTING) {
-            gaussian::register(&mut materials)?;
-            (
-                Arc::new(gaussian::Gaussian::new(world)?),
-                gaussian::camera(world)?,
-            )
-        } else if has(texture::SETTING) {
-            texture::register(&mut materials)?;
-            (
-                Arc::new(texture::TextureCompression::new(world)?),
-                texture::camera(world)?,
-            )
-        } else {
-            (Arc::new(Forward::default()), Camera::fit(world)?)
-        };
-        if has(vegetation::SETTING) && composition::enabled(world, "forest") {
-            schedule.add_system(Arc::new(vegetation::Wind));
-        }
-        if has(motion::PLAYER) {
-            schedule.add_system(Arc::new(motion::Matcher::default()));
-        }
-        if has(motion::silver::PLAYER) && composition::enabled(world, "actor") {
-            schedule.add_system(Arc::new(motion::silver::SilverMatcher::load()?));
-        }
-        Ok(Self {
-            camera,
-            materials: Arc::new(materials),
-            schedule,
-            technique,
-        })
-    }
-
-    fn apply(self, engine: &mut Engine) {
-        engine.camera = self.camera;
-        engine.materials = self.materials;
-        engine.technique = self.technique;
-        engine.schedule = self.schedule;
-    }
-}
-
 /// Saved experiment settings restore all scene-bound systems and render programs.
 pub fn configure(engine: &mut Engine) -> Result<()> {
-    SceneConfiguration::prepare(&engine.world, &engine.tasks)?.apply(engine);
+    SceneConfiguration::prepare(&engine.world, &engine.tasks, engine.ray_caps)?.apply(engine);
     Ok(())
 }
 
 /// Validate and configure the candidate before replacing any live scene state.
 pub fn replace(engine: &mut Engine, mut world: World) -> Result<()> {
     world.validate()?;
-    motion::silver::hydrate(&mut world)?;
-    let prepared = SceneConfiguration::prepare(&world, &engine.tasks)?;
+    SceneConfiguration::restore(&mut world)?;
+    let prepared = SceneConfiguration::prepare(&world, &engine.tasks, engine.ray_caps)?;
     engine.world = Arc::new(world);
     prepared.apply(engine);
     Ok(())
 }
 
 pub fn open(mut world: World) -> Result<Engine> {
-    motion::silver::hydrate(&mut world)?;
+    SceneConfiguration::restore(&mut world)?;
     let mut engine = Engine::start_workers(world, Arc::new(Forward::default()))?;
     configure(&mut engine)?;
     Ok(engine)

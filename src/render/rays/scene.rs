@@ -1,6 +1,12 @@
 //! Frame-local acceleration and hit data shared by visibility and closest-hit queries.
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Traversal {
+    Software,
+    Pipeline,
+    Inline,
+}
 pub(crate) enum RayScene {
     Software {
         nodes: Resource,
@@ -11,6 +17,7 @@ pub(crate) enum RayScene {
 }
 
 pub(crate) struct NativeScene {
+    pub(crate) inline_queries: bool,
     tlas: Resource,
     blases: Vec<Resource>,
     pub(crate) cluster: Option<ClusterShadow>,
@@ -21,11 +28,11 @@ pub(crate) struct NativeScene {
 impl RayScene {
     pub(crate) fn build(
         g: &mut FrameGraph,
-        hardware: bool,
+        traversal: Traversal,
         hit_attributes: bool,
         rigid: Option<[Arc<[u8]>; 2]>,
     ) -> Result<Self> {
-        if hardware {
+        if traversal != Traversal::Software {
             let cluster = g.products.cluster_shadow;
             let surfaces: Vec<_> = g
                 .products
@@ -63,6 +70,7 @@ impl RayScene {
                     None
                 };
                 return Ok(Self::Hardware(NativeScene {
+                    inline_queries: traversal == Traversal::Inline,
                     tlas,
                     blases,
                     cluster,
@@ -81,6 +89,23 @@ impl RayScene {
 }
 
 impl NativeScene {
+    pub(crate) fn inline(
+        &self,
+        groups: [u32; 3],
+        shader: &'static [u8],
+        bindings: Vec<(Resource, Access)>,
+    ) -> Op {
+        Op::RayQuery {
+            groups,
+            tlas: self.tlas,
+            blases: self.blases.clone(),
+            program: Dispatch {
+                shader: Shader::Compute(shader),
+                push: vec![0; 4 * (bindings.len() % 2)],
+                bindings,
+            },
+        }
+    }
     pub(crate) fn trace(
         &self,
         extent: [u32; 2],

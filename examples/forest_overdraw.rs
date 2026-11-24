@@ -172,6 +172,7 @@ fn main() -> Result<()> {
                 engine.materials.clone(),
             )?;
             view.buffer_atomic64 = gpu.buffer_atomic64();
+            view.ray_caps = gpu.ray_capabilities();
             let mut graph = engine.technique.build(&view)?;
             if backend.is_none() && i >= warm {
                 probes(&mut graph)?;

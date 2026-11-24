@@ -135,6 +135,34 @@ fn presents_and_resizes_with_optional_frame_capture() -> Result<()> {
     assert!(second.profile.timeline_waits > first.profile.timeline_waits);
     assert!(second.pixels.is_empty());
     verify_scratch_slots(&mut gpu, &pool, owner.0)?;
+    if gpu.ray_capabilities().pipeline {
+        let lab = crate::experiments::open(crate::experiments::lighting::scene(
+            crate::experiments::lighting::Kind::Rt,
+        )?)?;
+        let view = Snapshot::new(&lab.world, lab.camera, [193, 121], lab.materials.clone())?;
+        for index in 0..2 {
+            let mut g = lab.technique.build(&view)?;
+            if index == 1 {
+                for p in &mut g.passes {
+                    if matches!(p.op, Op::BuildBlas { .. }) {
+                        p.queue = Queue::Graphics;
+                    }
+                }
+            }
+            let output = g.present()?;
+            g.pass("Capture static BLAS sharing", Op::HostRead(output));
+            assert!(gpu.enqueue(g.compile()?, &pool, owner.0)?.is_none());
+        }
+        let first = gpu.retire_next().unwrap()?;
+        let second = gpu.retire_next().unwrap()?;
+        assert!(first.profile.acceleration_builds > 1);
+        assert_eq!(
+            second.profile.acceleration_builds, 1,
+            "the second slot builds just its TLAS"
+        );
+        assert_eq!(second.profile.frames_in_flight, 2);
+        assert_eq!(first.pixels, second.pixels);
+    }
     drop(gpu);
     compare_resident_updates(owner.0, &pool)?;
     preserve_pending_capture_on_budget_failure(owner.0, &pool)

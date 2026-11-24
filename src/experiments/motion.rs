@@ -1,4 +1,15 @@
 //! Brute-force motion matching reference. All distances and velocities are in character space.
+use crate::experiments::assembly::{Primary, Registration as SceneModule};
+pub(super) const MODULE: SceneModule = SceneModule {
+    key: PLAYER,
+    primary: Primary::Simulation,
+    restore: None,
+    install: |_world, a| {
+        a.schedule
+            .add_system(std::sync::Arc::new(Matcher::default()));
+        Ok(())
+    },
+};
 use crate::{
     engine::{Edit, SimulationData, System, SystemAccess},
     scene::*,

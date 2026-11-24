@@ -274,6 +274,20 @@ fn main() {
             "mega_shadow.rgen",
             &["-DPROXY_SHADOWS"],
         ),
+        (
+            "inline_shadow.comp",
+            "mega_shadow.rgen",
+            &[
+                "-fshader-stage=compute",
+                "-DPROXY_SHADOWS",
+                "-DSCENE_RAY_INLINE",
+            ],
+        ),
+        (
+            "gi12_inline.comp",
+            "gi12_trace.comp",
+            &["-DPROXY_SHADOWS", "-DSCENE_RAY_INLINE"],
+        ),
         ("gi12_proxy.rgen", "gi12_mega.rgen", &["-DPROXY_SHADOWS"]),
         (
             "gi12_cluster.rchit",

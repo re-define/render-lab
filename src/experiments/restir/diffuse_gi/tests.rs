@@ -13,16 +13,21 @@ use std::sync::Arc;
 #[test]
 #[ignore = "requires Vulkan 1.4 and VK_EXT_descriptor_heap"]
 fn barycentric_texture_sampling_and_delayed_second_bounce() -> Result<()> {
-    check_bounces(false)
+    check_bounces(false, false)
 }
 
 #[test]
 #[ignore = "requires VK_KHR_ray_tracing_pipeline and VK_KHR_acceleration_structure"]
 fn hardware_hits_sample_barycentric_textures_and_transfer_delayed_light() -> Result<()> {
-    check_bounces(true)
+    check_bounces(true, false)
 }
 
-fn check_bounces(hardware: bool) -> Result<()> {
+#[test]
+#[ignore = "requires VK_KHR_ray_query"]
+fn inline_queries_preserve_hit_uv_and_second_bounce() -> Result<()> {
+    check_bounces(true, true)
+}
+fn check_bounces(hardware: bool, inline: bool) -> Result<()> {
     let mut world = World::default();
     let texels = [128, 0, 0, 255, 0, 255, 0, 255];
     let texture = world.spawn(Entity {
@@ -151,7 +156,16 @@ fn check_bounces(hardware: bool) -> Result<()> {
             let lights = g.input("No lights", vec![0; 16]);
             let history = g.input("Clock", bytemuck::cast_slice(&[tick, 0, 0, 0]).to_vec());
             let scene = if hardware {
-                RayScene::build(&mut g, true, true, None)?
+                RayScene::build(
+                    &mut g,
+                    if inline {
+                        rays::Traversal::Inline
+                    } else {
+                        rays::Traversal::Pipeline
+                    },
+                    true,
+                    None,
+                )?
             } else {
                 let bounds = [-16f32, -16., -0.013, 0., 16., 16., 0.013, f32::from_bits(2)];
                 RayScene::Software {

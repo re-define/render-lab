@@ -78,7 +78,17 @@ pub struct Frame {
     pub presentation: Option<String>,
     pub submissions: usize,
 }
+#[derive(Debug, serde::Serialize)]
+pub struct QueueBatch {
+    pub queue: usize,
+    pub signal: u64,
+    /// Timeline points actually waited by vkQueueSubmit2 after wait coalescing.
+    pub waits: Vec<(usize, u64)>,
+}
 pub struct PassReport {
+    pub batch: Arc<QueueBatch>,
+    /// GPU start and end in milliseconds from this frame's earliest scope.
+    pub interval: Option<[f64; 2]>,
     pub phase: crate::rdg::PassPhase,
     pub queue: Queue,
     pub name: String,

@@ -138,6 +138,7 @@ pub mod post;
 pub struct Snapshot {
     /// Capabilities of the backend which will execute this snapshot.
     pub buffer_atomic64: bool,
+    pub ray_caps: crate::rhi::RayCapabilities,
     pub materials: Arc<MaterialPrograms>,
     pub scene: Arc<RenderScene>,
     pub camera: Camera,

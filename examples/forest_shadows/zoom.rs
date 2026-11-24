@@ -72,7 +72,7 @@ pub(super) fn run(
     };
     writeln!(
         csv,
-        "lap,frame,stage,forward_steps,interval_ms,gpu_ms,rhi_prepare_ms,shadow_ms,main_clusters,detailed_instances,detailed_triangles,coarse_triangles,allocations,allocated_bytes,frees,freed_bytes,device_local_bytes,peak_device_local_bytes,suballocations,suballocated_bytes,returned_ranges,returned_range_bytes,pool_blocks,local_pool_free_bytes,nonlocal_pool_free_bytes,raster_ms,voxel_raster_ms,voxel_bins_ms,voxel_clusters,visible_bricks,proxy_prepare_ms,software_bvh_ms,blas_ms,tlas_ms,as_builds,as_updates,shadow_backend,gi_trace,gi_trace_ms,gi_cache_ms,gi_probe_ms,gi_resolve_ms,gi_total_ms"
+        "lap,frame,stage,forward_steps,interval_ms,gpu_ms,rhi_prepare_ms,shadow_ms,main_clusters,detailed_instances,detailed_triangles,coarse_triangles,allocations,allocated_bytes,frees,freed_bytes,device_local_bytes,peak_device_local_bytes,suballocations,suballocated_bytes,returned_ranges,returned_range_bytes,pool_blocks,local_pool_free_bytes,nonlocal_pool_free_bytes,raster_ms,voxel_raster_ms,voxel_bins_ms,voxel_clusters,visible_bricks,proxy_prepare_ms,software_bvh_ms,blas_ms,tlas_ms,as_builds,as_updates,shadow_backend,gi_trace,gi_trace_ms,gi_cache_ms,gi_probe_ms,gi_resolve_ms,gi_total_ms,as_bytes,scratch_bytes,main_blas_overlap_ms"
     )?;
     // This thread owns and pumps the hidden window until the engine and swapchain are dropped.
     let hwnd = unsafe {
@@ -175,12 +175,16 @@ pub(super) fn run(
             .find(|p| {
                 matches!(
                     p.name.as_str(),
-                    "Trace hardware proxy shadow rays" | "Trace one shadow ray per sampled pixel"
+                    "Trace hardware proxy shadow rays"
+                        | "Trace inline proxy shadow rays"
+                        | "Trace one shadow ray per sampled pixel"
                 )
             })
             .context("missing forest shadow pass")?;
         let shadow = query.ms;
-        let backend = if query.name == "Trace hardware proxy shadow rays" {
+        let backend = if query.name == "Trace inline proxy shadow rays" {
+            "inline"
+        } else if query.name == "Trace hardware proxy shadow rays" {
             "hardware"
         } else {
             "software"
@@ -218,6 +222,42 @@ pub(super) fn run(
         ]);
         let gi_resolve = duration(&["GI-1.2 interpolate indirect diffuse"]);
         let gi_total = gi_trace + gi_cache + gi_probe + gi_resolve;
+        if seen % FRAMES == 120 || seen % FRAMES == 400 {
+            render_lab::rhi::timeline::export(
+                &frame.passes,
+                &directory.join(format!("timeline-{seen}.json")),
+            )?;
+        }
+        let scopes = |name: &str| {
+            let mut spans = frame
+                .passes
+                .iter()
+                .filter(|p| p.name == name)
+                .filter_map(|p| p.interval)
+                .collect::<Vec<_>>();
+            spans.sort_by(|a, b| a[0].total_cmp(&b[0]));
+            let mut merged = Vec::<[f64; 2]>::new();
+            for [start, end] in spans {
+                if let Some(last) = merged.last_mut()
+                    && start <= last[1]
+                {
+                    last[1] = last[1].max(end);
+                } else {
+                    merged.push([start, end]);
+                }
+            }
+            merged
+        };
+        let main = scopes("Main mesh visibility");
+        let blas_scopes = scopes("Build triangle BLAS");
+        let overlap: f64 = main
+            .iter()
+            .flat_map(|a| {
+                blas_scopes
+                    .iter()
+                    .map(move |b| (a[1].min(b[1]) - a[0].max(b[0])).max(0.))
+            })
+            .sum();
         let memory = frame.memory.managed;
         let driver = memory.activity.since(&activity);
         let ranges = memory.suballocations.since(&suballocations);
@@ -241,7 +281,7 @@ pub(super) fn run(
         }
         writeln!(
             csv,
-            "{},{},{stage},{steps},{interval:.5},{gpu:.5},{:.5},{shadow:.5},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{raster:.5},{voxel_ms:.5},{bins_ms:.5},{},{},{prepare:.5},{refit:.5},{blas:.5},{tlas:.5},{},{},{backend},{trace_kind},{gi_trace:.5},{gi_cache:.5},{gi_probe:.5},{gi_resolve:.5},{gi_total:.5}",
+            "{},{},{stage},{steps},{interval:.5},{gpu:.5},{:.5},{shadow:.5},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{raster:.5},{voxel_ms:.5},{bins_ms:.5},{},{},{prepare:.5},{refit:.5},{blas:.5},{tlas:.5},{},{},{backend},{trace_kind},{gi_trace:.5},{gi_cache:.5},{gi_probe:.5},{gi_resolve:.5},{gi_total:.5},{},{},{overlap:.5}",
             seen / FRAMES + 1,
             seen % FRAMES + 1,
             frame.profile.rhi_prepare_ms,
@@ -265,7 +305,9 @@ pub(super) fn run(
             c["Voxel plant clusters"],
             c.get("Visible voxel bricks").copied().unwrap_or(0),
             frame.profile.acceleration_builds,
-            frame.profile.acceleration_updates
+            frame.profile.acceleration_updates,
+            memory.device_local.acceleration,
+            memory.device_local.build_scratch
         )?;
         if let Some(writer) = &mut details {
             let full = path((seen + 1) % FRAMES).0 != stage;

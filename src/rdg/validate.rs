@@ -15,7 +15,7 @@ impl Graph {
                     (&p.op, d.shader),
                     (Op::Draw { .. }, Shader::Graphics(..) | Shader::Mesh(..))
                         | (
-                            Op::Compute { .. } | Op::ComputeIndirect { .. },
+                            Op::Compute { .. } | Op::ComputeIndirect { .. } | Op::RayQuery { .. },
                             Shader::Compute(_)
                         )
                         | (
@@ -157,6 +157,12 @@ impl Graph {
                 );
             }
             Op::TraceRays {
+                tlas,
+                ref blases,
+                ref program,
+                ..
+            }
+            | Op::RayQuery {
                 tlas,
                 ref blases,
                 ref program,
@@ -322,6 +328,7 @@ impl Storage {
                     | Access::DepthClear
                     | Access::AccelerationWrite
                     | Access::AccelerationRead
+                    | Access::ComputeAcceleration
                     | Access::RayAcceleration
                     | Access::ComputeSample
                     | Access::SdkImageRead
@@ -329,7 +336,10 @@ impl Storage {
             ),
             Storage::Acceleration(_) => matches!(
                 a,
-                Access::AccelerationWrite | Access::AccelerationRead | Access::RayAcceleration
+                Access::AccelerationWrite
+                    | Access::AccelerationRead
+                    | Access::ComputeAcceleration
+                    | Access::RayAcceleration
             ),
         }
     }

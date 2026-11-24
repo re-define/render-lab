@@ -1,4 +1,27 @@
 //! Seeded foliage, shared plant prototypes and controls for the geometry experiment.
+use crate::experiments::assembly::{Primary, Registration as SceneModule};
+pub(super) const MODULE: SceneModule = SceneModule {
+    key: SETTING,
+    primary: Primary::Visibility,
+    restore: None,
+    install: |world, a| {
+        configure(world, &mut a.materials)?;
+        a.camera = Some(initial_camera(world)?);
+        a.visibility.plants = true;
+        Ok(())
+    },
+};
+pub(super) const WIND_SYSTEM: SceneModule = SceneModule {
+    key: SETTING,
+    primary: Primary::Simulation,
+    restore: None,
+    install: |world, a| {
+        if super::composition::enabled(world, "forest") {
+            a.schedule.add_system(std::sync::Arc::new(Wind));
+        }
+        Ok(())
+    },
+};
 use crate::rdg::PassPhase;
 use crate::render::FrameGraph;
 mod generate;
@@ -334,6 +357,15 @@ pub fn command(engine: &mut Engine, args: &str) -> Result<String> {
         ["cache", mode @ ("on" | "off")] => s.rebuild_clusters = *mode == "off",
         ["shadows", mode @ ("mega" | "adaptive" | "coarse")] => {
             s.coarse_shadows = *mode == "coarse";
+            if *mode == "mega" {
+                anyhow::ensure!(
+                    engine.ray_caps.clusters && engine.ray_caps.pipeline,
+                    "Mega Geometry requires VK_NV_cluster_acceleration_structure and a ray pipeline"
+                );
+                if let Some((_, raw)) = engine.world.first_raw_component(super::restir::SETTING) {
+                    super::restir::check_cluster_mode(raw, engine.ray_caps)?;
+                }
+            }
             s.mega_shadows = *mode == "mega";
         }
         ["wind", value] => s.wind = value.parse()?,

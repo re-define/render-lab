@@ -1,4 +1,16 @@
 //! Indexed random access to exported 2DGaussian texture fields.
+use crate::experiments::assembly::{Primary, Registration as SceneModule};
+pub(super) const MODULE: SceneModule = SceneModule {
+    key: SETTING,
+    primary: Primary::Exclusive,
+    restore: None,
+    install: |world, a| {
+        register(&mut a.materials)?;
+        a.camera = Some(camera(world)?);
+        a.technique = Some(std::sync::Arc::new(Gaussian::new(world)?));
+        Ok(())
+    },
+};
 mod bvh;
 mod compact;
 use super::texture;

@@ -1,4 +1,26 @@
 //! Silver Wolf material and silhouette experiments.
+use crate::experiments::assembly::{Primary, Registration as SceneModule};
+pub(super) const MODULE: SceneModule = SceneModule {
+    key: SETTING,
+    primary: Primary::Visibility,
+    restore: None,
+    install: |world, a| {
+        Cartoon::register(&mut a.materials)?;
+        let moving = world
+            .first_raw_component(super::motion::silver::PLAYER)
+            .is_some();
+        let mut c = camera(world, if moving { "full" } else { "face" })?;
+        if moving {
+            c.distance *= 1.72;
+            c.yaw = 0.62;
+            c.pitch = 0.4;
+            c.target.y -= 0.24;
+        }
+        a.camera = Some(c);
+        a.visibility.cartoon = true;
+        Ok(())
+    },
+};
 mod renderer;
 use crate::{engine::Engine, import, render::Camera, scene::*};
 use anyhow::{Context, Result, bail, ensure};

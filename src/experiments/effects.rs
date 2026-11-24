@@ -1,4 +1,20 @@
 //! Two procedural experiments sharing the engine's mesh visibility and material passes.
+use crate::experiments::assembly::{Primary, Registration as SceneModule};
+pub(super) const MODULE: SceneModule = SceneModule {
+    key: SETTING,
+    primary: Primary::Visibility,
+    restore: None,
+    install: |world, a| {
+        a.camera = Some(configure(
+            world,
+            &mut a.materials,
+            &mut a.schedule,
+            super::composition::enabled(world, "water"),
+        )?);
+        a.visibility.effects = true;
+        Ok(())
+    },
+};
 use crate::render::FrameGraph;
 mod fracture;
 pub(in crate::experiments) mod river;

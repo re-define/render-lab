@@ -1,4 +1,20 @@
 //! Fixed-camera lighting and ray tracing comparisons.
+use crate::experiments::assembly::{Primary, Registration as SceneModule};
+pub(super) const MODULE: SceneModule = SceneModule {
+    key: SETTING,
+    primary: Primary::Exclusive,
+    restore: None,
+    install: |world, a| {
+        let (_, cfg) = Settings::read(world)?;
+        ensure!(
+            cfg.kind != Kind::Rt || a.caps.pipeline,
+            "RT preview requires VK_KHR_ray_tracing_pipeline"
+        );
+        a.camera = Some(configure(world, &mut a.materials)?);
+        a.technique = Some(std::sync::Arc::new(Lighting::default()));
+        Ok(())
+    },
+};
 use crate::render::FrameGraph;
 
 use crate::{

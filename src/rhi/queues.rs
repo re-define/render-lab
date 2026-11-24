@@ -34,16 +34,16 @@ impl Timelines {
         g: &Gpu,
         p: &Plan,
         recorders: &[Recorder],
+        resources: &[Physical],
         image: Option<present::Acquired>,
-    ) -> Result<(usize, usize)> {
+    ) -> Result<Vec<Arc<frame::QueueBatch>>> {
         let queue = |step: &Step| physical_queue(p.graph.passes[step.index].queue, g.queues.len());
         let previous = std::mem::take(&mut self.histories);
         let uses = &p.pass_uses;
         let mut signals = vec![(0, 0u64); p.steps.len()];
         let mut covered = vec![vec![(0u64, Stage::empty()); g.queues.len()]; g.queues.len()];
         let mut start = 0;
-        let mut submits = 0;
-        let mut timeline_waits = 0;
+        let mut batches = Vec::with_capacity(p.steps.len());
         while start < p.steps.len() {
             let q = queue(&p.steps[start]);
             let mut end = start + 1;
@@ -61,6 +61,13 @@ impl Timelines {
             };
             let mut present = false;
             for step in &p.steps[start..end] {
+                if let Op::BuildBlas { output, .. } = p.graph.passes[step.index].op
+                    && let Physical::StaticBlas { blas, .. } = &resources[output.0]
+                    && let Some(&(src, value)) = blas.ready.get()
+                    && src != q
+                {
+                    require(src, value, Stage::ALL_COMMANDS);
+                }
                 for &parent in &step.parents {
                     let (src, v) = signals[parent];
                     if src != q {
@@ -103,6 +110,7 @@ impl Timelines {
                     .build()
             };
             let mut waits = vec![];
+            let mut sources = vec![];
             for (src, &(v, stages)) in needed.iter().enumerate() {
                 let (done, mask) = &mut covered[q][src];
                 if v == 0
@@ -111,6 +119,7 @@ impl Timelines {
                     continue;
                 }
                 waits.push(sem(self.sems[src], v, stages));
+                sources.push((src, v));
                 if v > *done {
                     *mask = stages;
                     *done = v;
@@ -118,7 +127,12 @@ impl Timelines {
                     *mask |= stages;
                 }
             }
-            timeline_waits += waits.len();
+            let batch = Arc::new(frame::QueueBatch {
+                queue: q,
+                signal: value,
+                waits: sources,
+            });
+            batches.extend(std::iter::repeat_n(batch, end - start));
             let mut signal = vec![sem(self.sems[q], value, Stage::ALL_COMMANDS)];
             if let Some(img) = image.filter(|_| present) {
                 // The acquire must also order the initial layout transition.
@@ -143,9 +157,8 @@ impl Timelines {
                     .queue_submit2(g.queues[q], &[info], vk::Fence::null())?;
             }
             start = end;
-            submits += 1;
         }
-        Ok((submits, timeline_waits))
+        Ok(batches)
     }
     pub fn targets(&self) -> Vec<u64> {
         self.values.clone()

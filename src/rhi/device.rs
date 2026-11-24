@@ -43,6 +43,7 @@ pub(super) struct Gpu {
     pub common_clock: bool,
     pub raster_queries: bool,
     pub ray: Option<RayProperties>,
+    pub ray_caps: RayCapabilities,
     pub ngx: Option<ngx::Context>,
     pub dlss_unavailable: Option<String>,
     pub buffer_atomic64: bool,
@@ -128,12 +129,14 @@ impl Gpu {
                 let mut acceleration =
                     vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
                 let mut ray = vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default();
-                let ray_extensions = [
+                let as_extensions = [
                     vk::KHR_ACCELERATION_STRUCTURE_EXTENSION.name,
                     vk::KHR_DEFERRED_HOST_OPERATIONS_EXTENSION.name,
-                    vk::KHR_RAY_TRACING_PIPELINE_EXTENSION.name,
                 ];
-                let has_ray_extensions = ray_extensions.iter().all(|&name| supported(name));
+                let has_as = as_extensions.iter().all(|&name| supported(name));
+                let pipeline_ext = vk::KHR_RAY_TRACING_PIPELINE_EXTENSION.name;
+                let query_ext = vk::KHR_RAY_QUERY_EXTENSION.name;
+                let mut inline = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
                 let mut query = vk::PhysicalDeviceFeatures2::builder()
                     .push_next(&mut h)
                     .push_next(&mut v12)
@@ -142,11 +145,17 @@ impl Gpu {
                 let mut cluster_feature =
                     vk::PhysicalDeviceClusterAccelerationStructureFeaturesNV::default();
                 let cluster_ext = vk::NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION.name;
-                if has_ray_extensions && supported(cluster_ext) {
+                if has_as && supported(pipeline_ext) && supported(cluster_ext) {
                     query = query.push_next(&mut cluster_feature);
                 }
-                if has_ray_extensions {
-                    query = query.push_next(&mut acceleration).push_next(&mut ray);
+                if has_as {
+                    query = query.push_next(&mut acceleration);
+                    if supported(pipeline_ext) {
+                        query = query.push_next(&mut ray);
+                    }
+                    if supported(query_ext) {
+                        query = query.push_next(&mut inline);
+                    }
                 }
                 ins.get_physical_device_features2(pd, &mut query);
                 let precise_stats = query.features.pipeline_statistics_query != 0
@@ -156,10 +165,14 @@ impl Gpu {
                 if raster_queries && !precise_stats {
                     continue;
                 }
-                let enable_ray = has_ray_extensions
-                    && acceleration.acceleration_structure != 0
-                    && ray.ray_tracing_pipeline != 0;
-
+                let has_as = has_as && acceleration.acceleration_structure != 0;
+                let ray_caps = RayCapabilities {
+                    pipeline: has_as && ray.ray_tracing_pipeline != 0,
+                    inline: has_as && inline.ray_query != 0,
+                    clusters: has_as
+                        && ray.ray_tracing_pipeline != 0
+                        && cluster_feature.cluster_acceleration_structure != 0,
+                };
                 if [
                     h.descriptor_heap,
                     mf.mesh_shader,
@@ -185,7 +198,19 @@ impl Gpu {
                     pd,
                     &mut vk::PhysicalDeviceProperties2::builder().push_next(&mut heap),
                 );
-                let priorities = vec![1.; q.queue_count.min(3) as usize];
+                let queue_count = match std::env::var("RENDER_LAB_GPU_QUEUES") {
+                    Ok(value) => {
+                        let count: u32 = value.parse()?;
+                        ensure!(
+                            (1..=3).contains(&count),
+                            "RENDER_LAB_GPU_QUEUES must be 1, 2 or 3"
+                        );
+                        count
+                    }
+                    Err(std::env::VarError::NotPresent) => 3,
+                    Err(e) => return Err(e.into()),
+                };
+                let priorities = vec![1.; q.queue_count.min(queue_count) as usize];
                 let queues = [vk::DeviceQueueCreateInfo::builder()
                     .queue_family_index(family as u32)
                     .queue_priorities(&priorities)
@@ -222,9 +247,15 @@ impl Gpu {
                 if let Some(name) = &clock {
                     exts.push(name.as_ptr());
                 }
-                let ray_properties = if enable_ray {
-                    exts.extend(ray_extensions.iter().map(|name| name.as_ptr()));
-                    let clusters = if cluster_feature.cluster_acceleration_structure != 0 {
+                let ray_properties = if ray_caps.pipeline || ray_caps.inline {
+                    exts.extend(as_extensions.iter().map(|name| name.as_ptr()));
+                    if ray_caps.pipeline {
+                        exts.push(pipeline_ext.as_ptr());
+                    }
+                    if ray_caps.inline {
+                        exts.push(query_ext.as_ptr());
+                    }
+                    let clusters = if ray_caps.clusters {
                         exts.push(cluster_ext.as_ptr());
                         let mut limits =
                             vk::PhysicalDeviceClusterAccelerationStructurePropertiesNV::default();
@@ -241,12 +272,12 @@ impl Gpu {
                         pipeline: Default::default(),
                         acceleration: Default::default(),
                     };
-                    ins.get_physical_device_properties2(
-                        pd,
-                        &mut vk::PhysicalDeviceProperties2::builder()
-                            .push_next(&mut properties.pipeline)
-                            .push_next(&mut properties.acceleration),
-                    );
+                    let mut props = vk::PhysicalDeviceProperties2::builder()
+                        .push_next(&mut properties.acceleration);
+                    if ray_caps.pipeline {
+                        props = props.push_next(&mut properties.pipeline);
+                    }
+                    ins.get_physical_device_properties2(pd, &mut props);
                     properties.pipeline.next = std::ptr::null_mut();
                     properties.acceleration.next = std::ptr::null_mut();
                     Some(properties)
@@ -280,11 +311,18 @@ impl Gpu {
                     .push_next(&mut v12)
                     .push_next(&mut v13)
                     .push_next(&mut mf);
-                if enable_ray {
-                    create = create.push_next(&mut acceleration).push_next(&mut ray);
+                if ray_caps.pipeline || ray_caps.inline {
+                    create = create.push_next(&mut acceleration);
+                }
+                if ray_caps.inline {
+                    inline.next = std::ptr::null_mut();
+                    create = create.push_next(&mut inline);
+                }
+                if ray_caps.pipeline {
+                    create = create.push_next(&mut ray);
                 }
                 cluster_feature.next = std::ptr::null_mut();
-                if enable_ray && cluster_feature.cluster_acceleration_structure != 0 {
+                if ray_caps.clusters {
                     create = create.push_next(&mut cluster_feature);
                 }
                 let dev = ins.create_device(pd, &create, None)?;
@@ -316,6 +354,7 @@ impl Gpu {
                     common_clock: clock.is_some(),
                     raster_queries,
                     ray: ray_properties,
+                    ray_caps,
                     ngx,
                     dlss_unavailable,
                     buffer_atomic64,

@@ -1,4 +1,14 @@
 //! Resident cluster LOD with GPU spatial traversal and two-phase visibility rasterization.
+use crate::experiments::assembly::{Primary, Registration as SceneModule};
+pub(super) const MODULE: SceneModule = SceneModule {
+    key: SETTING,
+    primary: Primary::Visibility,
+    restore: None,
+    install: |_world, a| {
+        a.visibility.cluster = true;
+        Ok(())
+    },
+};
 use crate::{rdg::*, render::*, scene::*};
 use anyhow::{Result, ensure};
 use glam::{Mat4, Vec3};

@@ -1,4 +1,16 @@
 //! Random-access neural base colors in the ordinary visibility/PBR material pass.
+use crate::experiments::assembly::{Primary, Registration as SceneModule};
+pub(super) const MODULE: SceneModule = SceneModule {
+    key: SETTING,
+    primary: Primary::Exclusive,
+    restore: None,
+    install: |world, a| {
+        register(&mut a.materials)?;
+        a.camera = Some(camera(world)?);
+        a.technique = Some(std::sync::Arc::new(TextureCompression::new(world)?));
+        Ok(())
+    },
+};
 use crate::{
     engine::Engine,
     import,

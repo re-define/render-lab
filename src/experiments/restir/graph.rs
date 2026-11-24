@@ -86,11 +86,12 @@ impl ShadowCache {
     }
 }
 
-pub(in crate::experiments) fn add_light(
+pub(super) fn add_light(
     g: &mut FrameGraph,
     s: &Snapshot,
     technique: &Restir,
     cfg: Settings,
+    backend: Traversal,
     ResolveInputs {
         ids,
         objects,
@@ -117,7 +118,7 @@ pub(in crate::experiments) fn add_light(
     let jitter = s.temporal.as_ref().map_or([0.; 2], |f| f.jitter_delta);
     let scene = RayScene::build(
         g,
-        cfg.use_hardware(s.scene.setting(crate::experiments::vegetation::SETTING)),
+        backend,
         cfg.indirect(),
         rigid.map(|p| [p.acceleration.clone(), p.triangles.clone()]),
     )?;
@@ -177,7 +178,7 @@ pub(in crate::experiments) fn add_light(
         motion.and(s.temporal.as_ref()).map(|f| f.generation_key()),
         cfg.sampling as u32,
         g.products.cluster_shadow.is_some(),
-        cfg.rays,
+        backend,
         cfg.denoise as u32,
         amount,
         authored.then_some(s.scene.lights.signature),
@@ -303,17 +304,33 @@ pub(in crate::experiments) fn add_light(
     match &scene {
         RayScene::Hardware(n) => {
             let read = Access::RayRead;
-            n.shadows(
-                g,
-                vec![
-                    (current, read),
-                    (lights, read),
-                    (config, read),
-                    (history, read),
-                    (selected, read),
-                    (raw, Access::RayWrite),
-                ],
-            );
+            if n.inline_queries {
+                let op = n.inline(
+                    [w.div_ceil(8), h.div_ceil(8), 1],
+                    spirv!("inline_shadow"),
+                    vec![
+                        (current, R),
+                        (lights, R),
+                        (config, R),
+                        (history, R),
+                        (selected, R),
+                        (raw, W),
+                    ],
+                );
+                g.pass_in(PassPhase::Lighting, "Trace inline proxy shadow rays", op);
+            } else {
+                n.shadows(
+                    g,
+                    vec![
+                        (current, read),
+                        (lights, read),
+                        (config, read),
+                        (history, read),
+                        (selected, read),
+                        (raw, Access::RayWrite),
+                    ],
+                );
+            }
         }
         RayScene::Software {
             nodes,

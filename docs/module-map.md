@@ -72,6 +72,8 @@ flowchart TB
 | [motion](../src/render/motion.rs) · [运动着色器](../shaders/surface_motion.comp) | 结合当前最终可见表面及上一帧几何状态，计算当前到上一帧的屏幕偏移、预期深度和实例／表示标签。 |
 | [post](../src/render/post.rs) · [taa](../src/render/post/taa.rs) · [post/ngx](../src/render/post/ngx.rs) | 前端管理上帧快照、抖动、分辨率和历史重置。TAA 验证并累积历史，还提供诊断视图。NGX 适配层将输入打包为图像，把 SDK 求值声明给 RDG。SDK 的实际验证状态见[后处理文档](viewport-post.md)。 |
 
+从场景组件到相机、调度器、材质和主技术的装配由[实验注册与装配](../src/experiments/assembly.rs)负责。每个模块拥有自己的注册项，多个独占主技术或独占技术与可见性模块同时被要求时，错误列出发生冲突的键。GPU 设备能力与帧槽版本的交界见[光追能力矩阵](ray-tracing-rhi.md)。
+
 ## 实验怎样接入引擎
 
 ~~~mermaid

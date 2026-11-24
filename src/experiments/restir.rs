@@ -1,5 +1,6 @@
 use super::light_stack::{AddLight, Channel, Contribution, Producer};
 use crate::render::FrameGraph;
+use crate::render::rays::Traversal;
 mod diffuse_gi;
 pub(super) mod graph;
 mod ray_scene;
@@ -82,6 +83,7 @@ enum RayBackend {
     #[default]
     Auto,
     Hardware,
+    Inline,
     Software,
 }
 
@@ -126,15 +128,47 @@ impl Default for Settings {
 }
 
 impl Settings {
-    pub(super) fn hardware_rays(self, mega: bool) -> bool {
-        self.rays == RayBackend::Hardware || (self.rays == RayBackend::Auto && mega)
+    fn resolve_rays(self, caps: crate::rhi::RayCapabilities, mega: bool) -> Result<Traversal> {
+        if mega {
+            ensure!(
+                caps.pipeline && caps.clusters,
+                "selected forest clusters require VK_NV_cluster_acceleration_structure and a KHR ray pipeline"
+            );
+            ensure!(
+                matches!(self.rays, RayBackend::Auto | RayBackend::Hardware),
+                "selected forest clusters require pipeline traversal; select adaptive geometry for inline or software queries"
+            );
+            return Ok(Traversal::Pipeline);
+        }
+        match self.rays {
+            // Closest-hit GI uses the pipeline when available; ray queries remain
+            // useful for direct occlusion and adapters without a ray pipeline.
+            RayBackend::Auto if self.indirect() && caps.pipeline => Ok(Traversal::Pipeline),
+            RayBackend::Auto if caps.inline => Ok(Traversal::Inline),
+            RayBackend::Auto if caps.pipeline => Ok(Traversal::Pipeline),
+            RayBackend::Auto => Ok(Traversal::Software),
+            RayBackend::Hardware if !caps.pipeline => {
+                bail!("hardware pipeline requires VK_KHR_ray_tracing_pipeline")
+            }
+            RayBackend::Inline if !caps.inline => {
+                bail!("inline traversal requires VK_KHR_ray_query")
+            }
+            RayBackend::Hardware => Ok(Traversal::Pipeline),
+            RayBackend::Inline => Ok(Traversal::Inline),
+            RayBackend::Software => Ok(Traversal::Software),
+        }
     }
 
-    fn use_hardware(self, vegetation: Option<&serde_json::Value>) -> bool {
-        self.hardware_rays(
+    fn selected_rays(
+        self,
+        caps: crate::rhi::RayCapabilities,
+        vegetation: Option<&serde_json::Value>,
+    ) -> Result<Traversal> {
+        self.resolve_rays(
+            caps,
             vegetation
                 .and_then(|v| v.get("mega_shadows"))
-                .and_then(serde_json::Value::as_bool)
+                .and_then(|v| v.as_bool())
                 == Some(true),
         )
     }
@@ -202,6 +236,22 @@ pub(super) fn open_producer(world: &World, _: &rayon::ThreadPool) -> Result<Box<
     read(world)?;
     Ok(Box::new(Restir::new()))
 }
+pub(super) fn check_cluster_mode(
+    raw: &serde_json::Value,
+    caps: crate::rhi::RayCapabilities,
+) -> Result<()> {
+    decode(raw)?.resolve_rays(caps, true)?;
+    Ok(())
+}
+pub(super) fn validate_device(world: &World, caps: crate::rhi::RayCapabilities) -> Result<()> {
+    read(world)?.1.selected_rays(
+        caps,
+        world
+            .first_raw_component(super::vegetation::SETTING)
+            .map(|(_, v)| v),
+    )?;
+    Ok(())
+}
 pub fn command(engine: &mut Engine, args: &str) -> Result<String> {
     let (id, mut cfg) = read(&engine.world)?;
     let words: Vec<_> = args.split_whitespace().collect();
@@ -214,11 +264,32 @@ pub fn command(engine: &mut Engine, args: &str) -> Result<String> {
         ["ris"] => cfg.sampling = Sampling::Ris,
         ["reuse"] => cfg.sampling = Sampling::Restir,
         ["rays" | "proxy-rays", "hardware"] => cfg.rays = RayBackend::Hardware,
+        ["rays", "status"] => {
+            let caps = engine.ray_caps;
+            let active = cfg.selected_rays(
+                caps,
+                engine
+                    .world
+                    .first_raw_component(super::vegetation::SETTING)
+                    .map(|(_, v)| v),
+            )?;
+            return Ok(format!(
+                "requested {:?}, active {active:?}; KHR pipeline {}, inline query {}, NV clusters {}",
+                cfg.rays, caps.pipeline, caps.inline, caps.clusters
+            ));
+        }
+        ["rays", "auto"] => cfg.rays = RayBackend::Auto,
+        ["rays", "inline"] => cfg.rays = RayBackend::Inline,
         ["rays" | "proxy-rays", "software"] => cfg.rays = RayBackend::Software,
         ["rays", "toggle"] => {
             let vegetation = engine.world.first_raw_component(super::vegetation::SETTING);
-            (cfg.rays, selected) = if cfg.use_hardware(vegetation.map(|(_, value)| value)) {
+            (cfg.rays, selected) = if cfg
+                .selected_rays(engine.ray_caps, vegetation.map(|(_, value)| value))?
+                != Traversal::Software
+            {
                 (RayBackend::Software, "rays software")
+            } else if !engine.ray_caps.pipeline && engine.ray_caps.inline {
+                (RayBackend::Inline, "rays inline")
             } else {
                 (RayBackend::Hardware, "rays hardware")
             };
@@ -238,10 +309,17 @@ pub fn command(engine: &mut Engine, args: &str) -> Result<String> {
         ["history-stats", "off"] => cfg.history_stats = false,
         ["camera", view] => engine.camera = camera(view)?,
         _ => bail!(
-            "restir gi direct/single/multi · restir rays hardware/software/toggle · restir uniform/ris/reuse/reference · restir denoise off/spatial/svgf · restir source auto/scene/bank · restir lights N · restir candidates N · restir samples N · restir ev EV · restir camera overview/contact · restir history-stats on/off"
+            "restir gi direct/single/multi · restir rays auto/hardware/inline/software/toggle · restir uniform/ris/reuse/reference · restir denoise off/spatial/svgf · restir source auto/scene/bank · restir lights N · restir candidates N · restir samples N · restir ev EV · restir camera overview/contact · restir history-stats on/off"
         ),
     }
     cfg.validate()?;
+    cfg.selected_rays(
+        engine.ray_caps,
+        engine
+            .world
+            .first_raw_component(super::vegetation::SETTING)
+            .map(|(_, v)| v),
+    )?;
     Arc::make_mut(&mut engine.world)
         .entities
         .get_mut(&id)
@@ -267,6 +345,7 @@ impl Restir {
 }
 pub(super) const REGISTRATION: super::light_stack::Registration =
     super::light_stack::Registration {
+        validate_device: Some(validate_device),
         key: SETTING,
         feature: "restir",
         inputs: crate::render::LightingInput::DIRECT_DIFFUSE,
@@ -309,12 +388,13 @@ impl Restir {
         surfaces: &[PosedSurface<'_>],
         cfg: Settings,
     ) -> Result<AddLight<'a>> {
-        let rigid = (!cfg.use_hardware(s.scene.setting(super::vegetation::SETTING)))
+        let backend = cfg.selected_rays(s.ray_caps, s.scene.setting(super::vegetation::SETTING))?;
+        let rigid = (backend == Traversal::Software)
             .then(|| self.shadow.get(&s.scene, surfaces))
             .transpose()?;
         Ok(Box::new(move |g, inputs| {
             let (direct, controls, indirect) =
-                graph::add_light(g, s, self, cfg, inputs, rigid.as_deref())?;
+                graph::add_light(g, s, self, cfg, backend, inputs, rigid.as_deref())?;
             Ok(Contribution {
                 channel: Channel::Direct,
                 resources: (direct, controls),
@@ -328,6 +408,32 @@ impl Restir {
 mod tests {
     use super::*;
     use crate::{render::MaterialPrograms, rhi::Backend};
+
+    #[test]
+    fn selects_only_enabled_ray_features() {
+        use crate::rhi::RayCapabilities;
+        let mut cfg = Settings::default();
+        let mut caps = RayCapabilities::default();
+        assert_eq!(cfg.resolve_rays(caps, false).unwrap(), Traversal::Software);
+        cfg.rays = RayBackend::Hardware;
+        assert!(cfg.resolve_rays(caps, false).is_err());
+        caps.pipeline = true;
+        assert!(cfg.resolve_rays(caps, true).is_err());
+        caps.clusters = true;
+        assert_eq!(cfg.resolve_rays(caps, true).unwrap(), Traversal::Pipeline);
+        cfg.rays = RayBackend::Inline;
+        assert!(cfg.resolve_rays(caps, false).is_err());
+        cfg.rays = RayBackend::Auto;
+        caps.inline = true;
+        cfg.gi = DiffuseGi::Multi;
+        assert_eq!(cfg.resolve_rays(caps, false).unwrap(), Traversal::Pipeline);
+        cfg.gi = DiffuseGi::Direct;
+        assert_eq!(cfg.resolve_rays(caps, false).unwrap(), Traversal::Inline);
+        cfg.rays = RayBackend::Inline;
+        caps.pipeline = false;
+        assert_eq!(cfg.resolve_rays(caps, false).unwrap(), Traversal::Inline);
+        assert!(cfg.resolve_rays(caps, true).is_err());
+    }
 
     fn snapshot() -> Result<Snapshot> {
         let mut materials = MaterialPrograms::default();

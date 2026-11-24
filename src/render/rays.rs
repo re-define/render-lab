@@ -4,7 +4,7 @@ use super::*;
 use crate::rdg::PassPhase;
 use anyhow::Context;
 mod scene;
-pub(crate) use scene::{NativeScene, RayScene};
+pub(crate) use scene::{NativeScene, RayScene, Traversal};
 #[derive(Clone, Copy, Debug)]
 pub struct Surface {
     pub geometry: SurfaceBuffers,

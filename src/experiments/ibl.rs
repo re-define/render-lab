@@ -238,6 +238,7 @@ fn backdrop(
 
 pub(super) const REGISTRATION: super::light_stack::Registration =
     super::light_stack::Registration {
+        validate_device: None,
         key: SETTING,
         feature: "ibl",
         inputs: crate::render::LightingInput::IBL,

@@ -115,6 +115,7 @@ pub enum Access {
     AccelerationRead,
     AccelerationWrite,
     RayAcceleration,
+    ComputeAcceleration,
     RayRead,
     RayWrite,
     RayReadWrite,
@@ -231,6 +232,12 @@ pub enum Op {
         instances: Vec<RayInstance>,
         output: Resource,
     },
+    RayQuery {
+        groups: [u32; 3],
+        program: Dispatch,
+        tlas: Resource,
+        blases: Vec<Resource>,
+    },
     TraceRays {
         extent: [u32; 2],
         program: Dispatch,
@@ -262,6 +269,7 @@ impl Op {
             Self::Draw { program, .. }
             | Self::Compute { program, .. }
             | Self::ComputeIndirect { program, .. }
+            | Self::RayQuery { program, .. }
             | Self::TraceRays { program, .. } => Some(program),
             _ => None,
         }
@@ -364,6 +372,12 @@ impl Op {
             } => {
                 out.push((tlas, Access::RayAcceleration));
                 out.extend(blases.iter().map(|r| (*r, Access::RayAcceleration)));
+            }
+            Self::RayQuery {
+                tlas, ref blases, ..
+            } => {
+                out.push((tlas, Access::ComputeAcceleration));
+                out.extend(blases.iter().map(|r| (*r, Access::ComputeAcceleration)));
             }
             Self::Present(r) => out.push((r, Access::CopySrc)),
             Self::HostRead(r) | Self::Counters { buffer: r, .. } => out.push((r, Access::HostRead)),
@@ -646,6 +660,7 @@ impl Graph {
             | Op::BuildClusterBottom { .. }
             | Op::BuildBlas { .. }
             | Op::BuildTlas { .. }
+            | Op::RayQuery { .. }
             | Op::TraceRays { .. } => PassPhase::RayTracing,
             Op::Counters { .. } => PassPhase::Counters,
             Op::Present(_) => PassPhase::Present,
@@ -671,6 +686,7 @@ impl Graph {
             | Op::BuildClusterBottom { .. }
             | Op::BuildBlas { .. }
             | Op::BuildTlas { .. }
+            | Op::RayQuery { .. }
             | Op::TraceRays { .. } => Queue::Compute,
             _ => Queue::Transfer,
         };

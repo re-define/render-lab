@@ -888,7 +888,7 @@ impl ClusterLod {
         let mega = plants.is_some_and(|v| v.mega_shadows)
             && g.products.request_ray_proxies
             && crate::render::rays::view(s).is_none()
-            && restir.is_some_and(|cfg| cfg.hardware_rays(true));
+            && restir.is_some();
         let indirect = restir.is_some_and(|cfg| cfg.indirect());
         let (caster_rays, light_count) =
             if mega && !indirect && restir.is_some_and(|cfg| cfg.scene_lights(s)) {

@@ -8,7 +8,7 @@
 #define LIGHTING_TRIANGLES 6
 #define SKINNED_SHADOWS
 #define SCENE_HAS_DEFORMED (viewport.z!=0u)
-#ifdef GI_SHADOW
+#if defined(GI_SHADOW) || defined(SCENE_RAY_INLINE)
 #define SCENE_RAY_HARDWARE
 #ifdef PROXY_SHADOWS
 #define TLAS_OFFSET 48

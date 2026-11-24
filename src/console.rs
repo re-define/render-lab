@@ -18,7 +18,7 @@ mod lights;
 mod memory;
 
 const HELP: &str = concat!(
-    "fit · pause · rdg · hud on/off · post off/taa/dlss/dlaa/reset/status",
+    "fit · pause · rdg · timeline FILE.json · hud on/off · post off/taa/dlss/dlaa/reset/status",
     " · post view motion/reprojection/off · stats · schedule · memory idle/alloc/driver [NAME or #OWNER]",
     " · light list/point/sun/move/aim/power/color/enable/angular-radius · import/save/load PATH · lod PIXELS",
     " · lodview on/off · vegetation auto/triangles/voxels/pixels/wind/time/view/camera",
@@ -61,6 +61,11 @@ impl Console {
         let arg = arg.trim().trim_matches('"');
         match verb {
             "help" => return Ok(HELP.into()),
+            "timeline" => {
+                ensure!(!arg.is_empty(), "timeline FILE.json");
+                crate::rhi::timeline::export(passes, Path::new(arg))?;
+                return Ok(format!("GPU timeline saved to {arg}"));
+            }
             "memory" => return memory::describe(engine.last_memory().as_ref(), arg),
             "schedule" => {
                 ensure!(arg.is_empty(), "schedule takes no arguments");
@@ -188,6 +193,10 @@ impl Console {
                     "rays hardware/software/normals/distance/off"
                 );
                 let world = Arc::make_mut(&mut engine.world);
+                ensure!(
+                    arg != "hardware" || engine.ray_caps.pipeline,
+                    "hardware inspection requires VK_KHR_ray_tracing_pipeline"
+                );
                 let key = crate::render::rays::VIEW;
                 let id = world
                     .first_raw_component(key)

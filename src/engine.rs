@@ -49,6 +49,7 @@ pub struct Engine {
     pub camera: Camera,
     pub post: post::Settings,
     dlss_unavailable: Option<String>,
+    pub ray_caps: crate::rhi::RayCapabilities,
     pub schedule: Schedule,
     pub technique: Arc<dyn Technique>,
     pub tasks: Arc<ThreadPool>,
@@ -100,7 +101,11 @@ impl Engine {
                     }
                 };
                 if ready
-                    .send(Ok((backend.dlss_unavailable(), backend.buffer_atomic64())))
+                    .send(Ok((
+                        backend.dlss_unavailable(),
+                        backend.buffer_atomic64(),
+                        backend.ray_capabilities(),
+                    )))
                     .is_err()
                 {
                     return;
@@ -137,7 +142,8 @@ impl Engine {
                     report(frame);
                 }
             })?;
-        let (dlss_unavailable, buffer_atomic64) = startup.recv()?.map_err(|e| anyhow!(e))?;
+        let (dlss_unavailable, buffer_atomic64, ray_caps) =
+            startup.recv()?.map_err(|e| anyhow!(e))?;
         let pool = tasks.clone();
         let mailbox = latest.clone();
         let render = thread::Builder::new()
@@ -146,6 +152,7 @@ impl Engine {
                 let mut temporal = post::Sequence::default();
                 for mut frame in scenes {
                     frame.snapshot.buffer_atomic64 = buffer_atomic64;
+                    frame.snapshot.ray_caps = ray_caps;
                     temporal.assign(frame.post, &frame.technique, &mut frame.snapshot);
                     match pool.install(|| {
                         let started = std::time::Instant::now();
@@ -185,6 +192,7 @@ impl Engine {
             camera: Camera::default(),
             post: Default::default(),
             dlss_unavailable,
+            ray_caps,
             schedule: Schedule::default(),
             technique,
             tasks,

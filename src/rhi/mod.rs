@@ -19,6 +19,7 @@ mod queues;
 mod ray;
 mod record;
 mod slot;
+pub mod timeline;
 mod transient;
 use crate::rdg::*;
 use crate::render::FramePlan;
@@ -40,6 +41,10 @@ enum Physical {
     SharedBuffer(Arc<Buffer>),
     Image(Image, ImageDesc),
     Acceleration(Box<ray::Acceleration>),
+    StaticBlas {
+        blas: Arc<ray::StaticBlas>,
+        scratch: Option<Buffer>,
+    },
     Clusters(Box<clusters::Allocation>),
 }
 impl Physical {
@@ -236,6 +241,14 @@ impl Drop for Recorder {
     }
 }
 
+/// Enabled device features available when choosing a graph implementation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RayCapabilities {
+    pub pipeline: bool,
+    pub inline: bool,
+    pub clusters: bool,
+}
+
 pub struct Backend {
     gpu: Arc<Gpu>,
     slots: [FrameSlot; 2],
@@ -243,6 +256,7 @@ pub struct Backend {
     completed: VecDeque<Frame>,
     pipes: HashMap<(Shader, usize), Pipeline>,
     resident: HashMap<(usize, u32), ResidentBuffer>,
+    static_blas: ray::StaticCache,
     histories: HashMap<(u64, usize, [u32; 2]), Arc<Buffer>>,
     frame_number: u64,
     first_profile: Option<Arc<FrameProfile>>,
@@ -258,6 +272,7 @@ struct Submitted {
     slot: usize,
     output: Resource,
     retire: Vec<u64>,
+    batches: Vec<Arc<frame::QueueBatch>>,
     start: Instant,
     profile: FrameProfile,
     managed: ManagedMemory,
@@ -267,6 +282,9 @@ struct Submitted {
 impl Backend {
     pub(crate) fn dlss_unavailable(&self) -> Option<String> {
         self.gpu.dlss_unavailable.clone()
+    }
+    pub fn ray_capabilities(&self) -> RayCapabilities {
+        self.gpu.ray_caps
     }
     pub fn buffer_atomic64(&self) -> bool {
         self.gpu.buffer_atomic64
@@ -299,6 +317,7 @@ impl Backend {
             completed: VecDeque::new(),
             pipes: HashMap::new(),
             resident: HashMap::new(),
+            static_blas: Default::default(),
             histories: HashMap::new(),
             frame_number: 0,
             first_profile: None,
@@ -354,12 +373,20 @@ impl Backend {
                 Op::TraceRays {
                     extent, program, ..
                 } => {
+                    ensure!(
+                        g.ray_caps.pipeline,
+                        "RT pass requires VK_KHR_ray_tracing_pipeline"
+                    );
                     g.ray
                         .as_ref()
                         .context("RT experiment requires VK_KHR_ray_tracing_pipeline")?
                         .validate_dispatch(*extent, program.shader, &g.limits)
                         .with_context(|| format!("ray pass {}", pass.name))?;
                 }
+                Op::RayQuery { .. } => ensure!(
+                    g.ray_caps.inline,
+                    "compute ray queries require VK_KHR_ray_query"
+                ),
                 Op::Dlss(_) => ensure!(
                     g.ngx.is_some(),
                     "{}",
@@ -370,7 +397,7 @@ impl Backend {
         }
         ensure!(
             ray_vertices.is_empty() || g.ray.is_some(),
-            "RT experiment requires VK_KHR_ray_tracing_pipeline and VK_KHR_acceleration_structure"
+            "acceleration structure builds require VK_KHR_acceleration_structure"
         );
         if slot.heap.slots.len() < graph.resources.len() {
             // A descriptor heap reservation stays bound even after timeline retirement.
@@ -394,6 +421,34 @@ impl Backend {
         let mut dynamic_bytes = 0;
         let mut table_bytes = 0;
         let mut pooled = HashMap::<usize, Arc<Buffer>>::new();
+        self.static_blas.prune();
+        let resident_source = |r: Resource| match &graph.resources[r.0].1 {
+            Storage::Buffer { initial, .. }
+                if graph.resident_inputs.contains(&r) && !plan.written[r.0] =>
+            {
+                initial.as_ref()
+            }
+            _ => None,
+        };
+        let static_inputs = graph
+            .passes
+            .iter()
+            .filter_map(|p| {
+                let Op::BuildBlas {
+                    vertices,
+                    topology,
+                    output,
+                    ..
+                } = p.op
+                else {
+                    return None;
+                };
+                Some((
+                    output,
+                    [resident_source(vertices)?, resident_source(topology)?],
+                ))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
         let mut claimed = std::collections::BTreeSet::new();
         for (i, (name, s)) in graph.resources.iter().enumerate() {
             let resource = Resource(i);
@@ -513,6 +568,13 @@ impl Backend {
             if let Some(buffer) = shared {
                 slot.heap.write(g, i, &buffer, buffer.size)?;
                 slot.resources[i] = Physical::SharedBuffer(buffer);
+                continue;
+            }
+            if let Storage::Acceleration(shape) = s
+                && let Some(&sources) = static_inputs.get(&resource)
+            {
+                slot.resources[i] = self.static_blas.bind(g, *shape, sources, tag)?;
+                slot.heap.slots[i] = None;
                 continue;
             }
             let growable = graph.scratch_owners.contains_key(&resource);
@@ -653,16 +715,9 @@ impl Backend {
                     output,
                     ..
                 } => {
-                    let source = |r: Resource| match &graph.resources[r.0].1 {
-                        Storage::Buffer { initial, .. } if graph.resident_inputs.contains(&r) => {
-                            initial.as_ref()
-                        }
-                        _ => None,
-                    };
-                    let Physical::Acceleration(blas) = &mut slot.resources[output.0] else {
-                        unreachable!()
-                    };
-                    blas.prepare_blas(source(vertices), source(topology));
+                    if let Physical::Acceleration(blas) = &mut slot.resources[output.0] {
+                        blas.prepare_blas(resident_source(vertices), resident_source(topology));
+                    }
                 }
                 Op::BuildTlas {
                     ref instances,
@@ -673,6 +728,9 @@ impl Backend {
                     for instance in instances {
                         let (address, changed) = match &slot.resources[instance.blas.0] {
                             Physical::Acceleration(blas) => (blas.address, blas.needs_build),
+                            Physical::StaticBlas { blas, scratch } => {
+                                (blas.acceleration.address, scratch.is_some())
+                            }
                             Physical::Clusters(blas) => (blas.address, true),
                             _ => unreachable!(),
                         };
@@ -692,7 +750,7 @@ impl Backend {
                 _ => (),
             }
             if let Some(d) = p.op.program() {
-                let ray_bytes = if matches!(p.op, Op::TraceRays { .. }) {
+                let ray_bytes = if matches!(p.op, Op::TraceRays { .. } | Op::RayQuery { .. }) {
                     8
                 } else {
                     0
@@ -708,7 +766,7 @@ impl Backend {
                     e.insert(Pipeline::new(g, d, slot.heap.stride)?);
                 }
             }
-            if let Op::Compute { groups, .. } = p.op {
+            if let Op::Compute { groups, .. } | Op::RayQuery { groups, .. } = p.op {
                 ensure!(
                     groups
                         .iter()
@@ -802,6 +860,7 @@ impl Backend {
         self.pending.clear();
         self.surface.take();
         self.timelines = queues::Timelines::new(&self.gpu)?;
+        self.static_blas = Default::default();
         self.histories.clear();
         for slot in &mut self.slots {
             slot.clear();
@@ -928,8 +987,26 @@ impl Backend {
         }
         let record_ms = ms(recording_start);
         let submit_start = Instant::now();
-        let (submits, timeline_waits) =
-            self.timelines.submit(&self.gpu, &plan, recorders, image)?;
+        let batches = self
+            .timelines
+            .submit(&self.gpu, &plan, recorders, &slot.resources, image)?;
+        let mut starts = batches
+            .iter()
+            .enumerate()
+            .filter(|(i, b)| *i == 0 || !Arc::ptr_eq(b, &batches[i - 1]));
+        let (submits, timeline_waits) = starts
+            .by_ref()
+            .fold((0, 0), |(n, w), (_, b)| (n + 1, w + b.waits.len()));
+        for (step, batch) in plan.steps.iter().zip(&batches) {
+            if let Op::BuildBlas { output, .. } = plan.graph.passes[step.index].op
+                && let Physical::StaticBlas {
+                    blas,
+                    scratch: Some(_),
+                } = &slot.resources[output.0]
+            {
+                let _ = blas.ready.set((batch.queue, batch.signal));
+            }
+        }
         let submit_ms = ms(submit_start);
         let present_start = Instant::now();
         let presented = image
@@ -961,7 +1038,7 @@ impl Backend {
             extracted_entities: plan.extraction.entities_visited,
             updated_instances: plan.extraction.instances_updated,
             acceleration_builds: slot.resources.iter().filter(|resource| {
-                matches!(resource, Physical::Clusters(_)) || matches!(resource, Physical::Acceleration(acceleration) if acceleration.needs_build && !acceleration.update)
+                matches!(resource, Physical::Clusters(_) | Physical::StaticBlas{scratch:Some(_),..}) || matches!(resource, Physical::Acceleration(acceleration) if acceleration.needs_build && !acceleration.update)
             }).count(),
             acceleration_updates: slot.resources.iter().filter(|r| matches!(r, Physical::Acceleration(a) if a.needs_build && a.update)).count(),
             ..Default::default()
@@ -972,6 +1049,7 @@ impl Backend {
             output,
             managed: self.gpu.allocator.lock().unwrap().snapshot(),
             retire: self.timelines.targets(),
+            batches,
             start: frame_start,
             profile,
             recordings,
@@ -986,6 +1064,7 @@ impl Backend {
             slot,
             output,
             retire,
+            batches,
             start,
             mut profile,
             managed,
@@ -1007,7 +1086,9 @@ impl Backend {
         let mut passes = vec![];
         let mut clock_origin = None;
         let mut span = [0i64; 2];
-        for (r, step) in recorders.iter().zip(&plan.steps) {
+        let period_ms = f64::from(self.gpu.limits.timestamp_period) * 1e-6;
+        let aligned = self.gpu.common_clock || self.gpu.queues.len() == 1;
+        for ((r, step), batch) in recorders.iter().zip(&plan.steps).zip(batches) {
             let mut pair = [0_u64; 2];
             unsafe {
                 d.get_query_pool_results(
@@ -1019,16 +1100,24 @@ impl Backend {
                     vk::QueryResultFlags::_64 | vk::QueryResultFlags::WAIT,
                 )?;
             }
-            if self.gpu.common_clock {
+            let interval = if aligned {
                 let origin = *clock_origin.get_or_insert(pair[0]);
                 let shift = 64 - self.gpu.timestamp_bits;
                 let relative = |v: u64| ((v.wrapping_sub(origin) << shift) as i64) >> shift;
                 span[0] = span[0].min(relative(pair[0]));
                 span[1] = span[1].max(relative(pair[1]));
-            }
+                Some([
+                    relative(pair[0]) as f64 * period_ms,
+                    relative(pair[1]) as f64 * period_ms,
+                ])
+            } else {
+                None
+            };
             let ticks =
                 pair[1].wrapping_sub(pair[0]) & (u64::MAX >> (64 - self.gpu.timestamp_bits));
             passes.push(PassReport {
+                batch,
+                interval,
                 raster: if matches!(plan.graph.passes[step.index].op, Op::Draw { .. }) {
                     r.raster.as_ref().map(|q| q.counts()).transpose()?
                 } else {
@@ -1090,7 +1179,20 @@ impl Backend {
                 }
                 Physical::Image(i, ..) => account(&i.allocation),
                 Physical::Clusters(a) => a.allocations().for_each(&mut account),
+                Physical::StaticBlas { blas, scratch } => {
+                    if shared.insert(blas.acceleration.address) {
+                        blas.acceleration.allocations().for_each(&mut account);
+                    }
+                    if let Some(scratch) = scratch {
+                        account(&scratch.allocation);
+                    }
+                }
                 Physical::Acceleration(a) => a.allocations().for_each(&mut account),
+            }
+        }
+        for resource in &mut slot.resources {
+            if let Physical::StaticBlas { scratch, .. } = resource {
+                scratch.take();
             }
         }
         if let Some(r) = plan.material_atlas {
@@ -1122,10 +1224,14 @@ impl Backend {
         }
         self.frame_number += u64::from(presentation.is_none() || profile.wsi_binary_pairs != 0);
         profile.rhi_ms = start.elapsed().as_secs_f64() * 1000.;
-        profile.gpu_span_ms = self
-            .gpu
-            .common_clock
-            .then(|| (span[1] - span[0]) as f64 * self.gpu.limits.timestamp_period as f64 * 1e-6);
+        profile.gpu_span_ms = aligned.then(|| (span[1] - span[0]) as f64 * period_ms);
+        for p in &mut passes {
+            if let Some(interval) = &mut p.interval {
+                for t in interval {
+                    *t -= span[0] as f64 * period_ms;
+                }
+            }
+        }
         profile.recording_workers = workers.len();
         profile.overlapping_recordings = peak as usize;
         profile.physical_queues = self.gpu.queues.len();

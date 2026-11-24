@@ -14,6 +14,7 @@ fn render(
         engine.materials.clone(),
     )?;
     view.buffer_atomic64 = gpu.buffer_atomic64();
+    view.ray_caps = gpu.ray_capabilities();
     let mut g = engine.technique.build(&view)?;
     if probe {
         let cluster = g.products.cluster_shadow.unwrap();

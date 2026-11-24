@@ -31,7 +31,7 @@
 | `restir` | 在柱廊中从大量点光源抽样。初始 RIS、时空 reservoir 复用和可见性查询输出直接光。系统可选择空间 à-trous 或带重投影、方差估计的 SVGF 风格滤波。 | `restir uniform`、`restir ris`、`restir reuse` 与 `restir reference` 区分估计器。`restir denoise off` 隔离采样误差。运动中的银狼另有专门的重投影对照。[帧图](../src/experiments/restir/graph.rs) · [银狼逐帧误差实验](lighting-comparison.md) |
 | `ibl` | 从 Studio Small 02 HDR 环境图烘焙漫反射辐照度、分粗糙度的 GGX 预过滤环境和 BRDF LUT。材质用 split-sum 合成环境反射，球阵改变金属度和粗糙度。 | `ibl yaw 90` 转动环境。烘焙在启动时进行并在进程内复用，显式表面反射射线另由 RT 实验研究。[环境预计算](../src/experiments/ibl/bake.rs) · [材质输入与控制](../src/experiments/ibl.rs) |
 | `gi12-forest`、`gi12-silver` | 在风动森林和运动角色上组合 ReSTIR DI、固定分辨率屏幕探针与世界辐亮度缓存。漫反射命中点用 UV 采样材质定义的 GI 反射色和自发光。延迟的第二跳辐亮度反馈给缓存。 | `restir gi direct`、`restir gi single`、`restir gi multi` 比较直接光、单跳与两跳。实现范围是 GI-1.2 的漫反射缓存思路，当前反弹深度为两跳。[传播机制、画面与限制](gi12.md) |
-| `forest-karst` | 用岩柱、碎石坡与混交林研究薄叶逆光和树冠内外亮度。默认开启 ReSTIR DI、GI-1.2 两跳漫反射、自适应代理的硬件光追和 TAA。 | `vegetation camera karst` 与 `vegetation camera karst-grove` 复拍俯视和谷内机位。`restir rays software`、`restir rays hardware` 切换场景射线后端。[机位与实验图](procedural-vegetation.md#岩柱森林的树冠受光) · [同路径光追开销](procedural-vegetation.md#岩柱森林的多跳光追) |
+| `forest-karst` | 用岩柱、碎石坡与混交林研究薄叶逆光和树冠内外亮度。默认开启 ReSTIR DI、GI-1.2 两跳漫反射、自适应代理的硬件光追和 TAA。 | `vegetation camera karst` 与 `vegetation camera karst-grove` 复拍俯视和谷内机位。`restir rays software`、`restir rays inline`、`restir rays hardware` 切换场景射线后端。[队列和显存实测](forest-architecture-benchmark.md) · [机位与实验图](procedural-vegetation.md#岩柱森林的树冠受光) · [同路径光追开销](procedural-vegetation.md#岩柱森林的多跳光追) |
 
 ## 森林的 Mega Geometry 对照
 
