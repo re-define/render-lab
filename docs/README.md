@@ -21,6 +21,13 @@
 | 如何接入 KHR 管线、内联查询或 NV 簇几何 | [光追 RHI 能力矩阵](ray-tracing-rhi.md) |
 | 提交前如何校验代码、资产和 GPU 路径 | [开发与验证规范](../CONTRIBUTING.md) |
 
+## 后续架构调研
+
+| 主题 | 实现与接入草案 |
+| --- | --- |
+| 动画 | [Unreal Animation Framework](unreal-animation-framework.md) · 模块、trait 图、求值程序、Pose Search 与银狼迁移 |
+| 物理 | [Chaos 物理与破碎](chaos-physics.md) · 固定步、线程交接、碰撞、求解岛和角色姿态交接 |
+
 ## 专题与测量
 
 | 主题 | 构建过程、配置和历史数据 |
