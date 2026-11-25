@@ -23,6 +23,7 @@ const HELP: &str = concat!(
     " · light list/point/sun/move/aim/power/color/enable/angular-radius · import/save/load PATH · lod PIXELS",
     " · lodview on/off · vegetation auto/triangles/voxels/pixels/wind/time/view/camera",
     " · motion SPEED TURN [STRAFE] · motionsearch kd/scan · record PATH · stoprecord",
+    " · contact status/physics/auto/manual/target/hand/feet/view/action · contact gravity G · contact impulse J",
     " · toon outline/width/light/threshold/sdf/view · texture neural/original/stats",
     " · gaussian tile/bvh/compact-tile/compact-bvh/scan/original/stats",
     " · gi off/ssgi/probes/ray/view/camera · shadow hard/pcf/pcss/ray/size/bias/view/camera",
@@ -67,6 +68,7 @@ impl Console {
                 return Ok(format!("GPU timeline saved to {arg}"));
             }
             "memory" => return memory::describe(engine.last_memory().as_ref(), arg),
+            "contact" => return motion::silver::contact::command(engine, arg),
             "schedule" => {
                 ensure!(arg.is_empty(), "schedule takes no arguments");
                 return Ok(engine.schedule.describe());

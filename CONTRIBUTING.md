@@ -1,58 +1,22 @@
-# Render Lab 开发规范
+# 修改和验证引擎
 
-从引擎根目录运行本文中的命令。首次启动见[项目 README](README.md)，各模块契约和实验测量见[文档索引](docs/README.md)。
+从仓库根目录执行命令。Rust 使用 edition 2024，公共类型写明所有者、坐标空间、时间单位和失败行为。系统输出与调试命令使用同一运行入口，以便存档、窗口、录制和测试复用。
 
-## 代码放在哪里
-
-| 改动 | 归属与约定 |
+| 修改位置 | 应核对的契约 |
 | --- | --- |
-| 场景数据与模拟 | `scene` 拥有可保存的实体、组件和资产 ID。新模块实现 `SimulationSystem`，使用 `SystemContext` 按声明读写组件、局部变换和运行期资源。能列举姿态目标时，声明 `LocalTransformsById`，从 `transform_targets()` 分别返回读取和写入的实体 ID。选择目标所读的组件也要登记。需要指定前驱时登记稳定键和 `after`。同一固定子步内有先后关系的系统放进同一个 `fixed_stage`。旧式整世界闭包独占执行。 |
-| 渲染前端 | `render::SceneExtractor` 从 ECS 提取只读快照。材质、几何和灯光程序从快照获取输入。持久数据使用实体或资产 ID，GPU 槽号限于生成它的注册表或帧。 |
-| 实验 | 在 `experiments` 下按研究对象组织。场景构建、控制命令与 GPU 算法各自有明确入口。接入时同时考虑首次创建和从存档恢复。优先复用已有的几何准备、材质注册和后处理入口。 |
-| GPU 资源与同步 | 语义 pass 使用 `Graph::pass_in` 指定稳定统计分类。pass 在 RDG 中声明读写、图像用途、地址表引用和历史资源。RHI 负责 Vulkan 对象、录制、队列同步与资源退役。修改共享资源生命周期时，用至少两个在途帧验证。 |
-| 界面与工具 | UI 负责输入和显示，操作通过与 CLI 共用的控制台命令或引擎接口提交。训练、烘焙和格式转换放在 `tools/`，产物通过已有的导入或实验入口接入。 |
+| ECS 与任务 | 声明组件和资源读写，骨骼用具体实体 ID 绑定。并行任务读同一快照，按输入次序提交。失败时检查前序修改的回滚。改变绑定后，在同一固定子步的下一阶段重新解析。 |
+| 场景提取 | 检查初建、稀疏修改、连续大量姿态写入、不同步的两个提取器、结构修改和失败恢复。用冷提取核对模型和骨骼矩阵。添加快照组件时声明依赖及监听的世界变换。 |
+| 动画与物理 | 新输入通过固定时钟进入模拟。明确运动由哪个系统写回，给存档新增字段提供旧数据默认值。用不同显示步长、本地坐标和世界空间的断言复验。 |
+| RDG、RHI 与 shader | 标明 pass 分类、真实资源读写、图像布局和队列。检查帧槽复用、跨队列等待、历史失效、资源退役，以及 Rust 和 shader 的数据布局。 |
+| 实验、CLI 与资产 | 登记预设、系统、材质生产者和恢复入口。更新实验目录。导入或更换第三方资产时保存来源和许可。 |
 
-## Rust、shader 与数据格式
-
-- 使用 Rust 2024 和 `rustfmt`。模块内部优先私有可见性，通过模块入口重导出对外类型。重构公共 API 时核对 CLI、库调用者、示例、测试和存档恢复路径。
-- 按职责拆分文件。重复实现具有相同单位、所有权和失败语义时再合并。为类型、字段和函数命名时明确空间与单位，例如渲染像素和输出像素、模型空间和世界空间。注释解释约定、算法前提和生命周期。
-- 外部文件、用户命令、设备能力与 SDK 失败通过 `Result` 传播，并注明资源或操作。导入和读档先构造、验证候选数据，成功后替换活动场景。为历史场景保留已有迁移逻辑。
-- Rust 和 GLSL 共用的结构明确记录布局、对齐、索引和标志位。修改描述符顺序、push 常量、历史缓冲或纹理编码时，同时检查写入端和全部读取端。每个 shader 特化在 `build.rs` 中集中声明输出名、源文件和宏。
-- Vulkan、Win32 和 C++ FFI 的 `unsafe` 边界注明调用者负责的对象有效期及同步条件。录制 worker 使用独立录制资源。帧时间、屏障数、队列等待数保持各自的统计口径。
-- 清理代码时同时核对条件编译、SPIR-V 特化、序列化字段、插件接口与实验参考算法。例如动作库的全量扫描用于验证 KD-tree，`ngx` 的 SDK 分支按构建环境启用。
-
-## 文档怎么维护
-
-- 命名预设在 [CLI 清单](src/presets.rs)登记。新场景在[实验目录](docs/experiment-catalog.md)说明其独立验证目标。同一建场函数的算法组合优先列出控制台复现命令。移除预设时核对旧命令、存档加载、对照工具和专题文档。
-- 新实验在所属模块登记组件键、主渲染技术的兼容性、材质与系统的安装函数。需要解码的存档组件在同一注册项登记恢复回调。新建、读档和图层切换使用[同一装配器](src/experiments/assembly.rs)。
-- 改变光追契约时更新[光追 RHI 能力矩阵](docs/ray-tracing-rhi.md)。分别注明图编译能够验证的错误、依赖设备属性的限制，以及验证过的驱动与场景。
-- README 负责启动、环境与实验索引。[模块图](docs/module-map.md)负责所有权、输入输出和源码入口。[架构详解](docs/architecture.md)记录端到端帧流程与设计取舍。线程和场景契约更新到[运行时与场景](docs/runtime-and-scene.md)，GPU 数据和同步契约更新到[渲染管线](docs/render-pipeline.md)。增删 CLI 预设时同步[实验目录](docs/experiment-catalog.md)。专题文档保存实验配置、结果和限制，其余位置链接到对应章节。
-- 面向使用者的文字用中文，标识符、格式名和控制台命令保留源码拼写。仓库文件用相对链接。命令写明工作目录、必要资产或可选 SDK，示例采用可替换的参数或环境变量。
-- 架构图的箭头注明传递的数据或调用目的。区分帧内依赖、跨帧历史、可选后端和离线工具。新增或移动模块时同步更新模块图与源码链接。
-- 报告性能时给出设备、构建模式、场景、分辨率、相机、采样方法，以及呈现或回读路径。显存注明是否包含加速结构、缓存和帧槽。为历史基线保留测量条件，单独标明当前已验证的功能和实验限制。
-
-## 验证与交付
-
-日常改动从格式、静态检查和现有测试开始。新增测试优先覆盖这次改动能引起的具体回归。
-
-~~~powershell
+```powershell
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
-~~~
+cargo test --release --locked --lib silver_crowd_extraction_profile -- --ignored --nocapture
+```
 
-涉及 RDG、shader、RHI、呈现或录制时，在具备项目所需 Vulkan 扩展、桌面环境和 FFmpeg 的机器上运行 GPU 集成测试。验证层开启同步校验。NGX 集成用例需要本机装有 SDK 和运行时 DLL，单独关闭验证层运行。
+标为 ignored 的测试在各自源码中列出依赖，包括特定资产、Vulkan 设备、窗口或 NGX。运行图形集成时可启用 `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` 和 `VK_LAYER_VALIDATE_SYNC=1`。更改压缩工具后运行 `python -m unittest discover -s tools -p "test_*.py"`。提交数据应附构建模式、设备、输入、采样范围和统计口径。
 
-~~~powershell
-$env:VK_INSTANCE_LAYERS = "VK_LAYER_KHRONOS_validation"
-$env:VK_LAYER_VALIDATE_SYNC = "1"
-cargo test --locked --release --all-targets -- --include-ignored --test-threads=1 --skip ngx_resolves_nonempty
-Remove-Item Env:VK_INSTANCE_LAYERS, Env:VK_LAYER_VALIDATE_SYNC
-
-# 配置 NGX SDK 和运行时后执行
-cargo test --locked --release --lib ngx_resolves_nonempty -- --ignored --test-threads=1
-~~~
-
-NGX 路径和录制依赖的设置见[后处理文档](docs/viewport-post.md)与[实验手册](docs/experiment-guide.md)。
-
-涉及高斯打包格式时，在含 NumPy、plyfile 的 Python 环境运行 `python -m unittest discover -s tools -p "test_*.py"`。提交说明写清验证过的路径、已知限制和行为变化。
+文档用相对链接指向实现或测试。对研究原型明确写出简化条件，引用官方资料时区分预览特性与本仓库已经实现的功能。[架构](docs/architecture.md) · [GPU 管线](docs/rendering.md)

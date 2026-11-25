@@ -67,8 +67,13 @@ impl Studio {
         let root = self.engine.world.entities[&id].local.w_axis.truncate();
         let keys = self.navigation.motion_keys();
         let new_actor = self.motion_anchor.is_none_or(|(old, _)| old != id);
+        let fixed_camera = self
+            .engine
+            .world
+            .first_raw_component(motion::silver::contact::SETTING)
+            .is_some();
         let followed = self.motion_anchor.map_or(root, |(old, previous)| {
-            if old != id {
+            if old != id || fixed_camera {
                 return root;
             }
             let delta = (root - previous) * (1. - (-5. * dt).exp());

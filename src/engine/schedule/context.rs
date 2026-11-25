@@ -85,6 +85,37 @@ impl<'w> SystemContext<'w> {
         self.changes
     }
 
+    /// Evaluate independently against the same immutable substep snapshot. An error
+    /// discards the whole group. Successful edit lists retain input order on commit.
+    pub fn for_each_parallel<T: Sync>(
+        &mut self,
+        items: &[T],
+        f: impl Fn(&T, &mut SystemContext<'w>) -> Result<()> + Sync,
+    ) -> Result<()> {
+        use rayon::prelude::*;
+        if items.len() <= 1 {
+            let checkpoint = self.changes.len();
+            if let Some(one) = items.first()
+                && let Err(err) = f(one, self)
+            {
+                self.changes.truncate(checkpoint);
+                return Err(err);
+            }
+            return Ok(());
+        }
+        let (world, access, targets) = (self.world, self.access, self.targets);
+        let batches = items
+            .par_iter()
+            .map(|item| {
+                let mut child = SystemContext::new(world, access, targets);
+                f(item, &mut child)?;
+                Ok(child.finish())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.changes.extend(batches.into_iter().flatten());
+        Ok(())
+    }
+
     fn local_scope(&self, writing: bool) -> Result<Option<&[Id]>> {
         let declared = if writing {
             self.access.writes
@@ -226,6 +257,43 @@ impl<'w> SystemContext<'w> {
         self.access.require(SimulationData::World, false)?;
         self.access.require(SimulationData::World, true)?;
         self.changes.push(Change::Whole(edit));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+    #[test]
+    fn staged_items_commit_in_input_order_and_failed_group_has_no_writes() -> Result<()> {
+        let mut w = World::demo();
+        let id = *w.entities.keys().next().unwrap();
+        let make = |w| {
+            SystemContext::new(
+                w,
+                SystemAccess {
+                    name: "items",
+                    reads: &[],
+                    writes: &[SimulationData::Component("test.items")],
+                },
+                None,
+            )
+        };
+        let mut cx = make(&w);
+        let items = [3u32, 2, 4, 1];
+        let result = cx.for_each_parallel(&items, |n, child| {
+            child.set_component(id, "test.items", (*n).into())?;
+            ensure!(*n != 4, "test failure");
+            Ok(())
+        });
+        assert!(result.is_err() && cx.changes.is_empty());
+        cx.for_each_parallel(&items, |n, child| {
+            child.set_component(id, "test.items", (*n).into())
+        })?;
+        for edit in cx.finish() {
+            edit.apply(&mut w, None);
+        }
+        assert_eq!(w.entities[&id].components["test.items"], 1);
         Ok(())
     }
 }

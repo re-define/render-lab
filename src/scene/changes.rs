@@ -1,8 +1,12 @@
 //! Bounded, multi-reader edit history. Each extractor keeps its own cursor.
 use super::*;
-use std::{collections::VecDeque, ops::Deref};
+use std::{
+    collections::{HashSet, VecDeque},
+    ops::Deref,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
-const CAPACITY: usize = 4096;
+const RETAINED_EPOCHS: usize = 8;
 
 /// Local transforms prepared against a simulation snapshot before any edit commits.
 pub struct LocalPose(Vec<(Id, Mat4)>);
@@ -42,12 +46,13 @@ impl LocalPose {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Write {
     Inspect,
     Local,
     Material,
     Component(&'static str),
+    TypedValue(&'static str),
 }
 
 pub(crate) struct Cursor {
@@ -55,29 +60,34 @@ pub(crate) struct Cursor {
     sequence: u64,
 }
 
+/// Taking a snapshot seals its epoch. Repeated writes to one property occupy one entry
+/// until any reader takes a new cursor. A slow reader can consume several sealed epochs.
 #[derive(Default)]
 struct Journal {
     identity: Arc<()>,
-    sequence: u64,
-    edits: VecDeque<(Id, Write)>,
+    epoch: u64,
+    sealed: AtomicBool,
+    history: VecDeque<HashSet<(Id, Write)>>,
 }
 impl Journal {
-    fn advance(&mut self) {
-        self.sequence = self
-            .sequence
-            .checked_add(1)
-            .expect("ECS edit sequence exhausted");
-    }
     fn invalidate(&mut self) {
-        self.advance();
-        self.edits.clear();
+        if !self.history.is_empty() || *self.sealed.get_mut() {
+            *self = Self::default();
+        }
     }
     fn write(&mut self, id: Id, kind: Write) {
-        self.advance();
-        if self.edits.len() == CAPACITY {
-            self.edits.pop_front();
+        if self.history.is_empty() || *self.sealed.get_mut() {
+            *self.sealed.get_mut() = false;
+            self.epoch = self.epoch.checked_add(1).expect("ECS epoch exhausted");
+            let mut batch = if self.history.len() == RETAINED_EPOCHS {
+                self.history.pop_front().unwrap()
+            } else {
+                HashSet::new()
+            };
+            batch.clear();
+            self.history.push_back(batch);
         }
-        self.edits.push_back((id, kind));
+        self.history.back_mut().unwrap().insert((id, kind));
     }
 }
 
@@ -136,9 +146,10 @@ impl Entities {
         index.get(key).map_or(&[], Vec::as_slice)
     }
     pub(crate) fn cursor(&self) -> Cursor {
+        self.journal.sealed.store(true, Ordering::Relaxed);
         Cursor {
             identity: self.journal.identity.clone(),
-            sequence: self.journal.sequence,
+            sequence: self.journal.epoch,
         }
     }
     pub(crate) fn changes(
@@ -148,9 +159,9 @@ impl Entities {
         if !Arc::ptr_eq(&self.journal.identity, &cursor.identity) {
             return None;
         }
-        let count = usize::try_from(self.journal.sequence.checked_sub(cursor.sequence)?).ok()?;
-        let start = self.journal.edits.len().checked_sub(count)?;
-        Some(self.journal.edits.range(start..).copied())
+        let count = usize::try_from(self.journal.epoch.checked_sub(cursor.sequence)?).ok()?;
+        let start = self.journal.history.len().checked_sub(count)?;
+        Some(self.journal.history.range(start..).flatten().copied())
     }
     /// A raw row edit may alter several fields. Asset layouts and extension membership
     /// use full reconciliation; sparse rows are checked against their old bindings.
@@ -174,11 +185,13 @@ impl Entities {
     }
     fn edit(&mut self, id: Id, kind: Write) -> Option<&mut Entity> {
         let row = self.rows.get_mut(&id)?;
-        if let Write::Component(key) = kind
-            && !row.components.contains_key(key)
-        {
-            self.owners.take();
-        }
+        let kind = match kind {
+            Write::TypedValue(key) | Write::Component(key) if !row.components.contains_key(key) => {
+                self.owners.take();
+                Write::Component(key)
+            }
+            _ => kind,
+        };
         self.journal.write(id, kind);
         Some(row)
     }
@@ -245,7 +258,7 @@ impl World {
     }
     pub(super) fn mark_component(&mut self, id: Id, key: &'static str) -> &mut Entity {
         self.entities
-            .edit(id, Write::Component(key))
+            .edit(id, Write::TypedValue(key))
             .expect("missing component entity")
     }
 }

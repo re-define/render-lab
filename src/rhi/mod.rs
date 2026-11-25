@@ -1036,6 +1036,9 @@ impl Backend {
             dynamic_upload_bytes,
             scene_table_upload_bytes,
             geometry_instance_visits: plan.instance_visits,
+            extraction_full_rebuild: plan.extraction.full_rebuild,
+            updated_transforms: plan.extraction.transforms_updated,
+            updated_palettes: plan.extraction.palettes_updated,
             extracted_entities: plan.extraction.entities_visited,
             updated_instances: plan.extraction.instances_updated,
             acceleration_builds: slot.resources.iter().filter(|resource| {

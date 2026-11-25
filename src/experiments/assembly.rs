@@ -32,6 +32,7 @@ const MODULES: &[Registration] = &[
     vegetation::WIND_SYSTEM,
     motion::MODULE,
     motion::silver::MODULE,
+    motion::silver::contact::MODULE,
     lighting::MODULE,
     gaussian::MODULE,
     texture::MODULE,

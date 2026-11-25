@@ -114,7 +114,7 @@ def target_rig(path):
     return nodes, parents, order, world, local, names, ids
 
 
-def bake(data, rig, clip_name):
+def bake(data, rig, clip_name, *, relax_arms=True):
     nodes, parents, order, rest, local, names, ids = rig
     joints = data["joints"].tolist()
     source = {names[k]: joints.index(v) for k, v in PAIRS.items()}
@@ -180,7 +180,7 @@ def bake(data, rig, clip_name):
     # Keep the rhythmic motion around each mean and place it around a relaxed
     # reference. Use a distinct bent-elbow pose for the quicker clips.
     running = clip_name.startswith(("run_", "jog-"))
-    arms = relaxed_arms(rest, parents, names, running)
+    arms = relaxed_arms(rest, parents, names, running) if relax_arms else {}
     for i, neutral_pose in arms.items():
         residual = (mapped[i].mean().inv() * mapped[i]).as_rotvec()
         # Reduce large changes at the wrist and shoulder, which carry less

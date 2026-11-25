@@ -153,7 +153,7 @@ fn hierarchy_light_and_structural_edits_match_a_cold_extractor() -> Result<()> {
 }
 
 #[test]
-fn lagging_extractor_reconciles_evicted_edits() -> Result<()> {
+fn repeated_edits_to_one_entity_coalesce_between_snapshots() -> Result<()> {
     let mut world = World::demo();
     let id = world
         .entities
@@ -167,7 +167,7 @@ fn lagging_extractor_reconciles_evicted_edits() -> Result<()> {
         world.set_local(id, Mat4::from_translation(Vec3::Y * n as f32))?;
     }
     let next = extract(&mut extractor, &world)?;
-    assert_eq!(next.scene.stats.entities_visited, world.entities.len());
+    assert_eq!(next.scene.stats.entities_visited, 1);
     assert_eq!(next.scene.stats.instances_updated, 1);
     assert_eq!(
         next.scene
@@ -184,6 +184,37 @@ fn lagging_extractor_reconciles_evicted_edits() -> Result<()> {
             .stats
             .entities_visited,
         0
+    );
+    Ok(())
+}
+
+#[test]
+fn readers_older_than_retained_epochs_reconcile_from_the_world() -> Result<()> {
+    let mut world = World::demo();
+    let id = *world
+        .entities
+        .iter()
+        .find(|(_, e)| e.instance.is_some())
+        .unwrap()
+        .0;
+    let (mut fast, mut slow) = (SceneExtractor::default(), SceneExtractor::default());
+    extract(&mut fast, &world)?;
+    extract(&mut slow, &world)?;
+    for i in 1..20 {
+        world.set_local(id, Mat4::from_translation(Vec3::Y * i as f32))?;
+        extract(&mut fast, &world)?;
+    }
+    let frame = extract(&mut slow, &world)?;
+    assert_eq!(frame.scene.stats.entities_visited, world.entities.len());
+    assert_eq!(
+        frame
+            .scene
+            .instances()
+            .iter()
+            .find(|i| i.id == id)
+            .unwrap()
+            .model,
+        world.entities[&id].local
     );
     Ok(())
 }

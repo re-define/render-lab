@@ -34,6 +34,9 @@ pub struct FrameProfile {
     pub scene_table_upload_bytes: u64,
     /// CPU visits to instances during geometry routing and packet preparation.
     pub geometry_instance_visits: usize,
+    pub extraction_full_rebuild: bool,
+    pub updated_transforms: usize,
+    pub updated_palettes: usize,
     pub extracted_entities: usize,
     pub updated_instances: usize,
     pub acceleration_builds: usize,

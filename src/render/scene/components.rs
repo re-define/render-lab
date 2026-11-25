@@ -55,7 +55,7 @@ impl SnapshotContext<'_> {
     }
 
     pub fn transform(&mut self, id: Id) -> Option<Mat4> {
-        let entry = self.transforms.entries.get(&id);
+        let entry = self.transforms.get(id);
         self.watched.insert(id, entry.map(|t| t.version));
         entry.map(|t| t.world)
     }
@@ -100,7 +100,7 @@ impl ComponentOwner {
     pub fn changed(&self, transforms: &TransformCache) -> bool {
         self.watched
             .iter()
-            .any(|(id, version)| transforms.entries.get(id).map(|t| t.version) != *version)
+            .any(|(id, version)| transforms.get(*id).map(|t| t.version) != *version)
     }
 
     pub fn refresh(
@@ -253,6 +253,21 @@ mod tests {
             cold.scene.derived::<Mat4>(ANCHOR)
         );
         assert_eq!(initial.scene.setting(DISPLAY), Some(&Value::from(9)));
+        Ok(())
+    }
+    #[test]
+    fn repeated_simulation_component_updates_keep_unrelated_render_bindings() -> Result<()> {
+        let mut world = World::demo();
+        let id = world.spawn(Entity::default());
+        world.set_typed_component(id, "test.physics", 1u32);
+        let mut extractor = SceneExtractor::default();
+        extractor.snapshot(&world, Camera::default(), [64, 64], Default::default())?;
+        for i in 0..5000 {
+            world.set_typed_component(id, "test.physics", i);
+        }
+        let frame = extractor.snapshot(&world, Camera::default(), [64, 64], Default::default())?;
+        assert!(!frame.scene.stats.full_rebuild);
+        assert_eq!(frame.scene.stats.instances_updated, 0);
         Ok(())
     }
 }

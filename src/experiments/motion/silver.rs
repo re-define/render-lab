@@ -5,7 +5,9 @@ pub(in crate::experiments) const MODULE: SceneModule = SceneModule {
     primary: Primary::Simulation,
     restore: Some(hydrate),
     install: |world, a| {
-        if crate::experiments::composition::enabled(world, "actor") {
+        if crate::experiments::composition::enabled(world, "actor")
+            && world.first_raw_component(contact::SETTING).is_none()
+        {
             a.schedule
                 .add_system(std::sync::Arc::new(SilverMatcher::load()?));
         }
@@ -13,6 +15,7 @@ pub(in crate::experiments) const MODULE: SceneModule = SceneModule {
     },
 };
 use super::*;
+pub mod contact;
 mod locomotion;
 mod search;
 mod trajectory_view;
@@ -147,6 +150,7 @@ struct Pose {
     ground_velocity: Vec2,
 }
 pub struct SilverMatcher {
+    after: &'static [&'static str],
     search: search::Index,
     poses: Vec<Pose>,
     clips: Vec<(std::ops::Range<usize>, String)>,
@@ -200,6 +204,7 @@ impl SilverMatcher {
         }
         let search = search::Index::load(raw_features, &clips)?;
         Ok(Self {
+            after: &[],
             poses,
             clips,
             search,
@@ -264,7 +269,7 @@ impl SimulationSystem for SilverMatcher {
     fn order(&self) -> SystemOrder {
         SystemOrder {
             key: Some(PLAYER),
-            after: &[],
+            after: self.after,
         }
     }
     fn access(&self) -> SystemAccess {
@@ -294,7 +299,7 @@ impl SimulationSystem for SilverMatcher {
         if dt == 0. {
             return Ok(());
         }
-        for &id in cx.component_owners(PLAYER)? {
+        cx.for_each_parallel(cx.component_owners(PLAYER)?, |&id, cx| {
             let mut p: State = cx
                 .component::<State>(id, PLAYER)?
                 .context("missing Silver Wolf motion player")?
@@ -414,9 +419,8 @@ impl SimulationSystem for SilverMatcher {
                 p.transition = Some(blend);
             }
             cx.set_pose(joints)?;
-            cx.set_typed_component(id, PLAYER, p)?;
-        }
-        Ok(())
+            cx.set_typed_component(id, PLAYER, p)
+        })
     }
 }
 pub fn set_goal(w: &mut World, speed: f32, turn: f32, side: f32) -> Result<()> {

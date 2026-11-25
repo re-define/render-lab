@@ -3,8 +3,6 @@ use super::*;
 /// Reverse edges needed to propagate a change without walking all scene entities.
 #[derive(Default)]
 pub(super) struct Dependencies {
-    pub children: BTreeMap<Id, Vec<Id>>,
-    pub joint_skins: BTreeMap<Id, Vec<Id>>,
     pub skin_users: BTreeMap<Id, Vec<Id>>,
     pub lights: BTreeSet<Id>,
     pub components: BTreeMap<&'static str, ComponentOwner>,
@@ -54,8 +52,8 @@ impl SceneExtractor {
         }
         let mut scene = previous.as_ref().clone();
         scene.stats = ExtractionStats::default();
-        let mut visited = BTreeSet::new();
-        let mut moved = BTreeSet::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut moved = Vec::new();
         let mut dirty_components = BTreeSet::new();
         for (id, kind) in edits {
             let entity = &world.entities[&id];
@@ -63,20 +61,24 @@ impl SceneExtractor {
             match kind {
                 EntityWrite::Inspect => {
                     if !Entities::inspectable(entity)
-                        || entity.parent != self.transforms.entries[&id].parent
+                        || entity.parent != self.transforms.get(id).unwrap().parent
                         || !scene.same_bindings(id, entity)
                     {
                         return Ok(None);
                     }
                 }
-                EntityWrite::Component(key) => {
+                EntityWrite::Component(key) | EntityWrite::TypedValue(key) => {
                     for (&dependent_key, owner) in &self.dependencies.components {
                         if owner.watched_settings.contains_key(key) {
                             dirty_components.insert(dependent_key);
                         }
                     }
                     let Some(spec) = self.registry.get(key) else {
-                        // Unregistered keys can also affect geometry routes or visibility.
+                        // Existing typed state preserves entity membership and raw render settings.
+                        if matches!(kind, EntityWrite::TypedValue(_)) {
+                            continue;
+                        }
+                        // Raw settings can also affect geometry routes or visibility.
                         return Ok(None);
                     };
                     match self.dependencies.components.get(spec.key) {
@@ -92,9 +94,9 @@ impl SceneExtractor {
                 EntityWrite::Local | EntityWrite::Material => (),
             }
             if matches!(kind, EntityWrite::Inspect | EntityWrite::Local)
-                && entity.local != self.transforms.entries[&id].local
+                && entity.local != self.transforms.get(id).unwrap().local
             {
-                moved.insert(id);
+                moved.push((self.transforms.slots[&id], entity.local));
             }
             if matches!(kind, EntityWrite::Inspect | EntityWrite::Material)
                 && let Some(material) = &entity.material
@@ -105,7 +107,7 @@ impl SceneExtractor {
             }
         }
 
-        self.propagate_transforms(world, &moved, &mut visited, &mut scene)?;
+        self.propagate_transforms(world, &mut moved, &mut visited, &mut scene)?;
         for (&key, owner) in &mut self.dependencies.components {
             if dirty_components.contains(key) || owner.changed(&self.transforms) {
                 visited.insert(owner.id);
@@ -125,51 +127,57 @@ impl SceneExtractor {
     fn propagate_transforms(
         &mut self,
         world: &World,
-        moved: &BTreeSet<Id>,
-        visited: &mut BTreeSet<Id>,
+        moved: &mut [(usize, Mat4)],
+        visited: &mut std::collections::HashSet<Id>,
         scene: &mut RenderScene,
     ) -> Result<()> {
-        // Start with the outermost dirty ancestors so each subtree is resolved parent first, once.
-        let mut pending = Vec::new();
-        for &id in moved {
-            let mut parent = self.transforms.entries[&id].parent;
-            while let Some(p) = parent {
-                if moved.contains(&p) {
-                    break;
-                }
-                parent = self.transforms.entries[&p].parent;
-            }
-            if parent.is_none() {
-                pending.push(id);
-            }
+        // Descendants occupy a contiguous range. Install every final local pose before
+        // evaluating ranges so a changed child sees its parent's final world transform.
+        moved.sort_unstable_by_key(|(slot, _)| *slot);
+        for &(slot, local) in moved.iter() {
+            self.transforms.rows[slot].local = local;
         }
         let mut changed_instances = BTreeMap::new();
         let mut dirty_skins = BTreeSet::new();
         let mut update_lights = false;
-        while let Some(id) = pending.pop() {
-            visited.insert(id);
-            if self.transforms.update_one(id, &world.entities[&id])? {
-                scene.stats.transforms_updated += 1;
-                if let Some(index) = scene.instance_index(id) {
-                    changed_instances.insert(index, None);
-                }
-                if let Some(skins) = self.dependencies.joint_skins.get(&id) {
-                    dirty_skins.extend(skins.iter().copied());
-                }
-                update_lights |= self.dependencies.lights.contains(&id);
+        let mut covered = 0;
+        for &(root, _) in moved.iter() {
+            if root < covered {
+                continue;
             }
-            if let Some(children) = self.dependencies.children.get(&id) {
-                pending.extend_from_slice(children);
+            covered = self.transforms.rows[root].end;
+            for slot in root..covered {
+                let id = self.transforms.rows[slot].id;
+                visited.insert(id);
+                if self.transforms.resolve(slot) {
+                    scene.stats.transforms_updated += 1;
+                    let t = &self.transforms.rows[slot];
+                    if let Some(index) = t.instance {
+                        changed_instances.insert(index, None);
+                    }
+                    dirty_skins.extend(t.skins.iter().copied());
+                    update_lights |= t.light;
+                }
             }
         }
         for skin in dirty_skins {
             visited.insert(skin);
-            if self.update_palette(world, skin)? {
-                scene.stats.palettes_updated += 1;
-                for &user in &self.dependencies.skin_users[&skin] {
-                    let index = scene.instance_index(user).expect("indexed skin user");
-                    changed_instances.insert(index, Some(self.palettes[&skin].matrices.clone()));
+            let palette = self
+                .palettes
+                .get_mut(&skin)
+                .expect("skin dependency must have a palette");
+            let matrices = Arc::make_mut(&mut palette.matrices);
+            for (i, &slot) in palette.slots.iter().enumerate() {
+                let transform = &self.transforms.rows[slot];
+                if transform.version != palette.joints[i].1 {
+                    matrices[i] = transform.world * palette.inverse_bind[i];
+                    palette.joints[i].1 = transform.version;
                 }
+            }
+            scene.stats.palettes_updated += 1;
+            for &user in &self.dependencies.skin_users[&skin] {
+                let index = self.transforms.get(user).unwrap().instance.unwrap();
+                changed_instances.insert(index, Some(palette.matrices.clone()));
             }
         }
         scene.stats.instances_updated = changed_instances.len();
@@ -177,7 +185,7 @@ impl SceneExtractor {
             let instances = Arc::make_mut(&mut scene.instances);
             for (index, palette) in changed_instances {
                 let instance = Arc::make_mut(instances.edit(index));
-                let transform = &self.transforms.entries[&instance.id];
+                let transform = &self.transforms.get(instance.id).unwrap();
                 instance.model = transform.world;
                 instance.transform_version = transform.version;
                 if let Some(palette) = palette {

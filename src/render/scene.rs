@@ -2,6 +2,8 @@ mod components;
 use components::{ComponentOutputs, ComponentOwner};
 pub use components::{SnapshotComponent, SnapshotContext, SnapshotValue};
 mod incremental;
+mod transforms;
+use transforms::TransformCache;
 mod pages;
 mod routes;
 use super::lights::{RenderLight, SceneLights};
@@ -121,6 +123,7 @@ impl RenderInstance {
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct ExtractionStats {
+    pub full_rebuild: bool,
     /// Distinct ECS entity records inspected while extracting this snapshot.
     pub entities_visited: usize,
     pub transforms_updated: usize,
@@ -171,6 +174,7 @@ pub struct SceneExtractor {
 }
 
 struct Palette {
+    slots: Vec<usize>,
     joints: Vec<(Id, u64)>,
     inverse_bind: Vec<Mat4>,
     matrices: Arc<[Mat4]>,
@@ -213,6 +217,7 @@ impl SceneExtractor {
     fn rebuild(&mut self, world: &World) -> Result<Arc<RenderScene>> {
         let mut dependencies = Dependencies::default();
         let mut stats = ExtractionStats {
+            full_rebuild: true,
             transforms_updated: self.transforms.update(world)?,
             ..Default::default()
         };
@@ -231,12 +236,10 @@ impl SceneExtractor {
             .peekable();
         for (&id, entity) in &world.entities {
             stats.entities_visited += 1;
-            if let Some(parent) = entity.parent {
-                dependencies.children.entry(parent).or_default().push(id);
-            }
             if let Some(light) = entity.light {
                 has_lights = true;
                 dependencies.lights.insert(id);
+                self.transforms.row_mut(id).light = true;
                 if let Some(render_light) = self.light(id, light)? {
                     lights.push(render_light);
                 }
@@ -302,11 +305,7 @@ impl SceneExtractor {
                     if active_palettes.insert(skin) {
                         stats.palettes_updated += usize::from(self.update_palette(world, skin)?);
                         for &(joint, _) in &self.palettes[&skin].joints {
-                            dependencies
-                                .joint_skins
-                                .entry(joint)
-                                .or_default()
-                                .push(skin);
+                            self.transforms.row_mut(joint).skins.push(skin);
                         }
                     }
                     dependencies.skin_users.entry(skin).or_default().push(id);
@@ -314,7 +313,8 @@ impl SceneExtractor {
                 } else {
                     None
                 };
-            let transform = &self.transforms.entries[&id];
+            let transform = self.transforms.row_mut(id);
+            transform.instance = Some(instances.len());
             let next = RenderInstance {
                 id,
                 mesh: MeshId(instance.mesh),
@@ -391,7 +391,7 @@ impl SceneExtractor {
     }
 
     fn light(&self, id: Id, light: Light) -> Result<Option<RenderLight>> {
-        let world = self.transforms.entries[&id].world;
+        let world = self.transforms.get(id).unwrap().world;
         light
             .validate(world)
             .with_context(|| format!("light entity {id}"))?;
@@ -415,99 +415,33 @@ impl SceneExtractor {
             .joints
             .iter()
             .map(|&joint| {
-                let entry = self
-                    .transforms
-                    .entries
-                    .get(&joint)
-                    .context("missing skin joint")?;
+                let entry = self.transforms.get(joint).context("missing skin joint")?;
                 Ok((joint, entry.version))
             })
             .collect::<Result<Vec<_>>>()?;
-        if self
-            .palettes
-            .get(&id)
-            .is_some_and(|p| p.joints == joints && p.inverse_bind == skin.inverse_bind)
+        let slots: Vec<_> = joints
+            .iter()
+            .map(|(id, _)| self.transforms.slots[id])
+            .collect();
+        if let Some(prior) = self.palettes.get_mut(&id)
+            && prior.joints == joints
+            && prior.inverse_bind == skin.inverse_bind
         {
+            prior.slots = slots;
             return Ok(false);
         }
         let matrices = joints
             .iter()
             .zip(&skin.inverse_bind)
-            .map(|(&(id, _), &inverse)| self.transforms.entries[&id].world * inverse)
+            .map(|(&(id, _), &inverse)| self.transforms.get(id).unwrap().world * inverse)
             .collect();
         self.palettes.insert(
             id,
             Palette {
+                slots,
                 joints,
                 inverse_bind: skin.inverse_bind.clone(),
                 matrices,
-            },
-        );
-        Ok(true)
-    }
-}
-
-#[derive(Default)]
-struct TransformCache {
-    entries: BTreeMap<Id, Transform>,
-    order: Vec<Id>,
-    revision: u64,
-}
-
-struct Transform {
-    parent: Option<Id>,
-    parent_version: u64,
-    local: Mat4,
-    world: Mat4,
-    version: u64,
-}
-
-impl TransformCache {
-    fn update(&mut self, world: &World) -> Result<usize> {
-        let entities = &world.entities;
-        if self.entries.len() != entities.len()
-            || !self
-                .entries
-                .iter()
-                .zip(entities)
-                .all(|((&old, t), (&id, e))| old == id && t.parent == e.parent)
-        {
-            let order = world.transform_order()?;
-            self.entries.retain(|id, _| entities.contains_key(id));
-            self.order = order;
-        }
-        let mut updated = 0;
-        for i in 0..self.order.len() {
-            let id = self.order[i];
-            updated += usize::from(self.update_one(id, &entities[&id])?);
-        }
-        Ok(updated)
-    }
-
-    fn update_one(&mut self, id: Id, entity: &Entity) -> Result<bool> {
-        let (parent_world, parent_version) = entity.parent.map_or((Mat4::IDENTITY, 0), |parent| {
-            let parent = &self.entries[&parent];
-            (parent.world, parent.version)
-        });
-        if self.entries.get(&id).is_some_and(|entry| {
-            entry.parent == entity.parent
-                && entry.parent_version == parent_version
-                && entry.local == entity.local
-        }) {
-            return Ok(false);
-        }
-        self.revision = self
-            .revision
-            .checked_add(1)
-            .context("transform versions exhausted")?;
-        self.entries.insert(
-            id,
-            Transform {
-                local: entity.local,
-                parent: entity.parent,
-                parent_version,
-                world: parent_world * entity.local,
-                version: self.revision,
             },
         );
         Ok(true)

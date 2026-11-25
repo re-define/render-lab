@@ -22,6 +22,7 @@ pub(super) const PRESETS: &[(&str, SceneBuilder)] = &[
     ("water", effects::water),
     ("destruction", effects::destruction),
     ("motion", motion::silver::scene),
+    ("silver-contact", motion::silver::contact::scene),
     ("toon", cartoon::scene),
     ("texture", texture::scene),
     ("gaussian", || gaussian::scene(None)),
