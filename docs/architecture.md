@@ -1,5 +1,7 @@
 # 运行架构与模块
 
+代码评审、与 Unreal 的对照及分阶段迁移见[架构评审与目标设计](architecture-review.md)。
+
 ```mermaid
 flowchart LR
  UI["GPUI、CLI、输入"] -->|意图与时间步| Main["主线程 / ECS"]
