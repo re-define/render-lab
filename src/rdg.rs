@@ -2,7 +2,7 @@ mod validate;
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeSet, sync::Arc};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Resource(pub usize);
 #[derive(Clone, Debug)]
 pub enum Storage {
@@ -89,7 +89,7 @@ impl Storage {
         }
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Access {
     Vertex,
     Mesh,
@@ -448,9 +448,12 @@ pub(crate) struct ClusterCache {
 }
 pub struct Graph {
     pub(crate) cluster_caches: std::collections::BTreeMap<Resource, ClusterCache>,
-    address_values_only: BTreeSet<Resource>,
+    // Unlisted tables inherit the use of their binding. None exposes addresses without
+    // touching pointees; Some(access) declares a different pointee access than the table read.
+    address_overrides: std::collections::BTreeMap<Resource, Option<Access>>,
     cluster_children: std::collections::BTreeMap<Resource, Resource>,
     pub(crate) tables: std::collections::BTreeMap<Resource, Rows>,
+    pub(crate) asset_tables: std::collections::BTreeMap<Resource, bool>,
     pub extent: [u32; 2],
     pub(crate) display_extent: Option<[u32; 2]>,
     pub(crate) local_buffers: BTreeSet<Resource>,
@@ -553,10 +556,11 @@ impl Graph {
     pub fn new(extent: [u32; 2]) -> Self {
         Self {
             extent,
-            address_values_only: BTreeSet::new(),
+            address_overrides: Default::default(),
             cluster_children: Default::default(),
             cluster_caches: Default::default(),
             tables: Default::default(),
+            asset_tables: Default::default(),
             display_extent: None,
             local_buffers: Default::default(),
             scratch_owners: Default::default(),
@@ -574,6 +578,7 @@ impl Graph {
             Some((_, Storage::Buffer { .. }))
         ) && !self.histories.contains_key(&resource)
             && !self.resident_inputs.contains(&resource)
+            && !self.tables.contains_key(&resource)
             && !self.cluster_caches.contains_key(&resource)
             && !self.scratch_owners.contains_key(&resource)
     }
@@ -587,6 +592,19 @@ impl Graph {
             },
         );
         self.tables.insert(r, rows.clone());
+        self.prefer_local_buffer(r);
+        r
+    }
+    pub(crate) fn asset_table(&mut self, name: &str, rows: &Rows, allow_growth: bool) -> Resource {
+        let r = self.resource(
+            name,
+            Storage::Buffer {
+                bytes: rows.bytes().max(4),
+                initial: Some(Arc::from([])),
+            },
+        );
+        self.tables.insert(r, rows.clone());
+        self.asset_tables.insert(r, allow_growth);
         self.prefer_local_buffer(r);
         r
     }
@@ -653,29 +671,40 @@ impl Graph {
         self.addresses.insert(r, refs);
         r
     }
+    /// The compute shader reads the table but writes each buffer it points at.
+    pub(crate) fn compute_output_table(&mut self, refs: Vec<Resource>) -> Resource {
+        let table = self.address_table(refs);
+        self.address_overrides
+            .insert(table, Some(Access::ComputeWrite));
+        table
+    }
     /// This pass copies address values into native indirect records. Consumers declare the eventual accesses.
     pub(crate) fn build_addresses(&mut self, refs: Vec<Resource>) -> Resource {
         let table = self.address_table(refs);
-        self.address_values_only.insert(table);
+        self.address_overrides.insert(table, None);
         table
     }
     fn uses(&self, op: &Op) -> Vec<(Resource, Access)> {
         let mut uses = op.uses();
+        let mut seen: Option<std::collections::HashSet<(Resource, Access)>> = None;
         for index in 0..uses.len() {
             let (r, a) = uses[index];
+            let mut append = |item| {
+                let seen = seen.get_or_insert_with(|| uses.iter().copied().collect());
+                if seen.insert(item) {
+                    uses.push(item);
+                }
+            };
             if a == Access::RayAcceleration
                 && let Some(&child) = self.cluster_children.get(&r)
-                && !uses.contains(&(child, a))
             {
-                uses.push((child, a));
+                append((child, a));
             }
-            if !self.address_values_only.contains(&r)
-                && let Some(refs) = self.addresses.get(&r)
+            if let Some(refs) = self.addresses.get(&r)
+                && let Some(pointee) = self.address_overrides.get(&r).copied().unwrap_or(Some(a))
             {
                 for &src in refs {
-                    if !uses.contains(&(src, a)) {
-                        uses.push((src, a));
-                    }
+                    append((src, pointee));
                 }
             }
         }

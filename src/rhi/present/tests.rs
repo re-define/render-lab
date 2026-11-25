@@ -4,35 +4,42 @@ use crate::{
     scene::World,
 };
 use windows_sys::Win32::{System::LibraryLoader::GetModuleHandleW, UI::WindowsAndMessaging::*};
+struct HiddenWindow(isize);
+impl HiddenWindow {
+    fn open([width, height]: [u32; 2]) -> Result<Self> {
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                windows_sys::w!("STATIC"),
+                std::ptr::null(),
+                WS_POPUP,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                GetModuleHandleW(std::ptr::null()),
+                std::ptr::null(),
+            )
+        };
+        ensure!(!hwnd.is_null(), "hidden test window unavailable");
+        Ok(Self(hwnd as isize))
+    }
+}
+impl Drop for HiddenWindow {
+    fn drop(&mut self) {
+        unsafe {
+            DestroyWindow(self.0 as _);
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires Win32 Vulkan WSI"]
 fn presents_and_resizes_with_optional_frame_capture() -> Result<()> {
-    let window = unsafe {
-        CreateWindowExW(
-            0,
-            windows_sys::w!("STATIC"),
-            std::ptr::null(),
-            WS_POPUP,
-            0,
-            0,
-            160,
-            100,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            GetModuleHandleW(std::ptr::null()),
-            std::ptr::null(),
-        )
-    };
-    ensure!(!window.is_null(), "hidden test window unavailable");
-    struct Owner(isize);
-    impl Drop for Owner {
-        fn drop(&mut self) {
-            unsafe {
-                DestroyWindow(self.0 as _);
-            }
-        }
-    }
-    let owner = Owner(window as isize);
+    let owner = HiddenWindow::open([160, 100])?;
+    let window = owner.0 as windows_sys::Win32::Foundation::HWND;
     let mut gpu = Backend::open()?;
     let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
     let world = Arc::new(World::demo());
@@ -166,6 +173,107 @@ fn presents_and_resizes_with_optional_frame_capture() -> Result<()> {
     drop(gpu);
     compare_resident_updates(owner.0, &pool)?;
     preserve_pending_capture_on_budget_failure(owner.0, &pool)
+}
+
+#[test]
+#[ignore = "requires Win32 Vulkan WSI"]
+fn texture_asset_versions_isolate_in_flight_texels_and_reuse_retired_allocations() -> Result<()> {
+    use crate::{rdg::rows::Rows, render::FrameGraph};
+    let extent = [96, 64];
+    let window = HiddenWindow::open(extent)?;
+    let mut gpu = Backend::open()?;
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+    // Three 4 KiB pages, including a partial final page. Edit the first texel of page two.
+    let mut texels: Vec<u32> = (0..2049).map(|i| 0xff007700 | i).collect();
+    let changed = 1024;
+    let mut a = Rows::words();
+    a.resize_words(texels.len());
+    a.write_words(0, bytemuck::cast_slice(&texels));
+    let mut b = a.clone();
+    b.write_words(changed, &0xff553311u32.to_le_bytes());
+    let mut c = b.clone();
+    c.write_words(changed, &0xff2266aau32.to_le_bytes());
+    let enqueue = |gpu: &mut Backend, rows: &Rows| -> Result<(Option<Frame>, u64)> {
+        let mut g = FrameGraph::new(extent);
+        let atlas = g.asset_table("Editable texels", rows, true);
+        g.products.material_atlas = Some(atlas);
+        let output = g.input(
+            "Sampled texels",
+            vec![0; (extent[0] * extent[1] * 4) as usize],
+        );
+        let words = (rows.bytes() / 4) as u32;
+        g.pass(
+            "Sample the submitted texture version",
+            Op::Compute {
+                program: Dispatch {
+                    shader: Shader::Compute(include_bytes!(concat!(
+                        env!("OUT_DIR"),
+                        "/surface_tail.comp.spv"
+                    ))),
+                    bindings: vec![
+                        (atlas, Access::ComputeRead),
+                        (output, Access::ComputeReadWrite),
+                    ],
+                    push: bytemuck::bytes_of(&[0, words]).to_vec(),
+                },
+                groups: [words.div_ceil(64), 1, 1],
+            },
+        );
+        g.set_output(output);
+        g.present()?;
+        g.pass("Capture texels for this submission", Op::HostRead(output));
+        let completed = gpu.enqueue(g.compile()?, &pool, window.0)?;
+        let slot = gpu.pending.back().unwrap().slot;
+        Ok((
+            completed,
+            gpu.slots[slot].resources[atlas.0].buffer().address,
+        ))
+    };
+    let verify = |frame: Frame, expected: &[u32], uploaded: usize| {
+        let source: &[u8] = bytemuck::cast_slice(expected);
+        assert_eq!(&frame.pixels[..source.len()], source);
+        assert_eq!(frame.profile.atlas_upload_bytes, uploaded as u64);
+        assert_eq!(frame.profile.resident_upload_bytes, uploaded as u64);
+        frame.sequence
+    };
+    let (none, address_a) = enqueue(&mut gpu, &a)?;
+    assert!(none.is_none());
+    let (none, address_a2) = enqueue(&mut gpu, &a)?;
+    assert!(none.is_none());
+    assert_eq!(
+        address_a, address_a2,
+        "same version must share across slots"
+    );
+    let (first_a, address_b) = enqueue(&mut gpu, &b)?;
+    let first = verify(
+        first_a.expect("retire first A to make room for B"),
+        &texels,
+        a.bytes(),
+    );
+    assert_ne!(address_b, address_a, "second A is still in flight");
+    assert_eq!(gpu.pending.len(), 2);
+    let second_a = gpu.retire_next().unwrap()?;
+    assert_eq!(verify(second_a, &texels, 0), first + 1);
+
+    let (none, address_c) = enqueue(&mut gpu, &c)?;
+    assert!(none.is_none());
+    assert_eq!(
+        address_c, address_a,
+        "the retired A buffer can accept C's sparse edit"
+    );
+    texels[changed] = 0xff553311;
+    assert_eq!(
+        verify(gpu.retire_next().unwrap()?, &texels, b.bytes()),
+        first + 2
+    );
+    let (none, address_c2) = enqueue(&mut gpu, &c)?;
+    assert!(none.is_none());
+    assert_eq!(address_c, address_c2);
+    texels[changed] = 0xff2266aa;
+    assert_eq!(verify(gpu.retire_next().unwrap()?, &texels, 4), first + 3);
+    assert_eq!(verify(gpu.retire_next().unwrap()?, &texels, 0), first + 4);
+    assert!(gpu.retire_next().is_none());
+    Ok(())
 }
 
 /// Reorder same-name owners, remove one, bring it back, grow it and then shrink its logical range.

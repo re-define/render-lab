@@ -66,7 +66,7 @@ pub(super) trait Producer: Send + Sync {
 }
 pub(super) struct LightStack {
     producers: Vec<Box<dyn Producer>>,
-    hdr: bool,
+    pub(super) hdr: bool,
 }
 impl LightStack {
     #[cfg(test)]
@@ -82,7 +82,7 @@ impl LightStack {
         world: &World,
         programs: &mut MaterialPrograms,
         tasks: &rayon::ThreadPool,
-        ldr: bool,
+        mixed_geometry: bool,
     ) -> Result<Option<(Self, Camera)>> {
         let registrations = REGISTRY.iter().filter(|r| {
             world.first_raw_component(r.key).is_some()
@@ -102,7 +102,7 @@ impl LightStack {
                 .is_some_and(|m| matches!(m.shading, Shading::Pbr | Shading::Toon))
                 || e.instance.as_ref().is_some_and(|i| i.material.is_none())
         });
-        let hdr = builtin_lighting && !ldr;
+        let hdr = builtin_lighting || mixed_geometry || super::composition::is_scene(world);
         for registration in registrations {
             let producer = (registration.open)(world, tasks)?;
             let MaterialShader {
@@ -118,7 +118,10 @@ impl LightStack {
             {
                 programs.register_lighting(
                     name,
-                    if hdr { linear } else { display },
+                    crate::render::MaterialCode {
+                        display,
+                        linear: Some(linear),
+                    },
                     registration.inputs,
                 )?;
             }
@@ -128,17 +131,25 @@ impl LightStack {
             programs.bin(&material.shading)?;
         }
         if builtin_lighting {
-            if ldr {
-                programs.replace_builtin(
-                    include_bytes!(concat!(env!("OUT_DIR"), "/mixed_material_ldr.comp.spv")),
-                    include_bytes!(concat!(env!("OUT_DIR"), "/mixed_toon_ldr.comp.spv")),
-                );
-            } else {
-                programs.replace_builtin(
-                    include_bytes!(concat!(env!("OUT_DIR"), "/mixed_material.comp.spv")),
-                    include_bytes!(concat!(env!("OUT_DIR"), "/mixed_toon.comp.spv")),
-                );
-            }
+            programs.replace_builtin(
+                crate::render::MaterialCode {
+                    display: include_bytes!(concat!(
+                        env!("OUT_DIR"),
+                        "/mixed_material_ldr.comp.spv"
+                    )),
+                    linear: Some(include_bytes!(concat!(
+                        env!("OUT_DIR"),
+                        "/mixed_material.comp.spv"
+                    ))),
+                },
+                crate::render::MaterialCode {
+                    display: include_bytes!(concat!(env!("OUT_DIR"), "/mixed_toon_ldr.comp.spv")),
+                    linear: Some(include_bytes!(concat!(
+                        env!("OUT_DIR"),
+                        "/mixed_toon.comp.spv"
+                    ))),
+                },
+            );
         }
         Ok(Some((Self { producers, hdr }, camera)))
     }
@@ -158,7 +169,8 @@ impl Technique for LightStack {
             },
             layers,
             self.hdr,
-            |_, _, _, _| Ok(()),
+            |_, _| Ok(()),
+            |g, view| super::draw_visibility_overlays(g, s, view.ids, view.color),
         )
     }
 }
@@ -204,7 +216,8 @@ pub(super) fn build(
         |g, t| draw_surfaces(g, t, s, surfaces),
         layers,
         hdr,
-        |_, _, _, _| Ok(()),
+        |_, _| Ok(()),
+        |_, _| Ok(()),
     )
 }
 pub(super) fn build_modules(
@@ -212,7 +225,8 @@ pub(super) fn build_modules(
     geometry: impl FnOnce(&mut FrameGraph, &mut crate::render::Targets) -> Result<()>,
     layers: Vec<AddLight<'_>>,
     hdr: bool,
-    post: impl FnOnce(&mut FrameGraph, Resource, Resource, Resource) -> Result<()>,
+    scene: impl FnOnce(&mut FrameGraph, crate::render::SceneLayers) -> Result<()>,
+    display: impl FnOnce(&mut FrameGraph, crate::render::DisplayLayers) -> Result<()>,
 ) -> Result<FrameGraph> {
     let sky = Cell::new(None);
     build_frame_with_lighting(
@@ -275,13 +289,14 @@ pub(super) fn build_modules(
                 linear_hdr: hdr,
             })
         },
-        |g, ids, depth, color| {
-            post(g, ids, depth, color)?;
+        |g, mut inputs| {
             if let Some((draw, resources)) = sky.get() {
-                draw(g, ids, color, resources, hdr);
+                draw(g, inputs.ids, inputs.color.resource, resources, hdr);
+                inputs.has_backdrop = true;
             }
-            Ok(())
+            scene(g, inputs)
         },
+        display,
     )
 }
 
@@ -289,6 +304,30 @@ pub(super) fn build_modules(
 mod tests {
     use super::*;
     use crate::render::LightingInput::{Environment, EnvironmentControls};
+
+    #[test]
+    fn rejects_a_display_only_material_in_a_linear_composition() -> Result<()> {
+        let world = World::demo();
+        let mut materials = MaterialPrograms::default();
+        materials.register("Packed-only shader", ibl::REGISTRATION.material.display)?;
+        let view = Snapshot::new(&world, Camera::default(), [16, 16], Arc::new(materials))?;
+        let error = build_modules(
+            &view,
+            |_, _| Ok(()),
+            Vec::new(),
+            true,
+            |_, _| Ok(()),
+            |_, _| Ok(()),
+        )
+        .err()
+        .expect("incompatible output format");
+        assert!(
+            error
+                .to_string()
+                .contains("Packed-only shader has no linear HDR material kernel")
+        );
+        Ok(())
+    }
 
     #[test]
     fn custom_bin_uses_its_declared_resources_in_shader_order() -> Result<()> {
@@ -301,8 +340,16 @@ mod tests {
             &[Environment, EnvironmentControls],
         )?;
         let view = Snapshot::new(&world, Camera::fit(&world)?, [32, 32], Arc::new(programs))?;
-        let build =
-            |layers| build_modules(&view, |_, _| Ok(()), layers, false, |_, _, _, _| Ok(()));
+        let build = |layers| {
+            build_modules(
+                &view,
+                |_, _| Ok(()),
+                layers,
+                false,
+                |_, _| Ok(()),
+                |_, _| Ok(()),
+            )
+        };
         let error = build(Vec::new()).err().expect("missing producer");
         assert!(
             error

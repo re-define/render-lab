@@ -10,6 +10,7 @@ pub(crate) struct Benchmark {
     first: Option<(Instant, u64)>,
     series: BTreeMap<String, Vec<f64>>,
     pass_ms: BTreeMap<String, Vec<f64>>,
+    frame_times: Vec<Value>,
 }
 fn summarize(mut samples: Vec<f64>) -> Value {
     samples.sort_by(f64::total_cmp);
@@ -25,6 +26,7 @@ impl Benchmark {
             previous: None,
             series: Default::default(),
             pass_ms: Default::default(),
+            frame_times: Vec::new(),
         }
     }
     pub fn observe(&mut self, f: &Frame) -> bool {
@@ -40,6 +42,9 @@ impl Benchmark {
             return false;
         }
         let (previous, sequence) = prev.unwrap();
+        self.frame_times.push(json!({"tick":f.profile.tick_id,"snapshot":f.profile.snapshot_id,
+            "submission":f.profile.submission_id,"completion":f.sequence,"skipped_ticks_total":f.profile.skipped_render_ticks,
+            "cpu_us":f.profile.cpu_times_us,"gpu_span_ms":f.profile.gpu_span_ms}));
         if sequence + 1 == f.sequence {
             self.series
                 .entry("frame_interval_ms".into())
@@ -84,7 +89,7 @@ impl Benchmark {
         println!(
             "BENCHMARK {}",
             json!({"gpu":f.gpu,"extent":f.extent,"mode":f.presentation,"profile":if cfg!(debug_assertions){"dev"}else{"release"},"warmup":WARMUP,"samples":self.target,
-            "presented":f.sequence-seq,"elapsed_s":(f.completed-start).as_secs_f64(),"present_requests_per_s":(f.sequence-seq) as f64/(f.completed-start).as_secs_f64(),
+            "presented":f.sequence-seq,"elapsed_s":(f.completed-start).as_secs_f64(),"frame_times":self.frame_times,"present_requests_per_s":(f.sequence-seq) as f64/(f.completed-start).as_secs_f64(),
             "first_frame":&*f.first_profile,"last":f.profile,"memory":f.memory,"submissions":f.submissions,"counters":f.counters,"stats":dic(std::mem::take(&mut self.series)),"gpu_pass_ms":dic(std::mem::take(&mut self.pass_ms)),"passes":rows})
         );
         true

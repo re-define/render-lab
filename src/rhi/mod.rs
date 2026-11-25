@@ -199,7 +199,7 @@ struct Recorder {
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     query: vk::QueryPool,
-    raster: Option<raster_queries::Pools>,
+    raster: Vec<Option<raster_queries::Pools>>,
 }
 impl Recorder {
     fn new(g: &Arc<Gpu>) -> Result<Self> {
@@ -214,7 +214,7 @@ impl Recorder {
                 pool,
                 cmd: vk::CommandBuffer::null(),
                 query: vk::QueryPool::null(),
-                raster: None,
+                raster: Vec::new(),
             };
             r.cmd = g.dev.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::builder()
@@ -225,7 +225,7 @@ impl Recorder {
             r.query = g.dev.create_query_pool(
                 &vk::QueryPoolCreateInfo::builder()
                     .query_type(vk::QueryType::TIMESTAMP)
-                    .query_count(2),
+                    .query_count((2 * queues::MAX_STEPS_PER_COMMAND) as u32),
                 None,
             )?;
             Ok(r)
@@ -256,12 +256,21 @@ pub struct Backend {
     completed: VecDeque<Frame>,
     pipes: HashMap<(Shader, usize), Pipeline>,
     resident: HashMap<(usize, u32), ResidentBuffer>,
+    paged_assets: HashMap<(usize, u32), Weak<Buffer>>,
     static_blas: ray::StaticCache,
     histories: HashMap<(u64, usize, [u32; 2]), Arc<Buffer>>,
     frame_number: u64,
+    submitted_frames: u64,
     first_profile: Option<Arc<FrameProfile>>,
     timelines: queues::Timelines,
     surface: Option<present::Surface>,
+}
+#[derive(Default)]
+struct UploadBytes {
+    resident: u64,
+    dynamic: u64,
+    tables: u64,
+    atlas: u64,
 }
 struct ResidentBuffer {
     source: Weak<[u8]>,
@@ -273,6 +282,7 @@ struct Submitted {
     output: Resource,
     retire: Vec<u64>,
     batches: Vec<Arc<frame::QueueBatch>>,
+    layout: queues::RecordingLayout,
     start: Instant,
     profile: FrameProfile,
     managed: ManagedMemory,
@@ -317,9 +327,11 @@ impl Backend {
             completed: VecDeque::new(),
             pipes: HashMap::new(),
             resident: HashMap::new(),
+            paged_assets: HashMap::new(),
             static_blas: Default::default(),
             histories: HashMap::new(),
             frame_number: 0,
+            submitted_frames: 0,
             first_profile: None,
             timelines,
             surface: None,
@@ -335,7 +347,7 @@ impl Backend {
         plan: &FramePlan,
         index: usize,
         reuse: &transient::Reuse,
-    ) -> Result<(u64, u64, u64)> {
+    ) -> Result<UploadBytes> {
         let g = &self.gpu;
         let graph = &plan.graph;
         let slot = &mut self.slots[index];
@@ -412,12 +424,15 @@ impl Backend {
             slot.heap = Heap::new(g, graph.resources.len(), index)?;
         }
         slot.bind_layout(graph);
+        self.paged_assets
+            .retain(|_, entry| entry.strong_count() > 0);
         self.resident
             .retain(|_, resource| resource.source.strong_count() != 0);
         self.histories.retain(|(key, _, extent), _| {
             *extent == graph.extent && graph.histories.values().any(|&current| current == *key)
         });
         let mut resident_upload_bytes = 0;
+        let mut atlas_bytes = 0;
         let mut dynamic_bytes = 0;
         let mut table_bytes = 0;
         let mut pooled = HashMap::<usize, Arc<Buffer>>::new();
@@ -535,6 +550,49 @@ impl Backend {
                     }
                 };
                 Some(buffer.clone())
+            } else if let Some(&allow_growth) = graph.asset_tables.get(&resource) {
+                let table = &graph.tables[&resource];
+                let key = (table.version(), usage.bits());
+                if let Some(buffer) = self.paged_assets.get(&key).and_then(Weak::upgrade) {
+                    Some(buffer)
+                } else {
+                    let bytes = table.bytes().max(4) as u64;
+                    // Editable raw atlases may grow into the remainder of one 64 KiB extent.
+                    // Immutable compressed payloads and small tables keep exact sizes.
+                    let capacity = if allow_growth && bytes >= 65536 {
+                        bytes
+                            .next_multiple_of(65536)
+                            .min(u64::from(g.limits.max_storage_buffer_range))
+                    } else {
+                        bytes
+                    };
+                    // Only this retired slot may surrender its reference. A live reader
+                    // retains the old immutable buffer and forces copy-on-write.
+                    let old = std::mem::replace(&mut slot.resources[i], Physical::Vacant);
+                    let owned = match old {
+                        Physical::SharedBuffer(b)
+                            if b.table.is_some() && b.size == capacity && b.usage == usage =>
+                        {
+                            Arc::try_unwrap(b).ok()
+                        }
+                        _ => None,
+                    };
+                    let mut b = match owned {
+                        Some(buffer) => buffer,
+                        None => Buffer::new(g, capacity, usage, true, Class::Asset.named(name))?,
+                    };
+                    b.use_bytes(bytes);
+                    let prior = b.table.take();
+                    let n = b.mapped(|p| Ok(table.upload(prior.as_ref(), p)))? as u64;
+                    resident_upload_bytes += n;
+                    if Some(resource) == plan.material_atlas {
+                        atlas_bytes += n;
+                    }
+                    b.table = Some(table.clone());
+                    let b = Arc::new(b);
+                    self.paged_assets.insert(key, Arc::downgrade(&b));
+                    Some(b)
+                }
             } else if graph.resident_inputs.contains(&resource) {
                 let Storage::Buffer {
                     bytes,
@@ -566,7 +624,12 @@ impl Backend {
                 None
             };
             if let Some(buffer) = shared {
-                slot.heap.write(g, i, &buffer, buffer.size)?;
+                let bound = if graph.asset_tables.contains_key(&resource) {
+                    graph.tables[&resource].bytes().max(4) as u64
+                } else {
+                    buffer.size
+                };
+                slot.heap.write(g, i, &buffer, bound)?;
                 slot.resources[i] = Physical::SharedBuffer(buffer);
                 continue;
             }
@@ -776,10 +839,12 @@ impl Backend {
                 );
             }
         }
-        while slot.recorders.len() < plan.steps.len() {
-            slot.recorders.push(Recorder::new(g)?);
-        }
-        Ok((resident_upload_bytes, dynamic_bytes, table_bytes))
+        Ok(UploadBytes {
+            resident: resident_upload_bytes,
+            dynamic: dynamic_bytes,
+            tables: table_bytes,
+            atlas: atlas_bytes,
+        })
     }
     pub fn execute(&mut self, plan: FramePlan, tasks: &rayon::ThreadPool) -> Result<Frame> {
         self.execute_to(plan, tasks, None)
@@ -837,6 +902,19 @@ impl Backend {
             .or_else(|| self.retire_submitted())
     }
 
+    /// Poll during an idle receive timeout so a new plan can still use the other frame slot.
+    pub(crate) fn retire_ready(&mut self) -> Option<Result<Frame>> {
+        if let Some(frame) = self.completed.pop_front() {
+            return Some(Ok(frame));
+        }
+        let front = self.pending.front()?;
+        match self.timelines.ready(&self.gpu, &front.retire) {
+            Ok(false) => None,
+            Ok(true) => self.retire_submitted(),
+            Err(error) => Some(self.recover().and(Err(error))),
+        }
+    }
+
     fn retire_submitted(&mut self) -> Option<Result<Frame>> {
         self.pending.pop_front().map(|frame| {
             let result = self.finish_frame(frame);
@@ -884,7 +962,7 @@ impl Backend {
         plan: &FramePlan,
         index: usize,
         reuse: &transient::Reuse,
-    ) -> Result<(u64, u64, u64)> {
+    ) -> Result<UploadBytes> {
         match self.prepare(plan, index, reuse) {
             Err(error) if error.is::<memory::BudgetExceeded>() => {
                 self.release_idle_resources();
@@ -914,9 +992,14 @@ impl Backend {
         }
         queues::remove_semaphore_covered_reads(&mut plan.commands, self.gpu.queues.len());
         let reuse = transient::Reuse::plan(&mut plan, self.gpu.queues.len());
-        let (resident_upload_bytes, dynamic_upload_bytes, scene_table_upload_bytes) =
-            self.prepare_with_budget(&plan, index, &reuse)?;
+        let uploads = self.prepare_with_budget(&plan, index, &reuse)?;
+        let layout = self
+            .timelines
+            .recording_layout(&plan, tasks.current_num_threads());
         let slot = &mut self.slots[index];
+        while slot.recorders.len() < layout.chunks.len() {
+            slot.recorders.push(Recorder::new(&self.gpu)?);
+        }
         let output = plan.output;
         let pixels =
             plan.graph.output_extent()[0] as usize * plan.graph.output_extent()[1] as usize * 4;
@@ -947,50 +1030,48 @@ impl Backend {
         let dirs = &slot.resources;
         let heap = slot.heap.bind;
         let pipelines = &self.pipes;
-        let recorders = &mut slot.recorders[..plan.steps.len()];
-        let vendor = plan
-            .steps
-            .iter()
-            .position(|step| matches!(plan.graph.passes[step.index].op, Op::Dlss(_)));
-        let mut recordings = tasks.install(|| {
-            recorders
-                .par_iter_mut()
-                .zip(&plan.steps)
-                .enumerate()
-                .filter(|(index, _)| Some(*index) != vendor)
-                .map(|(_, (rec, step))| {
-                    let start = Instant::now();
-                    unsafe {
-                        rec.record(&plan, step, dirs, &heap, pipelines, image)?;
-                    }
-                    Ok((
-                        rayon::current_thread_index().unwrap(),
-                        start,
-                        Instant::now(),
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()
-        })?;
-        // Keep all NGX calls for a device on the RHI thread.
-        if let Some(index) = vendor {
+        let recorders = &mut slot.recorders[..layout.chunks.len()];
+        let vendor = |range: &std::ops::Range<usize>| {
+            matches!(
+                plan.graph.passes[plan.steps[range.start].index].op,
+                Op::Dlss(_)
+            )
+        };
+        let record = |rec: &mut Recorder, range: &std::ops::Range<usize>, worker| -> Result<_> {
             let start = Instant::now();
             unsafe {
-                recorders[index].record(
+                rec.record(
                     &plan,
-                    &plan.steps[index],
+                    &plan.steps[range.clone()],
                     dirs,
                     &heap,
                     pipelines,
                     image,
                 )?;
             }
-            recordings.push((tasks.current_num_threads(), start, Instant::now()));
+            Ok((worker, start, Instant::now()))
+        };
+        let mut recordings = tasks.install(|| {
+            recorders
+                .par_iter_mut()
+                .zip(&layout.chunks)
+                .filter(|(_, range)| !vendor(range))
+                .map(|(rec, range)| record(rec, range, rayon::current_thread_index().unwrap()))
+                .collect::<Result<Vec<_>>>()
+        })?;
+        // SDK command recording is serialized on the device-owning RHI thread.
+        for (rec, range) in recorders
+            .iter_mut()
+            .zip(&layout.chunks)
+            .filter(|(_, range)| vendor(range))
+        {
+            recordings.push(record(rec, range, tasks.current_num_threads())?);
         }
         let record_ms = ms(recording_start);
         let submit_start = Instant::now();
-        let batches = self
-            .timelines
-            .submit(&self.gpu, &plan, recorders, &slot.resources, image)?;
+        let batches =
+            self.timelines
+                .submit(&self.gpu, &plan, recorders, &layout, &slot.resources, image)?;
         let mut starts = batches
             .iter()
             .enumerate()
@@ -1008,6 +1089,7 @@ impl Backend {
                 let _ = blas.ready.set((batch.queue, batch.signal));
             }
         }
+        self.submitted_frames += 1;
         let submit_ms = ms(submit_start);
         let present_start = Instant::now();
         let presented = image
@@ -1015,7 +1097,32 @@ impl Backend {
             .transpose();
         let present_ms = ms(present_start);
         presented?;
+        let stamp = plan.stamp;
+        let elapsed = |pair: Option<(Instant, Instant)>| {
+            pair.map_or(0., |(a, b)| b.duration_since(a).as_secs_f64() * 1000.)
+        };
+        let stamp_time = |origin: Instant, t: Instant| (t - origin).as_micros() as u64;
+        let cpu_times_us = stamp.origin.and_then(|origin| {
+            Some(frame::CpuFrameTimes {
+                tick: stamp_time(origin, stamp.tick_started?),
+                snapshot: stamp_time(origin, stamp.snapshot_ready?),
+                render: stamp_time(origin, stamp.render_dequeued?),
+                plan: stamp_time(origin, stamp.plan_ready?),
+                rhi: stamp_time(origin, frame_start),
+                acquire: stamp_time(origin, acquire_start),
+                submit: stamp_time(origin, submit_start),
+                present_return: image.map(|_| stamp_time(origin, Instant::now())),
+                retired: 0,
+            })
+        });
         let profile = FrameProfile {
+            cpu_times_us,
+            submission_id: self.submitted_frames,
+            tick_id: stamp.tick_id, snapshot_id: stamp.snapshot_id,
+            skipped_render_ticks: stamp.skipped_ticks, history_generation: stamp.generation,
+            render_queue_ms: elapsed(stamp.snapshot_ready.zip(stamp.render_dequeued)),
+            rhi_queue_ms: elapsed(stamp.plan_ready.map(|t| (t, frame_start))),
+            tick_to_present_request_ms: stamp.tick_started.filter(|_| image.is_some()).map(ms),
             main_ms: plan.main_ms,
             extract_ms: plan.extract_ms,
             build_ms: plan.build_ms,
@@ -1031,10 +1138,13 @@ impl Backend {
             wsi_transitions: 2 * usize::from(image.is_some()),
             wsi_binary_pairs: usize::from(image.is_some()),
             frames_in_flight: 1,
-            resident_upload_bytes,
+            resident_upload_bytes: uploads.resident,
+            atlas_upload_bytes: uploads.atlas,
+            atlas_revision: plan.atlas_build.0,
+            atlas_version_repack_bytes: plan.atlas_build.1,
             transient_reuse_bytes: reuse.saved_bytes,
-            dynamic_upload_bytes,
-            scene_table_upload_bytes,
+            dynamic_upload_bytes: uploads.dynamic,
+            scene_table_upload_bytes: uploads.tables,
             geometry_instance_visits: plan.instance_visits,
             extraction_full_rebuild: plan.extraction.full_rebuild,
             updated_transforms: plan.extraction.transforms_updated,
@@ -1054,6 +1164,7 @@ impl Backend {
             managed: self.gpu.allocator.lock().unwrap().snapshot(),
             retire: self.timelines.targets(),
             batches,
+            layout,
             start: frame_start,
             profile,
             recordings,
@@ -1069,6 +1180,7 @@ impl Backend {
             output,
             retire,
             batches,
+            layout,
             start,
             mut profile,
             managed,
@@ -1079,7 +1191,7 @@ impl Backend {
         self.timelines.retire(&self.gpu, &retire)?;
         profile.retire_ms = retire_start.elapsed().as_secs_f64() * 1000.;
         let slot = &mut self.slots[slot];
-        let recorders = &slot.recorders[..plan.steps.len()];
+        let recorders = &slot.recorders[..layout.chunks.len()];
         let d = &self.gpu.dev;
         let pixels =
             plan.graph.output_extent()[0] as usize * plan.graph.output_extent()[1] as usize * 4;
@@ -1092,52 +1204,62 @@ impl Backend {
         let mut span = [0i64; 2];
         let period_ms = f64::from(self.gpu.limits.timestamp_period) * 1e-6;
         let aligned = self.gpu.common_clock || self.gpu.queues.len() == 1;
-        for ((r, step), batch) in recorders.iter().zip(&plan.steps).zip(batches) {
-            let mut pair = [0_u64; 2];
+        let mut timestamps = [[0_u64; 2]; queues::MAX_STEPS_PER_COMMAND];
+        for (r, range) in recorders.iter().zip(&layout.chunks) {
+            let times = &mut timestamps[..range.len()];
             unsafe {
                 d.get_query_pool_results(
                     r.query,
                     0,
-                    2,
-                    bytemuck::cast_slice_mut(&mut pair),
+                    (2 * times.len()) as u32,
+                    bytemuck::cast_slice_mut(times),
                     8,
                     vk::QueryResultFlags::_64 | vk::QueryResultFlags::WAIT,
                 )?;
             }
-            let interval = if aligned {
-                let origin = *clock_origin.get_or_insert(pair[0]);
-                let shift = 64 - self.gpu.timestamp_bits;
-                let relative = |v: u64| ((v.wrapping_sub(origin) << shift) as i64) >> shift;
-                span[0] = span[0].min(relative(pair[0]));
-                span[1] = span[1].max(relative(pair[1]));
-                Some([
-                    relative(pair[0]) as f64 * period_ms,
-                    relative(pair[1]) as f64 * period_ms,
-                ])
-            } else {
-                None
-            };
-            let ticks =
-                pair[1].wrapping_sub(pair[0]) & (u64::MAX >> (64 - self.gpu.timestamp_bits));
-            passes.push(PassReport {
-                batch,
-                interval,
-                raster: if matches!(plan.graph.passes[step.index].op, Op::Draw { .. }) {
-                    r.raster.as_ref().map(|q| q.counts()).transpose()?
+            for (offset, rank) in range.clone().enumerate() {
+                let pair = times[offset];
+                let step = &plan.steps[rank];
+                let batch = &batches[rank];
+                let interval = if aligned {
+                    let origin = *clock_origin.get_or_insert(pair[0]);
+                    let shift = 64 - self.gpu.timestamp_bits;
+                    let relative = |v: u64| ((v.wrapping_sub(origin) << shift) as i64) >> shift;
+                    span[0] = span[0].min(relative(pair[0]));
+                    span[1] = span[1].max(relative(pair[1]));
+                    Some([
+                        relative(pair[0]) as f64 * period_ms,
+                        relative(pair[1]) as f64 * period_ms,
+                    ])
                 } else {
                     None
-                },
-                phase: plan.graph.passes[step.index].phase,
-                queue: plan.graph.passes[step.index].queue,
-                name: plan.graph.passes[step.index].name.clone(),
-                parents: step.parents.iter().map(|&i| rows[i]).collect(),
-                barriers: step
-                    .barriers
-                    .iter()
-                    .map(|b| format!("{} → {:?}", plan.graph.resources[b.resource.0].0, b.to))
-                    .collect(),
-                ms: ticks as f64 * self.gpu.limits.timestamp_period as f64 * 1e-6,
-            });
+                };
+                let ticks =
+                    pair[1].wrapping_sub(pair[0]) & (u64::MAX >> (64 - self.gpu.timestamp_bits));
+                passes.push(PassReport {
+                    batch: batch.clone(),
+                    interval,
+                    raster: if matches!(plan.graph.passes[step.index].op, Op::Draw { .. }) {
+                        r.raster
+                            .get(offset)
+                            .and_then(Option::as_ref)
+                            .map(|q| q.counts())
+                            .transpose()?
+                    } else {
+                        None
+                    },
+                    phase: plan.graph.passes[step.index].phase,
+                    queue: plan.graph.passes[step.index].queue,
+                    name: plan.graph.passes[step.index].name.clone(),
+                    parents: step.parents.iter().map(|&i| rows[i]).collect(),
+                    barriers: step
+                        .barriers
+                        .iter()
+                        .map(|b| format!("{} → {:?}", plan.graph.resources[b.resource.0].0, b.to))
+                        .collect(),
+                    ms: ticks as f64 * self.gpu.limits.timestamp_period as f64 * 1e-6,
+                });
+            }
         }
         let mut counters = std::collections::BTreeMap::new();
         for pass in &plan.graph.passes {
@@ -1201,7 +1323,11 @@ impl Backend {
         }
         if let Some(r) = plan.material_atlas {
             let atlas = slot.resources[r.0].buffer();
-            memory.atlas_buffer_bytes = atlas.size;
+            memory.atlas_buffer_bytes = plan
+                .graph
+                .tables
+                .get(&r)
+                .map_or(atlas.size, |t| t.bytes() as u64);
             memory.atlas = Some(atlas.allocation.clone());
         }
         let Physical::Buffer(buffer) = &mut slot.resources[output.0] else {
@@ -1237,6 +1363,7 @@ impl Backend {
             }
         }
         profile.recording_workers = workers.len();
+        profile.recording_chunks = recorders.len();
         profile.overlapping_recordings = peak as usize;
         profile.physical_queues = self.gpu.queues.len();
         profile.dependency_edges = plan.steps.iter().map(|s| s.parents.len()).sum();
@@ -1245,6 +1372,25 @@ impl Backend {
         profile.memory_barriers = barriers[1];
         profile.image_barriers = barriers[2];
         let submits = profile.timeline_signals;
+        let pixels = if presentation.is_none()
+            || plan
+                .graph
+                .passes
+                .iter()
+                .any(|p| matches!(p.op,Op::HostRead(r) if r==output))
+        {
+            buffer.mapped(|p| Ok(p[..pixels].to_vec()))?
+        } else {
+            vec![]
+        };
+        let completed = Instant::now();
+        if let (Some(origin), Some(times)) = (plan.stamp.origin, profile.cpu_times_us.as_mut()) {
+            times.retired = (completed - origin).as_micros() as u64;
+        }
+        profile.tick_to_completion_ms = plan
+            .stamp
+            .tick_started
+            .map(|s| (completed - s).as_secs_f64() * 1000.);
         let first_profile = self
             .first_profile
             .get_or_insert_with(|| Arc::new(profile.clone()))
@@ -1253,21 +1399,11 @@ impl Backend {
             first_profile,
             profile,
             sequence: self.frame_number,
-            completed: Instant::now(),
+            completed,
             counters,
             submissions: submits,
             presentation: presentation.clone(),
-            pixels: if presentation.is_none()
-                || plan
-                    .graph
-                    .passes
-                    .iter()
-                    .any(|p| matches!(p.op,Op::HostRead(r) if r==output))
-            {
-                buffer.mapped(|p| Ok(p[..pixels].to_vec()))?
-            } else {
-                vec![]
-            },
+            pixels,
             extent: plan.graph.output_extent(),
             passes,
             gpu: self.gpu.name.clone(),

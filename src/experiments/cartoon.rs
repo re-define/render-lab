@@ -17,7 +17,12 @@ pub(super) const MODULE: SceneModule = SceneModule {
             c.target.y -= 0.24;
         }
         a.camera = Some(c);
-        a.visibility.cartoon = true;
+        let cartoon = Arc::new(Cartoon::default());
+        a.visibility.ordinary(
+            cartoon.clone(),
+            Box::new(move |g, t, s, surfaces| cartoon.draw(g, t, s, surfaces)),
+        )?;
+        a.visibility.layers.display.push(Cartoon::overlay);
         Ok(())
     },
 };

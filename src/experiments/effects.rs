@@ -1,5 +1,6 @@
 //! Two procedural experiments sharing the engine's mesh visibility and material passes.
 use crate::experiments::assembly::{Primary, Registration as SceneModule};
+use crate::render::material_code;
 pub(super) const MODULE: SceneModule = SceneModule {
     key: SETTING,
     primary: Primary::Visibility,
@@ -11,7 +12,28 @@ pub(super) const MODULE: SceneModule = SceneModule {
             &mut a.schedule,
             super::composition::enabled(world, "water"),
         )?);
-        a.visibility.effects = true;
+        if super::composition::enabled(world, "water") {
+            a.visibility.route(
+                Arc::new(Effects),
+                super::composition::SurfaceRoute {
+                    name: "Surface effects",
+                    owns: Effects::owns,
+                    draw: |g, targets, s, instance, outputs| {
+                        if let Some(reflector) = Effects::draw(g, targets, s, instance)? {
+                            outputs.rivers.push(reflector);
+                        }
+                        Ok(())
+                    },
+                },
+            );
+            a.visibility.layers.scene.push((
+                super::composition::SceneStage::Reflections,
+                |g, s, view, products| {
+                    river::reflections(g, s, view, &products.rivers);
+                    Ok(())
+                },
+            ));
+        }
         Ok(())
     },
 };
@@ -216,11 +238,11 @@ pub(super) fn configure(
 ) -> Result<Camera> {
     let (_, s) = settings(world)?;
     if s.kind != Kind::River {
-        programs.register(STONE, spv!("stone_material.comp"))?;
+        programs.register(STONE, material_code!("stone_material.comp"))?;
     }
     let camera = match s.kind {
         Kind::Water => {
-            programs.register(WATER, spv!("water_material.comp"))?;
+            programs.register(WATER, material_code!("water_material.comp"))?;
             Camera {
                 target: Vec3::new(0., 1.23, 0.55),
                 distance: 10.9,
@@ -229,12 +251,12 @@ pub(super) fn configure(
             }
         }
         Kind::River => {
-            programs.register(river::WATER, spv!("river_material.comp"))?;
+            programs.register(river::WATER, material_code!("river_material.comp"))?;
             super::vegetation::camera("river")?
         }
         Kind::Destruction => {
-            programs.register(ORE, spv!("ore_material.comp"))?;
-            programs.register(DISSOLVE, spv!("dissolve_material.comp"))?;
+            programs.register(ORE, material_code!("ore_material.comp"))?;
+            programs.register(DISSOLVE, material_code!("dissolve_material.comp"))?;
             Camera {
                 target: Vec3::new(0., 1.04, 0.),
                 distance: 8.8,
@@ -376,10 +398,11 @@ impl Technique for Effects {
                 }
                 Ok(())
             },
-            |g, ids, depth, color| {
-                river::reflections(g, s, ids, depth, color, &rivers.borrow());
+            |g, inputs| {
+                river::reflections(g, s, inputs, &rivers.borrow());
                 Ok(())
             },
+            |_, _| Ok(()),
         )
     }
 }

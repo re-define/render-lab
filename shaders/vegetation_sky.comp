@@ -2,7 +2,8 @@
 #include "visibility_image.glsl"
 layout(local_size_x=8,local_size_y=8) in;
 layout(set=0,binding=1) uniform texture2D sceneDepth;
-layout(set=0,binding=2,std430) buffer Color { uint pixels[]; };
+#define SCENE_COLOR_BINDING 2
+#include "effect_color.glsl"
 layout(set=0,binding=3,std430) readonly buffer View {
     mat4 inverseVP;
     vec4 eye;
@@ -48,11 +49,11 @@ void main() {
     float glow=pow(max(0.0,dot(ray,sun.xyz)),18.0)*sun.w;
     sky+=vec3(0.18,0.116,0.039)*glow;
     if(visibilityAt(xy).x==0u){
-        pixels[index]=packUnorm4x8(vec4(sky.bgr,1.0));
-    }else if(params.z==0u){
-        vec3 color=unpackUnorm4x8(pixels[index]).bgr;
+        if ((params.z & 2u) == 0u) storeSceneColor(index, authoredColor(sky));
+    }else if((params.z & 1u)==0u){
+        vec3 color=loadSceneColor(index);
         color*=mix(vec3(1.),vec3(.67,.74,.82),contact(p.xyz/p.w,length(delta)));
         float mist=0.65*(1.0-exp(-(valley ? 0.0029 : 0.0045)*max(0.0,length(delta)-12.0)));
-        pixels[index]=packUnorm4x8(vec4(mix(color,horizon+vec3(0.035,0.018,0.0)*glow,mist).bgr,1.0));
+        storeSceneColor(index, mix(color,authoredColor(horizon+vec3(0.035,0.018,0.0)*glow),mist));
     }
 }

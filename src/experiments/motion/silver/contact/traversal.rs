@@ -218,7 +218,6 @@ pub(super) fn steer(c: &mut Contact, p: &mut State, root: Vec3, target: Vec3, dt
 }
 
 // The bank stores local hip displacement followed by the same 21 rotations as locomotion.
-#[cfg_attr(test, derive(Clone))]
 pub(super) struct ActionRig {
     joints: Vec<usize>,
     hip_origin: Vec3,

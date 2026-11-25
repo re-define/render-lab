@@ -51,7 +51,8 @@ fn draw_trajectory(
         .scene
         .derived::<Trajectory>(PLAYER)
         .context("invalid trajectory output")?;
-    let extent = Vec2::from_array(snapshot.extent.map(|v| v as f32));
+    let display_extent = graph.output_extent();
+    let extent = Vec2::from_array(display_extent.map(|v| v as f32));
     let view = snapshot.view_projection() * trajectory.model;
     let project = |p: Vec2| {
         let clip = view * Vec3::new(p.x, 0.02, p.y).extend(1.);
@@ -81,7 +82,7 @@ fn draw_trajectory(
         return Ok(());
     }
     let mut push = Vec::with_capacity(26);
-    push.extend(snapshot.extent);
+    push.extend(display_extent);
     push.extend(min.to_array());
     push.extend(area.to_array());
     push.extend(

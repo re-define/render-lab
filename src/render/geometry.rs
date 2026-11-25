@@ -2,6 +2,9 @@ use super::*;
 use crate::rdg::PassPhase;
 use std::sync::{Mutex, Weak};
 
+mod skin;
+pub(super) use skin::SkinBatches;
+
 #[derive(Default)]
 pub(crate) struct MeshCache(Mutex<BTreeMap<MeshId, MeshSource>>);
 
@@ -129,7 +132,7 @@ pub(crate) struct SurfaceGeometry<'a> {
     mesh_id: MeshId,
     pub(crate) mesh: &'a Arc<Mesh>,
     model: Mat4,
-    palette: Option<&'a [Mat4]>,
+    palette: Option<&'a Arc<[Mat4]>>,
     pub(crate) selected: Option<Vec<u32>>,
     edges: Option<&'a [Edge]>,
 }
@@ -186,7 +189,7 @@ impl VisibilityRenderer {
                         mesh,
                         model,
                         selected,
-                        palette: instance.palette.as_deref(),
+                        palette: instance.palette.as_ref(),
                         edges: if instance.outline {
                             asset.topology.as_ref().map(|edges| edges.as_slice())
                         } else {
@@ -343,7 +346,7 @@ impl SurfaceGeometry<'_> {
         let motion = if let Some(history) = s.surface_history(instance)? {
             let source = match (history.previous, self.palette) {
                 (Some(prior), Some(_)) => {
-                    let palette = prior.palette.as_deref().unwrap();
+                    let palette = prior.palette.as_ref().unwrap();
                     if inputs
                         .last_joint
                         .is_none_or(|joint| usize::from(joint) < palette.len())
@@ -405,60 +408,12 @@ impl SurfaceGeometry<'_> {
         g: &mut FrameGraph,
         input: MeshInputs,
         model: Mat4,
-        palette: &[Mat4],
+        palette: &Arc<[Mat4]>,
         previous: bool,
     ) -> Result<Resource> {
-        let count: u32 = self.mesh.positions.len().try_into()?;
-        let mut joint_data = Vec::with_capacity(palette.len() + 1);
-        joint_data.push(model.to_cols_array());
-        joint_data.extend(palette.iter().map(Mat4::to_cols_array));
-        let joints = g.input(
-            if previous {
-                "Previous joint matrices"
-            } else {
-                "Current joint matrices"
-            },
-            bytemuck::cast_slice(&joint_data).to_vec(),
-        );
-        let vertices = g.resource(
-            if previous {
-                "Previous GPU-skinned positions"
-            } else {
-                "GPU-skinned vertices"
-            },
-            Storage::Buffer {
-                bytes: (count as usize * if previous { 16 } else { 32 }).max(16),
-                initial: None,
-            },
-        );
-        g.prefer_local_buffer(vertices);
-        let groups = count.div_ceil(64);
-        g.pass_in(
-            PassPhase::Animation,
-            if previous {
-                "GPU skin previous positions"
-            } else {
-                "GPU skin mesh"
-            },
-            Op::Compute {
-                program: Dispatch {
-                    shader: Shader::Compute(if previous {
-                        include_bytes!(concat!(env!("OUT_DIR"), "/skin_previous.comp.spv"))
-                    } else {
-                        include_bytes!(concat!(env!("OUT_DIR"), "/skin.comp.spv"))
-                    }),
-                    bindings: vec![
-                        (input.vertices, Access::ComputeRead),
-                        (input.influences.unwrap(), Access::ComputeRead),
-                        (joints, Access::ComputeRead),
-                        (vertices, Access::ComputeWrite),
-                    ],
-                    push: count.to_ne_bytes().to_vec(),
-                },
-                groups: [groups.min(32768), groups.div_ceil(32768), 1],
-            },
-        );
-        Ok(vertices)
+        let count = self.mesh.positions.len().try_into()?;
+        g.skins
+            .add(&mut g.graph, input, count, model, palette, previous)
     }
 
     fn outline_masks(

@@ -1,5 +1,6 @@
 //! Seeded foliage, shared plant prototypes and controls for the geometry experiment.
 use crate::experiments::assembly::{Primary, Registration as SceneModule};
+use crate::render::material_code;
 pub(super) const MODULE: SceneModule = SceneModule {
     key: SETTING,
     primary: Primary::Visibility,
@@ -7,7 +8,13 @@ pub(super) const MODULE: SceneModule = SceneModule {
     install: |world, a| {
         configure(world, &mut a.materials)?;
         a.camera = Some(initial_camera(world)?);
-        a.visibility.plants = true;
+        if super::composition::enabled(world, "forest") {
+            a.visibility.clustered();
+            a.visibility.layers.scene.push((
+                super::composition::SceneStage::Atmosphere,
+                |g, s, view, _| super::clusters::ClusterLod::atmosphere(g, s, view),
+            ));
+        }
         Ok(())
     },
 };
@@ -31,7 +38,7 @@ mod river_forest;
 use crate::{
     engine::{Engine, SimulationData, SimulationSystem, SystemAccess, SystemContext, SystemOrder},
     experiments::clusters,
-    rdg::{Access, Dispatch, Op, Resource, Shader},
+    rdg::{Access, Dispatch, Op, Shader},
     render::{Camera, MaterialPrograms, Snapshot},
     scene::*,
 };
@@ -151,31 +158,13 @@ impl SimulationSystem for Wind {
 
 const PROGRAM: &str = "Vegetation pixels";
 const GROUND: &str = "Meadow ground";
-const GI_PROGRAMS: [(&str, &[u8]); 6] = [
-    (
-        "GI woodland soil",
-        include_bytes!(concat!(env!("OUT_DIR"), "/gi_woodland_soil.comp.spv")),
-    ),
-    (
-        "GI limestone",
-        include_bytes!(concat!(env!("OUT_DIR"), "/gi_limestone.comp.spv")),
-    ),
-    (
-        "GI foliage",
-        include_bytes!(concat!(env!("OUT_DIR"), "/gi_foliage.comp.spv")),
-    ),
-    (
-        "GI bark",
-        include_bytes!(concat!(env!("OUT_DIR"), "/gi_bark.comp.spv")),
-    ),
-    (
-        "GI river soil",
-        include_bytes!(concat!(env!("OUT_DIR"), "/gi_river_soil.comp.spv")),
-    ),
-    (
-        "GI soil",
-        include_bytes!(concat!(env!("OUT_DIR"), "/gi_soil.comp.spv")),
-    ),
+const GI_PROGRAMS: [(&str, crate::render::MaterialCode); 6] = [
+    ("GI woodland soil", material_code!("gi_woodland_soil.comp")),
+    ("GI limestone", material_code!("gi_limestone.comp")),
+    ("GI foliage", material_code!("gi_foliage.comp")),
+    ("GI bark", material_code!("gi_bark.comp")),
+    ("GI river soil", material_code!("gi_river_soil.comp")),
+    ("GI soil", material_code!("gi_soil.comp")),
 ];
 const BARK: &str = "Tree bark";
 const SUN_DIRECTION: Vec3 = Vec3::new(0.42, -0.73, -0.55);
@@ -191,28 +180,25 @@ pub(super) fn configure(world: &World, registry: &mut MaterialPrograms) -> Resul
     }
     registry.register_scene_lit(
         PROGRAM,
-        include_bytes!(concat!(env!("OUT_DIR"), "/vegetation_material.comp.spv")),
-        include_bytes!(concat!(env!("OUT_DIR"), "/vegetation_scene.comp.spv")),
+        material_code!("vegetation_material.comp"),
+        material_code!("vegetation_scene.comp"),
     )?;
     registry.register_scene_lit(
         BARK,
-        include_bytes!(concat!(env!("OUT_DIR"), "/vegetation_bark.comp.spv")),
-        include_bytes!(concat!(env!("OUT_DIR"), "/vegetation_bark_scene.comp.spv")),
+        material_code!("vegetation_bark.comp"),
+        material_code!("vegetation_bark_scene.comp"),
     )?;
     if matches!(read(world)?.1.preset, Preset::River) {
         registry.register_scene_lit(
             river_forest::GROUND,
-            include_bytes!(concat!(env!("OUT_DIR"), "/river_ground.comp.spv")),
-            include_bytes!(concat!(env!("OUT_DIR"), "/river_ground_scene.comp.spv")),
+            material_code!("river_ground.comp"),
+            material_code!("river_ground_scene.comp"),
         )?;
     } else {
         registry.register_scene_lit(
             GROUND,
-            include_bytes!(concat!(env!("OUT_DIR"), "/vegetation_ground.comp.spv")),
-            include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/vegetation_ground_scene.comp.spv"
-            )),
+            material_code!("vegetation_ground.comp"),
+            material_code!("vegetation_ground_scene.comp"),
         )?;
     }
     Ok(())
@@ -263,9 +249,7 @@ pub(super) fn initial_camera(world: &World) -> Result<Camera> {
 pub(super) fn atmosphere(
     graph: &mut FrameGraph,
     snapshot: &Snapshot,
-    ids: Resource,
-    depth: Resource,
-    color: Resource,
+    inputs: crate::render::SceneLayers,
     debug: bool,
 ) {
     #[repr(C)]
@@ -310,7 +294,7 @@ pub(super) fn atmosphere(
         params: [
             width,
             height,
-            u32::from(debug),
+            u32::from(debug) | (u32::from(inputs.has_backdrop) << 1),
             match preset {
                 Some("river") => 1,
                 Some("karst") => 2,
@@ -328,14 +312,17 @@ pub(super) fn atmosphere(
         "Vegetation atmosphere",
         Op::Compute {
             program: Dispatch {
-                shader: Shader::Compute(include_bytes!(concat!(
-                    env!("OUT_DIR"),
-                    "/vegetation_sky.comp.spv"
-                ))),
+                shader: Shader::Compute(
+                    if inputs.color.encoding == crate::render::post::ColorEncoding::LinearRgba32 {
+                        include_bytes!(concat!(env!("OUT_DIR"), "/vegetation_sky_hdr.comp.spv"))
+                    } else {
+                        include_bytes!(concat!(env!("OUT_DIR"), "/vegetation_sky.comp.spv"))
+                    },
+                ),
                 bindings: vec![
-                    (ids, Access::ComputeSample),
-                    (depth, Access::ComputeSample),
-                    (color, Access::ComputeReadWrite),
+                    (inputs.ids, Access::ComputeSample),
+                    (inputs.depth, Access::ComputeSample),
+                    (inputs.color.resource, Access::ComputeReadWrite),
                     (view, Access::ComputeRead),
                 ],
                 push: vec![],

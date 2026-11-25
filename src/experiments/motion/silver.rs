@@ -150,7 +150,6 @@ struct Pose {
     ground_velocity: Vec2,
 }
 pub struct SilverMatcher {
-    after: &'static [&'static str],
     search: search::Index,
     poses: Vec<Pose>,
     clips: Vec<(std::ops::Range<usize>, String)>,
@@ -204,7 +203,6 @@ impl SilverMatcher {
         }
         let search = search::Index::load(raw_features, &clips)?;
         Ok(Self {
-            after: &[],
             poses,
             clips,
             search,
@@ -265,11 +263,144 @@ impl SilverMatcher {
         Ok(jumped.then_some((outgoing, next)))
     }
 }
+impl SilverMatcher {
+    fn publish_locomotion(
+        &self,
+        id: Id,
+        p: &mut State,
+        cx: &mut SystemContext<'_>,
+        dt: f32,
+    ) -> Result<()> {
+        let root = cx.local(id)?.context("missing motion root")?;
+        let (root, joints) = self.sample_pose(p, root, dt, |_, id| {
+            cx.local(id)?.context("missing motion joint")
+        })?;
+        cx.set_pose(std::iter::once((id, root)).chain(p.bones.iter().copied().zip(joints)))
+    }
+
+    /// The caller owns the previous base pose. Contact corrections must not feed into inertialization.
+    fn sample_pose(
+        &self,
+        p: &mut State,
+        root: Mat4,
+        dt: f32,
+        mut previous_local: impl FnMut(usize, Id) -> Result<Mat4>,
+    ) -> Result<(Mat4, Vec<Mat4>)> {
+        ensure!(
+            p.sample < self.poses.len() && p.bones.len() == self.poses[p.sample].rotations.len(),
+            "invalid motion binding"
+        );
+        let time = dt.min(0.25);
+        let mut root = root.w_axis.truncate();
+        if p.move_root {
+            let travel = p.advance(time);
+            let delta = travel.displacement;
+            root += Quat::from_rotation_y(p.yaw) * Vec3::new(delta.x, 0., delta.y);
+            p.velocity = travel.velocity;
+            p.acceleration = travel.acceleration;
+            p.yaw = (p.yaw + travel.turn).rem_euclid(std::f32::consts::TAU);
+            p.yaw_rate = travel.yaw_rate;
+        }
+        let mut playback = 1.;
+        if p.move_root {
+            let motion = self.poses[p.sample].ground_velocity;
+            let speed = motion.length();
+            if speed > 0.25 && p.velocity.dot(motion) > 0. {
+                // Adapt cadence within a small range while the controller
+                // and baked clip are moving in the same direction.
+                playback = (p.velocity.dot(motion) / speed.powi(2)).clamp(0.85, 1.15);
+            }
+        }
+        p.fraction += time * HZ * playback;
+        let mut jump = None;
+        while p.fraction >= 1. {
+            p.fraction -= 1.;
+            jump = self.step(p)?.or(jump);
+        }
+        let pose = &self.poses[p.sample];
+        let end = self
+            .clips
+            .iter()
+            .find(|(r, _)| r.contains(&p.sample))
+            .unwrap()
+            .0
+            .end;
+        let after = &self.poses[(p.sample + 1).min(end - 1)];
+        let mut transition = jump.map(|(old, next)| {
+            let old = &self.poses[old];
+            let old_next = &self.poses[next];
+            (
+                old,
+                old_next,
+                locomotion::Transition {
+                    elapsed: 0.,
+                    hip: locomotion::Offset {
+                        value: Vec3::ZERO,
+                        velocity: ((old_next.hip - old.hip) - (after.hip - pose.hip)) * HZ,
+                    },
+                    joints: Vec::with_capacity(p.bones.len()),
+                },
+            )
+        });
+        if let Some(active) = &mut p.transition {
+            active.elapsed += time;
+            if active.elapsed >= 0.4 || active.joints.len() != p.bones.len() {
+                p.transition = None;
+            }
+        }
+        let target_hip = p.hip_origin + pose.hip.lerp(after.hip, p.fraction);
+        let mut joints = Vec::with_capacity(p.bones.len());
+        for (i, &bone) in p.bones.iter().enumerate() {
+            let (scale, previous, mut translation) =
+                previous_local(i, bone)?.to_scale_rotation_translation();
+            let target = pose.rotations[i].slerp(after.rotations[i], p.fraction);
+            let rotation = if let Some((old, next, blend)) = &mut transition {
+                blend.joints.push(locomotion::Offset {
+                    value: locomotion::rotation_difference(target, previous),
+                    velocity: (locomotion::rotation_difference(
+                        old.rotations[i],
+                        next.rotations[i],
+                    ) - locomotion::rotation_difference(
+                        pose.rotations[i],
+                        after.rotations[i],
+                    )) * HZ,
+                });
+                previous
+            } else if let Some(blend) = &p.transition {
+                Quat::from_scaled_axis(blend.joints[i].at(blend.elapsed)) * target
+            } else {
+                target
+            };
+            if i == 0 {
+                if let Some((_, _, blend)) = &mut transition {
+                    blend.hip.value = translation - target_hip;
+                } else {
+                    translation = target_hip
+                        + p.transition
+                            .as_ref()
+                            .map_or(Vec3::ZERO, |blend| blend.hip.at(blend.elapsed));
+                }
+            }
+            joints.push(Mat4::from_scale_rotation_translation(
+                scale,
+                rotation.normalize(),
+                translation,
+            ));
+        }
+        if let Some((_, _, blend)) = transition {
+            p.transition = Some(blend);
+        }
+        Ok((
+            Mat4::from_rotation_translation(Quat::from_rotation_y(p.yaw), root),
+            joints,
+        ))
+    }
+}
 impl SimulationSystem for SilverMatcher {
     fn order(&self) -> SystemOrder {
         SystemOrder {
             key: Some(PLAYER),
-            after: self.after,
+            after: &[],
         }
     }
     fn access(&self) -> SystemAccess {
@@ -304,121 +435,7 @@ impl SimulationSystem for SilverMatcher {
                 .component::<State>(id, PLAYER)?
                 .context("missing Silver Wolf motion player")?
                 .into_owned();
-            ensure!(
-                p.sample < self.poses.len()
-                    && p.bones.len() == self.poses[p.sample].rotations.len(),
-                "invalid motion binding"
-            );
-            let time = dt.min(0.25);
-            let mut root = cx
-                .local(id)?
-                .context("missing motion root")?
-                .w_axis
-                .truncate();
-            if p.move_root {
-                let travel = p.advance(time);
-                let delta = travel.displacement;
-                root += Quat::from_rotation_y(p.yaw) * Vec3::new(delta.x, 0., delta.y);
-                p.velocity = travel.velocity;
-                p.acceleration = travel.acceleration;
-                p.yaw = (p.yaw + travel.turn).rem_euclid(std::f32::consts::TAU);
-                p.yaw_rate = travel.yaw_rate;
-            }
-            let mut playback = 1.;
-            if p.move_root {
-                let motion = self.poses[p.sample].ground_velocity;
-                let speed = motion.length();
-                if speed > 0.25 && p.velocity.dot(motion) > 0. {
-                    // Adapt cadence within a small range while the controller
-                    // and baked clip are moving in the same direction.
-                    playback = (p.velocity.dot(motion) / speed.powi(2)).clamp(0.85, 1.15);
-                }
-            }
-            p.fraction += time * HZ * playback;
-            let mut jump = None;
-            while p.fraction >= 1. {
-                p.fraction -= 1.;
-                jump = self.step(&mut p)?.or(jump);
-            }
-            let pose = &self.poses[p.sample];
-            let end = self
-                .clips
-                .iter()
-                .find(|(r, _)| r.contains(&p.sample))
-                .unwrap()
-                .0
-                .end;
-            let after = &self.poses[(p.sample + 1).min(end - 1)];
-            let mut transition = jump.map(|(old, next)| {
-                let old = &self.poses[old];
-                let old_next = &self.poses[next];
-                (
-                    old,
-                    old_next,
-                    locomotion::Transition {
-                        elapsed: 0.,
-                        hip: locomotion::Offset {
-                            value: Vec3::ZERO,
-                            velocity: ((old_next.hip - old.hip) - (after.hip - pose.hip)) * HZ,
-                        },
-                        joints: Vec::with_capacity(p.bones.len()),
-                    },
-                )
-            });
-            if let Some(active) = &mut p.transition {
-                active.elapsed += time;
-                if active.elapsed >= 0.4 || active.joints.len() != p.bones.len() {
-                    p.transition = None;
-                }
-            }
-            let target_hip = p.hip_origin + pose.hip.lerp(after.hip, p.fraction);
-            let mut joints = Vec::with_capacity(p.bones.len() + 1);
-            joints.push((
-                id,
-                Mat4::from_rotation_translation(Quat::from_rotation_y(p.yaw), root),
-            ));
-            for (i, &bone) in p.bones.iter().enumerate() {
-                let (scale, previous, mut translation) = cx
-                    .local(bone)?
-                    .context("missing motion joint")?
-                    .to_scale_rotation_translation();
-                let target = pose.rotations[i].slerp(after.rotations[i], p.fraction);
-                let rotation = if let Some((old, next, blend)) = &mut transition {
-                    blend.joints.push(locomotion::Offset {
-                        value: locomotion::rotation_difference(target, previous),
-                        velocity: (locomotion::rotation_difference(
-                            old.rotations[i],
-                            next.rotations[i],
-                        ) - locomotion::rotation_difference(
-                            pose.rotations[i],
-                            after.rotations[i],
-                        )) * HZ,
-                    });
-                    previous
-                } else if let Some(blend) = &p.transition {
-                    Quat::from_scaled_axis(blend.joints[i].at(blend.elapsed)) * target
-                } else {
-                    target
-                };
-                if i == 0 {
-                    if let Some((_, _, blend)) = &mut transition {
-                        blend.hip.value = translation - target_hip;
-                    } else {
-                        translation = target_hip
-                            + p.transition
-                                .as_ref()
-                                .map_or(Vec3::ZERO, |blend| blend.hip.at(blend.elapsed));
-                    }
-                }
-                joints.push((
-                    bone,
-                    Mat4::from_scale_rotation_translation(scale, rotation.normalize(), translation),
-                ));
-            }
-            if let Some((_, _, blend)) = transition {
-                p.transition = Some(blend);
-            }
-            cx.set_pose(joints)?;
+            self.publish_locomotion(id, &mut p, cx, dt)?;
             cx.set_typed_component(id, PLAYER, p)
         })
     }

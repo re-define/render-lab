@@ -28,13 +28,57 @@ pub struct MaterialPrograms {
     pub(super) kernels: Vec<MaterialKernel>,
 }
 
+/// A material explicitly declares the color buffers its SPIR-V can write.
+#[derive(Clone, Copy)]
+pub struct MaterialCode {
+    pub display: &'static [u8],
+    pub linear: Option<&'static [u8]>,
+}
+impl MaterialCode {
+    pub(super) fn select(self, linear: bool, label: &str) -> Result<&'static [u8]> {
+        if linear {
+            self.linear
+                .ok_or_else(|| anyhow::anyhow!("{label} has no linear HDR material kernel"))
+        } else {
+            Ok(self.display)
+        }
+    }
+}
+impl From<&'static [u8]> for MaterialCode {
+    fn from(display: &'static [u8]) -> Self {
+        Self {
+            display,
+            linear: None,
+        }
+    }
+}
+impl<const N: usize> From<&'static [u8; N]> for MaterialCode {
+    fn from(bytes: &'static [u8; N]) -> Self {
+        bytes.as_slice().into()
+    }
+}
+macro_rules! material_code {
+    ($name:literal) => {
+        $crate::render::MaterialCode {
+            display: include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")),
+            linear: Some(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/",
+                $name,
+                ".linear.spv"
+            ))),
+        }
+    };
+}
+pub(crate) use material_code;
+
 #[derive(Clone)]
 pub(super) struct MaterialKernel {
     key: Shading,
     lighting: &'static [LightingInput],
     pub label: &'static str,
-    pub shader: &'static [u8],
-    pub scene_lit: Option<&'static [u8]>,
+    pub shader: MaterialCode,
+    pub scene_lit: Option<MaterialCode>,
 }
 impl Default for MaterialPrograms {
     fn default() -> Self {
@@ -44,28 +88,22 @@ impl Default for MaterialPrograms {
                     key: Shading::Pbr,
                     lighting: &[],
                     label: "PBR pixels",
-                    shader: include_bytes!(concat!(env!("OUT_DIR"), "/pbr.comp.spv")),
-                    scene_lit: Some(include_bytes!(concat!(
-                        env!("OUT_DIR"),
-                        "/pbr_scene.comp.spv"
-                    ))),
+                    shader: material_code!("pbr.comp"),
+                    scene_lit: Some(material_code!("pbr_scene.comp")),
                 },
                 MaterialKernel {
                     key: Shading::Toon,
                     lighting: &[],
                     label: "Toon pixels",
-                    shader: include_bytes!(concat!(env!("OUT_DIR"), "/toon.comp.spv")),
-                    scene_lit: Some(include_bytes!(concat!(
-                        env!("OUT_DIR"),
-                        "/toon_scene.comp.spv"
-                    ))),
+                    shader: material_code!("toon.comp"),
+                    scene_lit: Some(material_code!("toon_scene.comp")),
                 },
             ],
         }
     }
 }
 impl MaterialPrograms {
-    pub(crate) fn replace_builtin(&mut self, pbr: &'static [u8], toon: &'static [u8]) {
+    pub(crate) fn replace_builtin(&mut self, pbr: MaterialCode, toon: MaterialCode) {
         for (kernel, code) in self.kernels.iter_mut().zip([pbr, toon]) {
             kernel.shader = code;
             kernel.scene_lit = None;
@@ -74,15 +112,19 @@ impl MaterialPrograms {
     }
     /// Returns the stable identifier to store in Material::shading. The GPU bin number
     /// belongs to this registry and is never serialized into the scene.
-    pub fn register(&mut self, name: &'static str, spirv: &'static [u8]) -> Result<Shading> {
-        self.register_kernel(name, spirv, None, &[])
+    pub fn register(
+        &mut self,
+        name: &'static str,
+        spirv: impl Into<MaterialCode>,
+    ) -> Result<Shading> {
+        self.register_kernel(name, spirv.into(), None, &[])
     }
 
     pub(crate) fn register_scene_lit(
         &mut self,
         name: &'static str,
-        shader: &'static [u8],
-        scene_lit: &'static [u8],
+        shader: MaterialCode,
+        scene_lit: MaterialCode,
     ) -> Result<Shading> {
         self.register_kernel(name, shader, Some(scene_lit), &[])
     }
@@ -90,7 +132,7 @@ impl MaterialPrograms {
     pub fn register_lighting(
         &mut self,
         name: &'static str,
-        shader: &'static [u8],
+        shader: impl Into<MaterialCode>,
         inputs: &'static [LightingInput],
     ) -> Result<Shading> {
         ensure!(
@@ -100,7 +142,7 @@ impl MaterialPrograms {
                 .all(|(i, input)| !inputs[..i].contains(input)),
             "duplicate lighting input for {name}"
         );
-        self.register_kernel(name, shader, None, inputs)
+        self.register_kernel(name, shader.into(), None, inputs)
     }
 
     pub(crate) fn lighting(&self) -> impl Iterator<Item = (u32, &str, &[LightingInput], bool)> {
@@ -121,8 +163,8 @@ impl MaterialPrograms {
     fn register_kernel(
         &mut self,
         name: &'static str,
-        shader: &'static [u8],
-        scene_lit: Option<&'static [u8]>,
+        shader: MaterialCode,
+        scene_lit: Option<MaterialCode>,
         lighting: &'static [LightingInput],
     ) -> Result<Shading> {
         ensure!(
@@ -132,6 +174,7 @@ impl MaterialPrograms {
         ensure!(
             std::iter::once(shader)
                 .chain(scene_lit)
+                .flat_map(|s| std::iter::once(s.display).chain(s.linear))
                 .all(|spirv| spirv.len() >= 20
                     && spirv.len().is_multiple_of(4)
                     && spirv[..4] == 0x07230203u32.to_le_bytes()),

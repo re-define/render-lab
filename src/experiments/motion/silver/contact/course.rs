@@ -9,7 +9,7 @@ pub(super) const GATE_Z: f32 = 2.42;
 pub(super) const TURN: Vec3 = Vec3::new(0., 0., 3.50);
 pub(super) const RAIL_TOP: f32 = 0.50;
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub(super) struct Fixtures {
     pub landing: Id,
     #[serde(default)]

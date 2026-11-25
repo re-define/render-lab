@@ -1,6 +1,7 @@
 use super::*;
 use crate::rdg::PassPhase;
 use crate::render::FrameGraph;
+use crate::render::material_code;
 use crate::{
     rdg::*,
     render::{
@@ -50,7 +51,7 @@ pub struct Cartoon {
 impl Cartoon {
     pub fn register(materials: &mut crate::render::MaterialPrograms) -> Result<()> {
         if materials.bin(&Shading::Custom(PROGRAM.into())).is_err() {
-            materials.register(PROGRAM, spirv!("character.comp"))?;
+            materials.register(PROGRAM, material_code!("character.comp"))?;
         }
         Ok(())
     }
@@ -200,18 +201,15 @@ impl Cartoon {
     pub(in crate::experiments) fn overlay(
         g: &mut FrameGraph,
         s: &Snapshot,
-        ids: Resource,
-        depth: Resource,
-        color: Resource,
+        display: crate::render::DisplayLayers,
     ) -> Result<()> {
         let cfg = Settings::decode(
             s.scene
                 .setting(SETTING)
                 .context("open the toon experiment first")?,
         )?;
-        crate::experiments::draw_visibility_overlays(g, s, ids, color)?;
         if cfg.outline == Outline::Image {
-            let [w, h] = s.extent;
+            let [w, h] = g.output_extent();
             // Descriptor indices take 12 bytes. The following uvec2 is 8-byte aligned.
             let push = bytemuck::bytes_of(&[0u32, w, h, cfg.width.to_bits()]).to_vec();
             g.pass_in(
@@ -221,9 +219,9 @@ impl Cartoon {
                     program: Dispatch {
                         shader: Shader::Compute(spirv!("outline_image.comp")),
                         bindings: vec![
-                            (ids, Access::ComputeSample),
-                            (depth, Access::ComputeSample),
-                            (color, Access::ComputeReadWrite),
+                            (display.ids, Access::ComputeSample),
+                            (display.depth, Access::ComputeSample),
+                            (display.color, Access::ComputeReadWrite),
                         ],
                         push,
                     },
@@ -244,7 +242,11 @@ impl Technique for Cartoon {
                 t.background = 0xffe4e5eb;
                 self.draw(g, t, s, Forward::default().posed_surfaces(s, |_| true)?)
             },
-            |g, ids, depth, color| Self::overlay(g, s, ids, depth, color),
+            |_, _| Ok(()),
+            |g, display| {
+                Self::overlay(g, s, display)?;
+                crate::experiments::draw_visibility_overlays(g, s, display.ids, display.color)
+            },
         )
     }
 }

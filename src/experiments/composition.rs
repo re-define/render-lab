@@ -7,7 +7,10 @@ use super::{
 use crate::{
     engine::Engine,
     render::FrameGraph,
-    render::{Camera, Forward, MaterialPrograms, Snapshot, Technique},
+    render::{
+        Camera, Forward, MaterialPrograms, PosedSurface, RenderInstance, Snapshot, Targets,
+        Technique,
+    },
     scene::*,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -41,13 +44,74 @@ fn layer_enabled(settings: Option<&serde_json::Value>, layer: &str) -> bool {
         .unwrap_or(true)
 }
 pub(super) type Configured = (Arc<dyn Technique>, Camera);
+pub(super) struct SurfaceRoute {
+    pub name: &'static str,
+    pub owns: fn(&Snapshot, &RenderInstance) -> bool,
+    pub draw: fn(
+        &mut FrameGraph,
+        &mut Targets,
+        &Snapshot,
+        &RenderInstance,
+        &mut GeometryOutputs,
+    ) -> Result<()>,
+}
+type OrdinaryDraw = dyn Fn(&mut FrameGraph, &mut Targets, &Snapshot, Vec<PosedSurface<'_>>) -> Result<()>
+    + Send
+    + Sync;
+
 #[derive(Default)]
 pub(super) struct GeometryModules {
-    pub cluster: bool,
-    pub plants: bool,
-    pub effects: bool,
-    pub cartoon: bool,
+    cluster: Option<Arc<clusters::ClusterLod>>,
+    routes: Vec<SurfaceRoute>,
+    ordinary: Option<Box<OrdinaryDraw>>,
+    providers: Vec<Arc<dyn Technique>>,
+    pub layers: Contributors,
 }
+impl GeometryModules {
+    pub fn clustered(&mut self) {
+        if self.cluster.is_none() {
+            let clusters = Arc::new(clusters::ClusterLod::default());
+            self.providers.push(clusters.clone());
+            self.cluster = Some(clusters);
+        }
+    }
+    pub fn route(&mut self, technique: Arc<dyn Technique>, route: SurfaceRoute) {
+        self.providers.push(technique);
+        self.routes.push(route);
+    }
+    pub fn ordinary(
+        &mut self,
+        technique: Arc<dyn Technique>,
+        draw: Box<OrdinaryDraw>,
+    ) -> Result<()> {
+        ensure!(
+            self.ordinary.is_none(),
+            "multiple renderers for ordinary surfaces"
+        );
+        self.providers.push(technique);
+        self.ordinary = Some(draw);
+        Ok(())
+    }
+}
+/// Visibility produces these optional records before scene-color contributors run.
+#[derive(Default)]
+pub(super) struct GeometryOutputs {
+    pub rivers: Vec<effects::river::Reflector>,
+}
+#[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
+pub(super) enum SceneStage {
+    Reflections,
+    Atmosphere,
+}
+type ScenePass =
+    fn(&mut FrameGraph, &Snapshot, crate::render::SceneLayers, &GeometryOutputs) -> Result<()>;
+type DisplayPass = fn(&mut FrameGraph, &Snapshot, crate::render::DisplayLayers) -> Result<()>;
+#[derive(Default)]
+pub(super) struct Contributors {
+    pub scene: Vec<(SceneStage, ScenePass)>,
+    pub display: Vec<DisplayPass>,
+}
+
 pub(super) fn assemble(
     world: &World,
     tasks: &rayon::ThreadPool,
@@ -57,12 +121,13 @@ pub(super) fn assemble(
 ) -> Result<Configured> {
     let GeometryModules {
         cluster,
-        plants,
-        effects,
-        cartoon,
+        routes,
+        ordinary,
+        mut layers,
+        mut providers,
     } = geometry;
-    let extended = cluster || plants || effects || cartoon;
-    let lights = LightStack::open_modules(world, materials, tasks, extended)?;
+    layers.scene.sort_by_key(|(stage, _)| *stage);
+    let lights = LightStack::open_modules(world, materials, tasks, !providers.is_empty())?;
     let (lights, light_camera) = lights.map_or((None, None), |(l, c)| (Some(l), Some(c)));
     let camera = if let Some(c) = restir::studies::camera(world)? {
         c
@@ -78,30 +143,26 @@ pub(super) fn assemble(
     } else {
         Camera::fit(world)?
     };
-    let cluster = (cluster || plants) && enabled(world, "forest");
-    let effect = effects && enabled(world, "water");
-    let technique: Arc<dyn Technique> = match (cluster, effect, cartoon, lights) {
-        (false, false, false, Some(l)) => Arc::new(l),
-        (true, false, false, None) => Arc::new(clusters::ClusterLod::default()),
-        (false, true, false, None) => Arc::new(effects::Effects),
-        (false, false, true, None) => Arc::new(cartoon::Cartoon::default()),
-        (false, false, false, None) => Arc::new(Forward::default()),
-        (cl, effect, ct, lights) => Arc::new(Modules {
-            cluster: cl.then(clusters::ClusterLod::default),
-            effect,
-            cartoon: ct.then(cartoon::Cartoon::default),
+    let technique: Arc<dyn Technique> = match (providers.len(), lights) {
+        (0, Some(lights)) => Arc::new(lights),
+        (0, None) => Arc::new(Forward::default()),
+        (1, None) => providers.pop().unwrap(),
+        (_, lights) => Arc::new(Modules {
+            cluster,
+            routes,
+            ordinary,
             lights,
-            plants: plants && cl,
+            layers,
         }),
     };
     Ok((technique, camera))
 }
 struct Modules {
-    cluster: Option<clusters::ClusterLod>,
-    effect: bool,
-    cartoon: Option<cartoon::Cartoon>,
+    cluster: Option<Arc<clusters::ClusterLod>>,
+    routes: Vec<SurfaceRoute>,
+    ordinary: Option<Box<OrdinaryDraw>>,
     lights: Option<LightStack>,
-    plants: bool,
+    layers: Contributors,
 }
 impl Technique for Modules {
     fn needs_surface_motion(&self, s: &Snapshot) -> bool {
@@ -110,8 +171,6 @@ impl Technique for Modules {
             .is_some_and(|l| l.needs_surface_motion(s))
     }
     fn build(&self, s: &Snapshot) -> Result<FrameGraph> {
-        let owns_effect =
-            |i: &crate::render::RenderInstance| self.effect && effects::Effects::owns(s, i);
         let candidates: Vec<_> = if self.cluster.is_some() {
             s.scene
                 .routes
@@ -123,8 +182,24 @@ impl Technique for Modules {
             s.scene.instances.iter().collect()
         };
         let visits = candidates.len();
-        let (effects, ordinary): (Vec<_>, Vec<_>) =
-            candidates.into_iter().partition(|i| owns_effect(i));
+        let mut custom = Vec::new();
+        let mut ordinary = Vec::new();
+        for instance in candidates {
+            let mut routes = self.routes.iter().filter(|route| (route.owns)(s, instance));
+            if let Some(route) = routes.next() {
+                if let Some(other) = routes.next() {
+                    bail!(
+                        "both {} and {} claim instance {:?}",
+                        route.name,
+                        other.name,
+                        instance.id
+                    );
+                }
+                custom.push((route, instance));
+            } else {
+                ordinary.push(instance);
+            }
+        }
         let ordinary = Forward::default().prepare_surfaces(s, ordinary)?;
         let layers = self
             .lights
@@ -132,7 +207,7 @@ impl Technique for Modules {
             .map(|l| l.layers(s, &ordinary))
             .transpose()?
             .unwrap_or_default();
-        let rivers = std::cell::RefCell::new(Vec::new());
+        let outputs = std::cell::RefCell::new(GeometryOutputs::default());
         light_stack::build_modules(
             s,
             |g, t| {
@@ -140,17 +215,14 @@ impl Technique for Modules {
                     self.lights.as_ref().is_some_and(|l| l.uses_shadow_rays());
                 g.products.instance_visits += visits;
                 let draw = |g: &mut FrameGraph, t: &mut crate::render::Targets| {
-                    if let Some(cartoon) = &self.cartoon {
-                        cartoon.draw(g, t, s, ordinary)?
+                    if let Some(draw) = &self.ordinary {
+                        draw(g, t, s, ordinary)?;
                     } else {
-                        light_stack::draw_surfaces(g, t, s, ordinary)?
+                        light_stack::draw_surfaces(g, t, s, ordinary)?;
                     }
-                    if self.effect {
-                        for i in effects {
-                            if let Some(id) = effects::Effects::draw(g, t, s, i)? {
-                                rivers.borrow_mut().push(id);
-                            }
-                        }
+                    let mut outputs = outputs.borrow_mut();
+                    for (route, instance) in custom {
+                        (route.draw)(g, t, s, instance, &mut outputs)?;
                     }
                     Ok(())
                 };
@@ -161,16 +233,19 @@ impl Technique for Modules {
                 }
             },
             layers,
-            false,
-            |g, ids, depth, color| {
-                effects::river::reflections(g, s, ids, depth, color, &rivers.borrow());
-                if self.plants {
-                    clusters::ClusterLod::atmosphere(g, s, ids, depth, color)?;
-                }
-                if self.cartoon.is_some() {
-                    cartoon::Cartoon::overlay(g, s, ids, depth, color)?;
+            self.lights.as_ref().is_none_or(|lights| lights.hdr),
+            |g, inputs| {
+                let products = outputs.borrow();
+                for (_, draw) in &self.layers.scene {
+                    draw(g, s, inputs, &products)?;
                 }
                 Ok(())
+            },
+            |g, inputs| {
+                for draw in &self.layers.display {
+                    draw(g, s, inputs)?;
+                }
+                super::draw_visibility_overlays(g, s, inputs.ids, inputs.color)
             },
         )
     }
@@ -301,7 +376,20 @@ mod tests {
             let resources = |name: &str| graph.resources.iter().filter(|(n, _)| n == name).count();
             assert_eq!(resources("Visibility IDs"), 1, "{cmd}");
             assert_eq!(resources("Scene depth"), 1, "{cmd}");
-            assert!(has("Temporal AA resolve"), "{cmd}");
+            assert_eq!(resources("Linear HDR scene color"), 1, "{cmd}");
+            let index = |name| graph.passes.iter().position(|p| p.name == name);
+            let temporal = index("Temporal AA resolve").expect("TAA");
+            let tone = index("Tone map linear scene color").expect("display transform");
+            assert!(temporal < tone, "{cmd}");
+            if let Some(atmosphere) = index("Vegetation atmosphere") {
+                assert!(atmosphere < temporal, "{cmd}");
+                if let Some(sky) = index("Environment backdrop") {
+                    assert!(sky < atmosphere, "{cmd}");
+                }
+            }
+            if let Some(trajectory) = index("Motion trajectory") {
+                assert!(tone < trajectory, "{cmd}");
+            }
             let actual = [
                 has("GPU cluster cull"),
                 resources("Cascade solver parameters") > 0,
@@ -313,6 +401,153 @@ mod tests {
             assert_eq!(engine.camera.eye(), camera.eye());
             graph.compile()?;
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires the imported character assets and IBL environment"]
+    fn river_uses_scene_radiance_and_ink_uses_reconstructed_display_pixels() -> Result<()> {
+        use crate::experiments::ibl;
+        use crate::rdg::{Op, Resource};
+        let mut world = cartoon::scene()?;
+        effects::river::install(&mut world);
+        let mut env = ibl::Settings::default();
+        env.sky = true;
+        world.spawn(Entity {
+            components: [(ibl::SETTING.into(), serde_json::to_value(env)?)].into(),
+            ..Default::default()
+        });
+        let engine = super::super::open(world)?;
+        for mode in [Mode::Taa, Mode::Dlss] {
+            let mut view = Snapshot::new(
+                &engine.world,
+                engine.camera,
+                [320, 180],
+                engine.materials.clone(),
+            )?;
+            let mut settings = Settings::default();
+            settings.select(mode);
+            Sequence::default().assign(settings, &engine.technique, &mut view);
+            let graph = engine.technique.build(&view)?;
+            let pass = |name| graph.passes.iter().position(|p| p.name == name).unwrap();
+            let sky = pass("Environment backdrop");
+            let reflection = pass("Reflect visible banks in river");
+            let reconstruction = pass(if mode == Mode::Taa {
+                "Temporal AA resolve"
+            } else {
+                "NVIDIA DLSS Quality"
+            });
+            let tone_map = pass("Tone map linear scene color");
+            let ink = pass("Image-space outlines");
+            assert!(
+                sky < reflection
+                    && reflection < reconstruction
+                    && reconstruction < tone_map
+                    && tone_map < ink
+            );
+            let scene_color = Resource(
+                graph
+                    .resources
+                    .iter()
+                    .position(|(name, _)| name == "Linear HDR scene color")
+                    .unwrap(),
+            );
+            assert_eq!(
+                graph.passes[reflection].op.program().unwrap().bindings[2].0,
+                scene_color
+            );
+            let display = graph.products().final_color.unwrap();
+            let overlay = graph.passes[ink].op.program().unwrap();
+            assert_eq!(overlay.bindings[2].0, display);
+            let push: &[u32] = bytemuck::cast_slice(&overlay.push);
+            assert_eq!(push[1..3], [320, 180]);
+            if mode == Mode::Dlss {
+                assert!(matches!(&graph.passes[reconstruction].op, Op::Dlss(d) if d.hdr));
+                assert_ne!(graph.extent, graph.output_extent());
+            }
+            graph.compile()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Vulkan and the IBL environment"]
+    fn toggling_hidden_water_preserves_linear_radiance_through_reload() -> Result<()> {
+        use crate::experiments::ibl;
+        use crate::rdg::Resource;
+        let mut world = World::demo();
+        scene::append_scenery(&mut world, effects::water()?, "water", Vec3::X * 2000.)?;
+        let mut env = serde_json::to_value(ibl::Settings::default())?;
+        env["exposure"] = 2.0.into();
+        env["sky"] = false.into();
+        world.spawn(Entity {
+            components: [
+                (SETTING.into(), serde_json::json!({"water":true})),
+                (ibl::SETTING.into(), env),
+            ]
+            .into(),
+            ..Default::default()
+        });
+        let mut engine = super::super::open(world)?;
+        engine.camera = Camera {
+            distance: 5.5,
+            ..Camera::default()
+        };
+        let mut gpu = crate::rhi::Backend::open()?;
+        let capture = |engine: &Engine, gpu: &mut crate::rhi::Backend| -> Result<Vec<u8>> {
+            let [w, h] = [128, 80];
+            let view = Snapshot::new(
+                &engine.world,
+                engine.camera,
+                [w, h],
+                engine.materials.clone(),
+            )?;
+            let mut graph = engine.technique.build(&view)?;
+            let index = graph
+                .resources
+                .iter()
+                .position(|(n, _)| n == "Linear HDR scene color")
+                .context("composition lost linear scene color")?;
+            // The capture API reads four bytes per output pixel. Expose all four float words.
+            graph.display_extent = Some([4 * w, h]);
+            graph.set_output(Resource(index));
+            Ok(gpu.execute(graph.compile()?, &engine.tasks)?.pixels)
+        };
+        let start = capture(&engine, &mut gpu)?;
+        let pixels: Vec<[f32; 4]> = start
+            .chunks_exact(16)
+            .map(bytemuck::pod_read_unaligned)
+            .collect();
+        assert!(
+            pixels
+                .iter()
+                .all(|p| p.iter().all(|c| c.is_finite()) && p[3] == 1.)
+        );
+        assert!(
+            pixels.iter().any(|p| p[..3].iter().any(|c| *c > 1.)),
+            "fixture has no HDR highlight"
+        );
+        command(&mut engine, "water off")?;
+        assert!(
+            capture(&engine, &mut gpu)? == start,
+            "unaffected radiance changed when disabling the water solver"
+        );
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("layers.json");
+        engine.world.save(&path)?;
+        let camera = engine.camera;
+        super::super::replace(&mut engine, World::load(&path)?)?;
+        engine.camera = camera;
+        assert!(!enabled(&engine.world, "water"));
+        assert!(
+            capture(&engine, &mut gpu)? == start,
+            "reloaded linear radiance changed"
+        );
+        command(&mut engine, "water on")?;
+        assert!(
+            capture(&engine, &mut gpu)? == start,
+            "radiance changed when re-enabling water"
+        );
         Ok(())
     }
 

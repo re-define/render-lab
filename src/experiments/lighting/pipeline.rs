@@ -300,7 +300,8 @@ pub(super) fn raster_frame(
                 bindings: vec![(direct, R), (indirect, R), (light, R)],
             }))
         },
-        |_, _, _, _| Ok(()),
+        |_, _| Ok(()),
+        |_, _| Ok(()),
     )
 }
 

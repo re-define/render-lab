@@ -15,11 +15,12 @@ use crate::{
     engine::{Engine, Schedule},
     render::Camera,
 };
-use rig::{FINGERTIP, Rig};
-use std::time::Duration;
+#[cfg(test)]
+use rig::FINGERTIP;
+use rig::Rig;
+use std::{collections::BTreeMap, time::Duration};
 
 pub const SETTING: &str = "lab.silver_wolf.contact";
-const PREPARE: &str = "lab.silver_wolf.contact.prepare";
 pub(in crate::experiments) const MODULE: SceneModule = SceneModule {
     key: SETTING,
     primary: Primary::Simulation,
@@ -46,14 +47,29 @@ pub(in crate::experiments) const MODULE: SceneModule = SceneModule {
 fn hydrate_contact(w: &mut World) -> Result<()> {
     w.hydrate_components::<Contact>(SETTING)?;
     w.hydrate_components::<dynamics::Body>(dynamics::BODY)?;
-    if let Some((actor, _)) = w.first_raw_component(SETTING)
-        && w.typed_component::<dynamics::Body>(actor, dynamics::BODY)?
-            .is_none()
-    {
+    w.hydrate_components::<dynamics::Spring>(dynamics::SPRING)?;
+    for actor in w.entities.component_owners(SETTING).to_vec() {
         let mut c = w
             .typed_component::<Contact>(actor, SETTING)?
             .context("missing saved rig")?
             .into_owned();
+        if w.typed_component::<dynamics::Spring>(c.plate, dynamics::SPRING)?
+            .is_none()
+        {
+            w.set_typed_component(
+                c.plate,
+                dynamics::SPRING,
+                dynamics::Spring {
+                    rest_y: c.rest_y,
+                    velocity: c.velocity,
+                },
+            );
+        }
+        if w.typed_component::<dynamics::Body>(actor, dynamics::BODY)?
+            .is_some()
+        {
+            continue;
+        }
         let mut body = dynamics::Body::new(w.entities[&actor].local.w_axis.truncate());
         if let Some(play) = &mut c.play {
             c.section.migrate_flight(play, &mut body);
@@ -91,8 +107,42 @@ struct Foot {
     #[serde(default)]
     releasing: bool,
 }
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+struct FingerMarker {
+    joint: Id,
+    offset: Vec3,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+struct PoseBinding {
+    bones: Vec<Id>,
+    hip_origin: Vec3,
+    hierarchy: Vec<(Id, Option<Id>)>,
+    finger: Option<FingerMarker>,
+    floor: Id,
+    plate: Id,
+    target: Id,
+    course: Option<course::Fixtures>,
+}
+
+impl PoseBinding {
+    fn matches(&self, player: &State, contact: &Contact) -> bool {
+        self.bones == player.bones
+            && self.hip_origin == player.hip_origin
+            && self.finger == contact.finger
+            && self.floor == contact.floor
+            && self.plate == contact.plate
+            && self.target == contact.target
+            && self.course == contact.course
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Contact {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_binding: Option<Arc<PoseBinding>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    finger: Option<FingerMarker>,
     #[serde(default)]
     course: Option<course::Fixtures>,
     #[serde(default)]
@@ -103,6 +153,8 @@ struct Contact {
     plate: Id,
     target: Id,
     rest_y: f32,
+    // Read legacy saves whose spring velocity lived on the actor.
+    #[serde(default, skip_serializing)]
     velocity: f32,
     feet: [Foot; 2],
     #[serde(default)]
@@ -117,6 +169,7 @@ struct Contact {
 }
 
 struct Stage {
+    binding: Arc<PoseBinding>,
     actor: Id,
     rig: Rig,
     action_rig: Option<traversal::ActionRig>,
@@ -127,13 +180,50 @@ struct Stage {
 }
 
 fn install(w: &World, schedule: &mut Schedule) -> Result<()> {
-    let (actor, _) = w
-        .first_raw_component(SETTING)
-        .context("missing contact rig")?;
-    ensure!(
-        Some(actor) == super::actor(w),
-        "contact rig must belong to Silver Wolf"
-    );
+    let bank = Arc::new(SilverMatcher::load()?);
+    schedule.fixed_stage_for_component(Duration::from_secs_f64(1. / 60.), 8, w, SETTING, move |w| {
+        let children = rig::children(w);
+        let mut actors = BTreeMap::new();
+        let mut platforms = BTreeMap::<Id, Vec<Arc<Stage>>>::new();
+        for &actor in w.entities.component_owners(SETTING) {
+            let stage = Arc::new(bind_actor(w, actor, &children)?);
+            platforms
+                .entry(stage.plate)
+                .or_default()
+                .push(stage.clone());
+            actors.insert(actor, stage);
+        }
+        let bindings: Vec<_> = actors
+            .values()
+            .map(|s| (s.actor, s.binding.clone()))
+            .collect();
+        let current = move |world: &World| {
+            for (id, binding) in &bindings {
+                let p = player(world, *id)?;
+                let c = world
+                    .typed_component::<Contact>(*id, SETTING)?
+                    .context("missing contact")?;
+                if !binding.matches(&p, &c) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        Ok((
+            vec![
+                Arc::new(stage::Prepare {
+                    actors: actors.clone(),
+                    bank: bank.clone(),
+                }),
+                Arc::new(dynamics::Integrate(platforms.into_values().collect())),
+                Arc::new(stage::Feedback(actors.into_values().collect())),
+            ],
+            Box::new(current),
+        ))
+    })
+}
+
+fn bind_actor(w: &World, actor: Id, children: &BTreeMap<Id, Vec<Id>>) -> Result<Stage> {
     let c = w
         .typed_component::<Contact>(actor, SETTING)?
         .context("missing contact state")?;
@@ -159,20 +249,38 @@ fn install(w: &World, schedule: &mut Schedule) -> Result<()> {
         ensure!(
             w.entities
                 .get(&id)
-                .is_some_and(|e| e.parent.is_none() && e.instance.is_some()),
+                .is_some_and(|e| e.parent == w.entities[&actor].parent),
             "invalid contact fixture {id}"
         );
     }
-    let rig = Rig::bind(w, actor, c.course.is_some())?;
+    let rig = Rig::bind(w, actor, children)?;
     let action_rig = c
         .course
         .map(|_| traversal::ActionRig::bind(w, actor, &rig))
         .transpose()?;
     ensure!(
-        c.source.is_empty() || c.source.len() == rig.corrected.len(),
+        c.source.is_empty()
+            || c.source.len() == rig.corrected.len()
+            || (c.course.is_none() && c.source.len() == 10),
         "invalid saved contact pose"
     );
-    let stage = Arc::new(Stage {
+    let state = player(w, actor)?;
+    let binding = Arc::new(PoseBinding {
+        bones: state.bones.clone(),
+        hip_origin: state.hip_origin,
+        hierarchy: rig
+            .ids
+            .iter()
+            .map(|&id| (id, w.entities[&id].parent))
+            .collect(),
+        finger: c.finger.clone(),
+        floor: c.floor,
+        plate: c.plate,
+        target: c.target,
+        course: c.course,
+    });
+    Ok(Stage {
+        binding,
         actor,
         rig,
         action_rig,
@@ -180,19 +288,7 @@ fn install(w: &World, schedule: &mut Schedule) -> Result<()> {
         rail: c.course.map(|f| f.rail),
         plate: c.plate,
         target: c.target,
-    });
-    let mut matcher = SilverMatcher::load()?;
-    matcher.after = &[PREPARE];
-    schedule.fixed_stage(
-        Duration::from_secs_f64(1. / 60.),
-        8,
-        vec![
-            Arc::new(stage::Prepare(stage.clone())),
-            Arc::new(matcher),
-            Arc::new(dynamics::Integrate(stage.clone())),
-            Arc::new(stage::Feedback(stage)),
-        ],
-    )
+    })
 }
 
 pub fn scene() -> Result<World> {
@@ -206,9 +302,19 @@ pub fn scene() -> Result<World> {
     );
     let (floor, plate, target, fixtures) = course::build(&mut w);
     w.set_typed_component(
+        plate,
+        dynamics::SPRING,
+        dynamics::Spring {
+            rest_y: 0.10,
+            velocity: 0.,
+        },
+    );
+    w.set_typed_component(
         actor,
         SETTING,
         Contact {
+            source_binding: None,
+            finger: None,
             floor,
             plate,
             target,

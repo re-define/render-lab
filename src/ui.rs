@@ -280,7 +280,7 @@ impl Render for Studio {
         {
             self.message = format!("{e:#}");
         }
-        if let Some(frame) = self.engine.take_frame() {
+        while let Some(frame) = self.engine.take_frame() {
             match frame {
                 Ok(f) => {
                     if let Some(recording) = self.console.recording.as_mut()
@@ -294,6 +294,7 @@ impl Render for Studio {
                     }
                     if self.benchmark.as_mut().is_some_and(|b| b.observe(&f)) {
                         cx.quit();
+                        break;
                     }
                     if self.console.show_hud
                         && self
@@ -549,6 +550,7 @@ impl Render for Studio {
     }
 }
 pub fn run(mut engine: Engine, console: Console, benchmark: Option<usize>) {
+    engine.set_ordered_completions(benchmark.is_some());
     Application::new().run(move |cx| {
         let bounds = Bounds::centered(None, size(px(1120.), px(690.)), cx);
         let studio = cx

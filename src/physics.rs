@@ -1,6 +1,8 @@
 //! Translational dynamics in SI units. The caller owns the fixed clock and collision geometry.
+mod support;
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
+pub use support::SupportFace;
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct Particle {

@@ -85,7 +85,7 @@ impl SurfaceProbe {
 fn walks_loads_plate_and_touches_with_the_skinned_vertex() -> Result<()> {
     let mut w = Arc::new(scene()?);
     let actor = actor(&w).unwrap();
-    let rig = Rig::bind(&w, actor, true)?;
+    let rig = Rig::bind(&w, actor, &rig::children(&w))?;
     let fingertip = tip_vertex(&w, rig.ids[rig.finger])?;
     assert!(fingertip.distance(FINGERTIP) < 1e-5);
     let mut schedule = Schedule::default();
@@ -399,7 +399,7 @@ fn saved_contact_substep_continues_with_same_load_and_pose() -> Result<()> {
             .abs_diff_eq(saved_body.particle.momentum, 1e-5)
     );
     assert!((live_body.palm_impulse - saved_body.palm_impulse).abs() < 1e-5);
-    let rig = Rig::bind(&world, id, true)?;
+    let rig = Rig::bind(&world, id, &rig::children(&world))?;
     let a = world.transforms()?;
     let b = loaded.transforms()?;
     for joint in rig.ids {
@@ -579,5 +579,101 @@ fn translating_deck_carries_the_root_and_takeoff_inherits_its_velocity() -> Resu
         }
     }
     assert!(airborne_steps > 5);
+    Ok(())
+}
+
+#[test]
+fn replacing_a_live_rig_discards_stale_sources_and_restores_after_save() -> Result<()> {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build()?;
+    let mut world = Arc::new(scene()?);
+    let id = actor(&world).unwrap();
+    let mut schedule = Schedule::default();
+    install(&world, &mut schedule)?;
+    schedule.tick(&mut world, 1. / 60., &pool)?;
+    let w = Arc::make_mut(&mut world);
+    let mut p = player(w, id)?.into_owned();
+    let mut contact = w
+        .typed_component::<Contact>(id, SETTING)?
+        .unwrap()
+        .into_owned();
+    let rig = Rig::bind(w, id, &rig::children(w))?;
+    // These finite but incorrect previous transforms make unwanted scale reuse observable.
+    contact.source.fill(Mat4::from_scale(Vec3::splat(7.)));
+    let old_head = p.bones[4];
+    let expected_scale = w.entities[&old_head]
+        .local
+        .to_scale_rotation_translation()
+        .0;
+    let replacement = w.spawn(Entity {
+        name: "Retargeted head".into(),
+        ..w.entities[&old_head].clone()
+    });
+    p.bones[4] = replacement;
+    w.set_typed_component(id, PLAYER, p);
+    contact.finger = Some(FingerMarker {
+        joint: id,
+        offset: FINGERTIP,
+    });
+    w.set_typed_component(id, SETTING, contact.clone());
+    assert!(
+        schedule
+            .tick(&mut world, 1. / 60., &pool)
+            .unwrap_err()
+            .to_string()
+            .contains("fingertip")
+    );
+    contact.finger = Some(FingerMarker {
+        joint: rig.ids[rig.finger],
+        offset: FINGERTIP + Vec3::Y * 0.001,
+    });
+    Arc::make_mut(&mut world).set_typed_component(id, SETTING, contact);
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("edited-rig.scene.json");
+    world.save(&path)?;
+    let mut restored = World::load(&path)?;
+    crate::experiments::SceneConfiguration::restore(&mut restored)?;
+    let mut replay = Schedule::default();
+    install(&restored, &mut replay)?;
+    let mut restored = Arc::new(restored);
+    // A failed substep retains its pending time.
+    schedule.tick(&mut world, 0., &pool)?;
+    replay.tick(&mut restored, 1. / 60., &pool)?;
+    for result in [&*world, &*restored] {
+        let c = result.typed_component::<Contact>(id, SETTING)?.unwrap();
+        assert_eq!(c.source_binding.as_ref().unwrap().bones[4], replacement);
+        let scale = result.entities[&replacement]
+            .local
+            .to_scale_rotation_translation()
+            .0;
+        assert!(
+            scale.abs_diff_eq(expected_scale, 1e-5),
+            "stale base pose: {scale}"
+        );
+    }
+    assert!(
+        world.entities[&replacement]
+            .local
+            .abs_diff_eq(restored.entities[&replacement].local, 1e-5)
+    );
+    // An authored marker change with identical actors, bone IDs, hierarchy and component ownership also rebinds.
+    let mut c = world
+        .typed_component::<Contact>(id, SETTING)?
+        .unwrap()
+        .into_owned();
+    c.finger.as_mut().unwrap().offset.y += 0.01;
+    let offset = c.finger.as_ref().unwrap().offset;
+    Arc::make_mut(&mut world).set_typed_component(id, SETTING, c);
+    schedule.tick(&mut world, 1. / 60., &pool)?;
+    let c = world.typed_component::<Contact>(id, SETTING)?.unwrap();
+    assert_eq!(
+        c.source_binding
+            .as_ref()
+            .unwrap()
+            .finger
+            .as_ref()
+            .unwrap()
+            .offset,
+        offset
+    );
     Ok(())
 }

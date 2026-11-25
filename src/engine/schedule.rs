@@ -54,7 +54,7 @@ impl fmt::Display for SimulationData {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SystemAccess {
     pub name: &'static str,
     pub reads: &'static [SimulationData],
@@ -119,7 +119,7 @@ impl SystemAccess {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct SystemOrder {
     /// A stable, unique key for systems referenced by other modules.
     pub key: Option<&'static str>,
@@ -257,7 +257,49 @@ struct Phase {
     entries: Vec<Entry>,
     automatic: bool,
     fixed: Option<FixedStep>,
+    membership: Option<Membership>,
     completed: u64,
+}
+type BindingCheck = Box<dyn Fn(&World) -> Result<bool> + Send + Sync>;
+type SystemGroup = (Vec<Arc<dyn System>>, BindingCheck);
+type BindSystems = dyn Fn(&World) -> Result<SystemGroup> + Send + Sync;
+struct Membership {
+    component: &'static str,
+    owners: Vec<Id>,
+    hierarchy_revision: u64,
+    is_current: BindingCheck,
+    bind: Box<BindSystems>,
+}
+impl Phase {
+    fn refresh_membership(&mut self, world: &World) -> Result<()> {
+        let Some(membership) = &mut self.membership else {
+            return Ok(());
+        };
+        let owners = world.entities.component_owners(membership.component);
+        if owners == membership.owners
+            && membership.hierarchy_revision == world.entities.hierarchy_revision()
+            && (membership.is_current)(world)?
+        {
+            return Ok(());
+        }
+        let (systems, check) = (membership.bind)(world)?;
+        let replacement: Vec<_> = systems.into_iter().map(Entry::new).collect();
+        // Rebind resources and per-entity targets while preserving the compiled dependency graph.
+        anyhow::ensure!(
+            replacement.len() == self.entries.len()
+                && replacement
+                    .iter()
+                    .zip(&self.entries)
+                    .all(|(a, b)| a.access == b.access && a.order == b.order),
+            "membership refresh changed the declared simulation schedule"
+        );
+        self.entries = replacement;
+        membership.is_current = check;
+        membership.hierarchy_revision = world.entities.hierarchy_revision();
+        membership.owners.clear();
+        membership.owners.extend_from_slice(owners);
+        Ok(())
+    }
 }
 struct FixedStep {
     seconds: f64,
@@ -311,6 +353,27 @@ impl Schedule {
         );
         Ok(())
     }
+    /// Keep fixed-step timing when entities enter or leave a component-defined system group.
+    /// Binding runs at substep boundaries; ordinary component value writes keep the existing binding.
+    pub(crate) fn fixed_stage_for_component(
+        &mut self,
+        step: Duration,
+        max_steps: u32,
+        world: &World,
+        component: &'static str,
+        bind: impl Fn(&World) -> Result<SystemGroup> + Send + Sync + 'static,
+    ) -> Result<()> {
+        let (systems, is_current) = bind(world)?;
+        self.fixed_stage(step, max_steps, systems)?;
+        self.phases.last_mut().unwrap().membership = Some(Membership {
+            component,
+            owners: world.entities.component_owners(component).to_vec(),
+            hierarchy_revision: world.entities.hierarchy_revision(),
+            is_current,
+            bind: Box::new(bind),
+        });
+        Ok(())
+    }
     fn plan(&self) -> Result<&Plan> {
         self.compiled
             .get_or_init(|| Plan::compile(&self.phases).map_err(|e| e.to_string()))
@@ -323,6 +386,9 @@ impl Schedule {
     /// Resolve the schedule report against a snapshot. Execution binds again at
     /// each substep boundary so it observes edits made by preceding systems.
     pub fn bind_transforms(&mut self, world: &World) -> Result<()> {
+        for phase in &mut self.phases {
+            phase.refresh_membership(world)?;
+        }
         self.validate()?;
         let plan = self.compiled.get_mut().unwrap().as_mut().unwrap();
         plan.preview(&self.phases, world)
@@ -412,6 +478,7 @@ impl Schedule {
                 None => (1, dt),
             };
             for _ in 0..steps {
+                p.refresh_membership(world)?;
                 run_substep(p, groups, world, interval, pool)?;
                 if let Some(f) = &mut p.fixed {
                     f.remainder = (f.remainder - f.seconds).max(0.);

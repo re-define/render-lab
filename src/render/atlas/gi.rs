@@ -1,9 +1,10 @@
 use super::*;
 pub(super) struct HitTable {
     layout: std::sync::Weak<scene::GeometryRoutes>,
-    sources: std::sync::Weak<BTreeMap<MaterialId, Arc<Material>>>,
-    data: Arc<[u8]>,
-    signature: u64,
+    sources: Arc<BTreeMap<MaterialId, Arc<Material>>>,
+    data: Rows,
+    program_starts: Vec<usize>,
+    revision: u64,
 }
 impl Atlas {
     /// Stable scene material slots, shared by CPU-packed and GPU-deformed triangles.
@@ -13,20 +14,49 @@ impl Atlas {
         let atlas = Self::cached(scene)?;
         let mut table = atlas.hit_table.lock().unwrap();
         let layout = Arc::downgrade(&scene.routes);
-        let sources = Arc::downgrade(&scene.materials);
+        let signature = |material_revision: u64| {
+            let mut key = std::hash::DefaultHasher::new();
+            (atlas.revision, material_revision).hash(&mut key);
+            key.finish()
+        };
         if let Some(c) = table
             .as_ref()
-            .filter(|c| c.layout.ptr_eq(&layout) && c.sources.ptr_eq(&sources))
+            .filter(|c| c.layout.ptr_eq(&layout) && Arc::ptr_eq(&c.sources, &scene.materials))
         {
             return Ok((
-                g.resident_input("GI hit material table", c.data.clone()),
-                c.signature,
+                g.asset_table("GI hit material table", &c.data, false),
+                signature(c.revision),
             ));
         }
         let fallback = Material::default();
         // Four uvec4 header words per material, followed by one uvec4 per program node.
-        let mut rows = vec![[0u32; 4]; scene.routes.materials.len() * 4];
+        let prior = table.as_ref().filter(|t| t.layout.ptr_eq(&layout));
+        let mut data = prior.map_or_else(Rows::words, |t| t.data.clone());
+        let mut end = scene.routes.materials.len() * 4;
+        let mut starts = Vec::with_capacity(scene.routes.materials.len());
+        for id in &scene.routes.materials {
+            starts.push(end);
+            if let Some(GiHitModel::Program { nodes, .. }) = id
+                .and_then(|id| scene.materials.get(&id))
+                .map(|m| &m.gi_hit.model)
+            {
+                end += nodes.len();
+            }
+        }
+        data.resize_words(end * 4);
         for (slot, id) in scene.routes.materials.iter().enumerate() {
+            if let Some(old) = prior
+                && old.program_starts[slot] == starts[slot]
+                && id.is_none_or(|id| {
+                    old.sources
+                        .get(&id)
+                        .zip(scene.materials.get(&id))
+                        .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+                })
+            {
+                continue;
+            }
+            let mut rows = vec![[0u32; 4]; 4];
             let m = id
                 .and_then(|id| scene.materials.get(&id))
                 .map_or(&fallback, Arc::as_ref);
@@ -49,7 +79,7 @@ impl Atlas {
                 };
                 std::array::from_fn(|i| (m.base_color[i] * scale).clamp(0., 1.))
             });
-            let base = slot * 4;
+            let base = 0;
             rows[base][..3].copy_from_slice(&color.map(f32::to_bits));
             rows[base + 1][..3].copy_from_slice(&m.gi_hit.emission.map(f32::to_bits));
             rows[base + 2][..3].copy_from_slice(&region(m.gi_hit.texture));
@@ -65,7 +95,7 @@ impl Atlas {
                 } => {
                     rows[base][3] = 1;
                     rows[base + 3] = [
-                        rows.len().try_into()?,
+                        starts[slot].try_into()?,
                         nodes.len().try_into()?,
                         u32::from(*diffuse),
                         u32::from(*emission),
@@ -91,19 +121,21 @@ impl Atlas {
                     }
                 }
             }
+            data.write_words(slot * 16, bytemuck::cast_slice(&rows[..4]));
+            data.write_words(starts[slot] * 4, bytemuck::cast_slice(&rows[4..]));
         }
-        let mut signature = std::hash::DefaultHasher::new();
-        rows.hash(&mut signature);
-        Arc::as_ptr(&atlas).hash(&mut signature);
-        let signature = signature.finish();
-        let data: Arc<[u8]> = bytemuck::cast_slice(&rows).into();
-        let slot = g.resident_input("GI hit material table", data.clone());
+        let revision = prior.filter(|t| t.data.identical(&data)).map_or_else(
+            || NEXT_REVISION.fetch_add(1, Ordering::Relaxed),
+            |t| t.revision,
+        );
+        let slot = g.asset_table("GI hit material table", &data, false);
         *table = Some(HitTable {
             layout,
-            sources,
+            sources: scene.materials.clone(),
             data,
-            signature,
+            program_starts: starts,
+            revision,
         });
-        Ok((slot, signature))
+        Ok((slot, signature(revision)))
     }
 }

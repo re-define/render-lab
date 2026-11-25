@@ -51,6 +51,7 @@ pub(crate) enum Write {
     Inspect,
     Local,
     Material,
+    Texture,
     Component(&'static str),
     TypedValue(&'static str),
 }
@@ -97,6 +98,8 @@ impl Journal {
 pub struct Entities {
     rows: BTreeMap<Id, Entity>,
     #[serde(skip)]
+    hierarchy_revision: u64,
+    #[serde(skip)]
     journal: Journal,
     #[serde(skip)]
     owners: std::sync::OnceLock<BTreeMap<String, Vec<Id>>>,
@@ -105,6 +108,7 @@ impl Clone for Entities {
     fn clone(&self) -> Self {
         Self {
             rows: self.rows.clone(),
+            hierarchy_revision: self.hierarchy_revision,
             journal: Default::default(),
             owners: Default::default(),
         }
@@ -124,6 +128,10 @@ impl<'a> IntoIterator for &'a Entities {
     }
 }
 impl Entities {
+    /// Raw row edits may change a name or parent. Typed value and local-pose updates preserve this revision.
+    pub(crate) fn hierarchy_revision(&self) -> u64 {
+        self.hierarchy_revision
+    }
     fn set_local_if_present(&mut self, id: Id, local: Mat4) -> Option<()> {
         let row = self.rows.get_mut(&id)?;
         if row.local != local {
@@ -167,6 +175,7 @@ impl Entities {
     /// use full reconciliation; sparse rows are checked against their old bindings.
     pub fn get_mut(&mut self, id: &Id) -> Option<&mut Entity> {
         let row = self.rows.get_mut(id)?;
+        self.hierarchy_revision = self.hierarchy_revision.wrapping_add(1);
         self.owners.take();
         if Self::inspectable(row) {
             self.journal.write(*id, Write::Inspect);
@@ -196,27 +205,32 @@ impl Entities {
         Some(row)
     }
     pub fn insert(&mut self, id: Id, entity: Entity) -> Option<Entity> {
+        self.hierarchy_revision = self.hierarchy_revision.wrapping_add(1);
         self.owners.take();
         self.journal.invalidate();
         self.rows.insert(id, entity)
     }
     pub fn remove(&mut self, id: &Id) -> Option<Entity> {
         let row = self.rows.remove(id)?;
+        self.hierarchy_revision = self.hierarchy_revision.wrapping_add(1);
         self.owners.take();
         self.journal.invalidate();
         Some(row)
     }
     pub fn values_mut(&mut self) -> std::collections::btree_map::ValuesMut<'_, Id, Entity> {
+        self.hierarchy_revision = self.hierarchy_revision.wrapping_add(1);
         self.owners.take();
         self.journal.invalidate();
         self.rows.values_mut()
     }
     pub fn iter_mut(&mut self) -> std::collections::btree_map::IterMut<'_, Id, Entity> {
+        self.hierarchy_revision = self.hierarchy_revision.wrapping_add(1);
         self.owners.take();
         self.journal.invalidate();
         self.rows.iter_mut()
     }
     pub fn retain(&mut self, keep: impl FnMut(&Id, &mut Entity) -> bool) {
+        self.hierarchy_revision = self.hierarchy_revision.wrapping_add(1);
         self.owners.take();
         self.journal.invalidate();
         self.rows.retain(keep)
@@ -227,6 +241,19 @@ impl World {
         self.entities
             .set_local_if_present(id, local)
             .context("missing transform entity")
+    }
+    /// Replace a texture asset while retaining its entity ID and all material bindings.
+    pub fn set_texture(&mut self, id: Id, texture: Arc<Texture>) -> Result<()> {
+        let old = self
+            .entities
+            .get(&id)
+            .and_then(|e| e.texture.as_ref())
+            .context("missing texture entity")?;
+        if !Arc::ptr_eq(old, &texture) {
+            texture.validate()?;
+            self.entities.edit(id, Write::Texture).unwrap().texture = Some(texture);
+        }
+        Ok(())
     }
     pub fn set_material(&mut self, id: Id, material: Material) -> Result<()> {
         let old = self

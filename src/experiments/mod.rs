@@ -24,7 +24,7 @@ use crate::{
 use anyhow::Result;
 use std::sync::Arc;
 
-/// Overlays for the packed color buffer after visibility shading and before image outlines.
+/// Overlays for the packed color buffer at display resolution after temporal resolve and tone mapping.
 pub(super) struct VisibilityOverlay {
     pub component: SnapshotComponent,
     pub draw: fn(&mut FrameGraph, &Snapshot, Resource, Resource) -> Result<()>,

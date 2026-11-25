@@ -146,9 +146,7 @@ pub(in crate::experiments) struct Reflector {
 pub(in crate::experiments) fn reflections(
     g: &mut FrameGraph,
     s: &Snapshot,
-    ids: Resource,
-    depth: Resource,
-    color: Resource,
+    inputs: crate::render::SceneLayers,
     rivers: &[Reflector],
 ) {
     if rivers.is_empty() {
@@ -175,11 +173,17 @@ pub(in crate::experiments) fn reflections(
         "Reflect visible banks in river",
         Op::Compute {
             program: Dispatch {
-                shader: Shader::Compute(spv!("river_reflections.comp")),
+                shader: Shader::Compute(
+                    if inputs.color.encoding == crate::render::post::ColorEncoding::LinearRgba32 {
+                        spv!("river_reflections_hdr.comp")
+                    } else {
+                        spv!("river_reflections.comp")
+                    },
+                ),
                 bindings: vec![
-                    (ids, Access::ComputeSample),
-                    (depth, Access::ComputeSample),
-                    (color, Access::ComputeReadWrite),
+                    (inputs.ids, Access::ComputeSample),
+                    (inputs.depth, Access::ComputeSample),
+                    (inputs.color.resource, Access::ComputeReadWrite),
                     (params, Access::ComputeRead),
                     (streams, Access::ComputeRead),
                 ],

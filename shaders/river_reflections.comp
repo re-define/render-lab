@@ -4,7 +4,8 @@
 #include "visibility_image.glsl"
 layout(local_size_x=8,local_size_y=8) in;
 layout(set=0,binding=1) uniform texture2D surfaceDepth;
-layout(set=0,binding=2,std430) buffer SceneColor {uint pixels[];};
+#define SCENE_COLOR_BINDING 2
+#include "effect_color.glsl"
 struct Reflector {mat4 inverseModel;uvec4 info;};
 layout(set=0,binding=3,std430) readonly buffer View {mat4 vp;mat4 invVP;vec4 eye;uvec4 config;Reflector rivers[];};
 layout(buffer_reference,std430,buffer_reference_align=16) readonly buffer Vertices {vec4 v[];};
@@ -55,9 +56,9 @@ void main(){
                 float confidence=(1.-smoothstep(.08,.55+.14*distance,delta));
                 float alpha=(.13+.43*grazing)*confidence*smoothstep(.0,.07,edge)*(1.-smoothstep(50.,100.,distance));
                 uint pixel=q.y*size.x+q.x;
-                vec3 original=unpackUnorm4x8(pixels[pixel]).rgb;
-                vec3 reflected=unpackUnorm4x8(pixels[hit.y*size.x+hit.x]).rgb;
-                pixels[pixel]=packUnorm4x8(vec4(mix(original,reflected*vec3(.91,.94,.91),alpha),1.));
+                vec3 original=loadSceneColor(pixel);
+                vec3 reflected=loadSceneColor(uint(hit.y*size.x+hit.x));
+                storeSceneColor(pixel,mix(original,reflected*vec3(.91,.94,.91),alpha));
                 return;
             }
         }

@@ -20,7 +20,8 @@ void main() {
     if (any(greaterThanEqual(local, p.area))) return;
     uvec2 xy = p.origin + local;
     uint index = xy.y * p.size.x + xy.x;
-    if (visibilityAt(xy).x != 0u) return;
+    uvec2 renderPixel = uvec2((vec2(xy) + .5) * vec2(textureSize(visibilityImage, 0)) / vec2(p.size));
+    if (visibilityAt(renderPixel).x != 0u) return;
 
     vec2 pixel = vec2(xy) + 0.5;
     float ink = length(pixel - p.points[0]) - 4.0;

@@ -16,6 +16,7 @@ pub struct AllocationInfo {
 #[derive(Default, Clone, serde::Serialize)]
 pub struct FrameMemory {
     pub managed: super::ManagedMemory,
+    /// Logical atlas bytes visible through the descriptor. atlas.allocated_bytes includes growth capacity.
     pub atlas_buffer_bytes: u64,
     pub atlas: Option<AllocationInfo>,
     /// Binding ranges for live RDG resources and the descriptor heap in this frame slot.
@@ -23,10 +24,42 @@ pub struct FrameMemory {
     pub nonlocal_bytes: u64,
 }
 
+/// CPU-side observations in microseconds on one engine clock. GPU intervals have their own origin.
+#[derive(Default, Clone, serde::Serialize)]
+pub struct CpuFrameTimes {
+    pub tick: u64,
+    pub snapshot: u64,
+    pub render: u64,
+    pub plan: u64,
+    pub rhi: u64,
+    pub acquire: u64,
+    pub submit: u64,
+    pub present_return: Option<u64>,
+    pub retired: u64,
+}
 #[derive(Default, Clone, serde::Serialize)]
 pub struct FrameProfile {
+    pub cpu_times_us: Option<CpuFrameTimes>,
+    pub tick_id: u64,
+    pub snapshot_id: u64,
+    /// Monotonic frame submission ID for this backend, including offscreen frames.
+    pub submission_id: u64,
+    pub skipped_render_ticks: u64,
+    pub history_generation: u64,
+    /// Time in the main-to-render channel and from plan completion to RHI preparation.
+    pub render_queue_ms: f64,
+    pub rhi_queue_ms: f64,
+    /// CPU time from simulation tick start to return from vkQueuePresentKHR, when issued.
+    pub tick_to_present_request_ms: Option<f64>,
+    pub tick_to_completion_ms: Option<f64>,
     pub frames_in_flight: usize,
     pub resident_upload_bytes: u64,
+    /// Bytes actually written to the texture atlas in this submission, included in resident uploads.
+    pub atlas_upload_bytes: u64,
+    pub atlas_revision: u64,
+    /// Payload bytes copied into CPU pages when constructing this atlas version, excluding page COW.
+    /// Count once per revision, even when the same version serves multiple submissions.
+    pub atlas_version_repack_bytes: usize,
     /// Logical temporary buffer payloads served by an earlier physical allocation in this frame.
     pub transient_reuse_bytes: u64,
     /// Payload bytes written through mapped buffers, excluding resident assets and zero padding.
@@ -55,6 +88,7 @@ pub struct FrameProfile {
     pub gpu_span_ms: Option<f64>,
     pub task_workers: usize,
     pub recording_workers: usize,
+    pub recording_chunks: usize,
     pub overlapping_recordings: usize,
     pub dependency_edges: usize,
     pub resource_barriers: usize,

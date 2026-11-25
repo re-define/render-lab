@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use std::{collections::BTreeMap, sync::Arc};
 pub(crate) use visibility::{FrameLighting, MaterialInputs, ResolveInputs};
 mod frame_graph;
+pub(crate) use frame_graph::FrameStamp;
 pub use frame_graph::{FrameGraph, FramePlan, FrameProducts};
 mod atlas;
 pub(crate) use atlas::{Atlas, AtlasCache};
@@ -133,7 +134,8 @@ fn vertex_matrix(mesh: &Mesh, k: usize, model: Mat4, palette: Option<&[Mat4]>) -
     Ok(model)
 }
 mod materials;
-pub use materials::{LightingInput, MaterialPrograms};
+pub(crate) use materials::material_code;
+pub use materials::{LightingInput, MaterialCode, MaterialPrograms};
 pub mod post;
 pub struct Snapshot {
     /// Capabilities of the backend which will execute this snapshot.
@@ -429,7 +431,8 @@ impl VisibilityRenderer {
             s,
             atlas,
             |g, t| self.draw_subset(g, t, s, |_| true),
-            |_, _, _, _| Ok(()),
+            |_, _| Ok(()),
+            |_, _| Ok(()),
         )
     }
 }
@@ -440,13 +443,37 @@ impl Technique for VisibilityRenderer {
     }
 }
 
+/// Scene-space effects operate at render resolution and must honor the color encoding.
+#[derive(Clone, Copy)]
+pub(crate) struct SceneLayers {
+    pub ids: Resource,
+    pub depth: Resource,
+    pub color: post::ColorInput,
+    pub has_backdrop: bool,
+}
+/// Display-space effects operate on packed output after reconstruction and tone mapping.
+/// Visibility and depth keep their original render resolution.
+#[derive(Clone, Copy)]
+pub(crate) struct DisplayLayers {
+    pub ids: Resource,
+    pub depth: Resource,
+    pub color: Resource,
+}
 pub(crate) fn build_frame_with_post(
     s: &Snapshot,
     atlas: Arc<Atlas>,
     build: impl FnOnce(&mut FrameGraph, &mut Targets) -> Result<()>,
-    post: impl FnOnce(&mut FrameGraph, Resource, Resource, Resource) -> Result<()>,
+    scene: impl FnOnce(&mut FrameGraph, SceneLayers) -> Result<()>,
+    display: impl FnOnce(&mut FrameGraph, DisplayLayers) -> Result<()>,
 ) -> Result<FrameGraph> {
-    build_frame_with_lighting(s, atlas, build, |_, _| Ok(FrameLighting::default()), post)
+    build_frame_with_lighting(
+        s,
+        atlas,
+        build,
+        |_, _| Ok(FrameLighting::default()),
+        scene,
+        display,
+    )
 }
 
 pub(crate) fn build_frame_with_lighting(
@@ -454,13 +481,14 @@ pub(crate) fn build_frame_with_lighting(
     atlas: Arc<Atlas>,
     build: impl FnOnce(&mut FrameGraph, &mut Targets) -> Result<()>,
     lighting: impl FnOnce(&mut FrameGraph, ResolveInputs) -> Result<FrameLighting>,
-    post: impl FnOnce(&mut FrameGraph, Resource, Resource, Resource) -> Result<()>,
+    scene: impl FnOnce(&mut FrameGraph, SceneLayers) -> Result<()>,
+    display: impl FnOnce(&mut FrameGraph, DisplayLayers) -> Result<()>,
 ) -> Result<FrameGraph> {
     let mut g = FrameGraph::new(s.extent);
     g.display_extent = (s.output_extent() != s.extent).then(|| s.output_extent());
     let mut t = Targets {
         background: 0xff090d13,
-        texture: g.resident_input(atlas.label, atlas.pixels.clone()),
+        texture: g.asset_table(atlas.label, &atlas.pixels, atlas.editable),
         atlas,
         visibility: g.resource("Visibility IDs", Storage::Color),
         depth: g.resource("Scene depth", Storage::Depth),
@@ -478,6 +506,7 @@ pub(crate) fn build_frame_with_lighting(
     let ray_view = rays::view(s);
     g.products.request_ray_proxies = ray_view.is_some();
     g.products.material_atlas = Some(t.texture);
+    g.products.atlas_build = (t.atlas.revision, t.atlas.repacked);
     build(&mut g, &mut t)?;
     if let Some(mode) = ray_view {
         let output = rays::inspect(&mut g, s, mode)?;
@@ -505,7 +534,6 @@ pub(crate) fn build_frame_with_lighting(
     g.products.visibility = Some(inputs.ids);
     g.products.depth = Some(depth);
     g.products.motion = inputs.motion;
-    post(&mut g, inputs.ids, depth, color)?;
     let mut color = post::ColorInput {
         resource: color,
         encoding: if lighting.linear_hdr {
@@ -514,6 +542,15 @@ pub(crate) fn build_frame_with_lighting(
             post::ColorEncoding::Bgra8
         },
     };
+    scene(
+        &mut g,
+        SceneLayers {
+            ids: inputs.ids,
+            depth,
+            color,
+            has_backdrop: false,
+        },
+    )?;
     if let Some((motion, frame)) = inputs
         .motion
         .zip(s.temporal.as_ref())
@@ -534,6 +571,14 @@ pub(crate) fn build_frame_with_lighting(
     } else {
         color.resource
     };
+    display(
+        &mut g,
+        DisplayLayers {
+            ids: inputs.ids,
+            depth,
+            color,
+        },
+    )?;
     g.set_output(color);
     Ok(g)
 }

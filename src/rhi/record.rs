@@ -87,6 +87,14 @@ pub(super) fn scope(a: Access) -> (S, A, L) {
         ),
     }
 }
+struct RecordContext<'a> {
+    plan: &'a Plan,
+    res: &'a [Physical],
+    heap: &'a vk::BindHeapInfoEXT,
+    pipes: &'a HashMap<(Shader, usize), Pipeline>,
+    image: Option<present::Acquired>,
+}
+
 impl Recorder {
     unsafe fn barriers(&mut self, graph: &Graph, step: &Step, res: &[Physical]) {
         let mut images = vec![];
@@ -162,11 +170,9 @@ impl Recorder {
         } else {
             std::slice::from_ref(&memory)
         };
-        self.barriers_count = [
-            usize::from(!mem.is_empty() || !images.is_empty()),
-            mem.len(),
-            images.len(),
-        ];
+        self.barriers_count[0] += usize::from(!mem.is_empty() || !images.is_empty());
+        self.barriers_count[1] += mem.len();
+        self.barriers_count[2] += images.len();
         if !mem.is_empty() || !images.is_empty() {
             self.gpu.dev.cmd_pipeline_barrier2(
                 self.cmd,
@@ -179,7 +185,7 @@ impl Recorder {
     pub(super) unsafe fn record(
         &mut self,
         plan: &Plan,
-        step: &Step,
+        steps: &[Step],
         res: &[Physical],
         heap: &vk::BindHeapInfoEXT,
         pipes: &HashMap<(Shader, usize), Pipeline>,
@@ -194,16 +200,55 @@ impl Recorder {
             &vk::CommandBufferBeginInfo::builder()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )?;
-        d.cmd_reset_query_pool(cmd, self.query, 0, 2);
-        d.cmd_write_timestamp2(cmd, S::TOP_OF_PIPE, self.query, 0);
+        self.barriers_count = [0; 3];
+        let queries = (steps.len() * 2) as u32;
+        d.cmd_reset_query_pool(cmd, self.query, 0, queries);
+        let cx = RecordContext {
+            plan,
+            res,
+            heap,
+            pipes,
+            image,
+        };
+        for (offset, step) in steps.iter().enumerate() {
+            self.record_step(&cx, step, offset)?;
+        }
+        d.end_command_buffer(cmd)?;
+        Ok(())
+    }
+
+    unsafe fn record_step(
+        &mut self,
+        cx: &RecordContext<'_>,
+        step: &Step,
+        offset: usize,
+    ) -> Result<()> {
+        let RecordContext {
+            plan,
+            res,
+            heap,
+            pipes,
+            image,
+        } = *cx;
+        let gpu = self.gpu.clone();
+        let d = &gpu.dev;
+        let cmd = self.cmd;
+        d.cmd_write_timestamp2(cmd, S::TOP_OF_PIPE, self.query, 2 * offset as u32);
         self.barriers(&plan.graph, step, res);
         let op = &plan.graph.passes[step.index].op;
-        if gpu.raster_queries && matches!(op, Op::Draw { .. }) {
-            if self.raster.is_none() {
-                self.raster = Some(raster_queries::Pools::new(&gpu)?);
+        let raster = if gpu.raster_queries && matches!(op, Op::Draw { .. }) {
+            self.raster
+                .resize_with(self.raster.len().max(offset + 1), || None);
+            let pools = &mut self.raster[offset];
+            if pools.is_none() {
+                *pools = Some(raster_queries::Pools::new(&gpu)?);
             }
-            self.raster.as_ref().unwrap().reset(cmd);
-        }
+            let pools = pools.as_ref().unwrap();
+            pools.reset(cmd);
+            Some(pools)
+        } else {
+            None
+        };
         if let Some(p) = op.program() {
             let point = match p.shader {
                 Shader::Graphics(..) | Shader::Mesh(..) => vk::PipelineBindPoint::GRAPHICS,
@@ -296,7 +341,7 @@ impl Recorder {
                     }],
                 );
                 d.cmd_set_scissor(cmd, 0, &[rect]);
-                if let Some(q) = &self.raster {
+                if let Some(q) = raster {
                     q.begin(cmd);
                 }
                 match count {
@@ -318,7 +363,7 @@ impl Recorder {
                         d.cmd_draw_indirect(cmd, res[r.0].buffer().raw, 0, 1, 16)
                     }
                 }
-                if let Some(q) = &self.raster {
+                if let Some(q) = raster {
                     q.end(cmd);
                 }
                 d.cmd_end_rendering(cmd);
@@ -476,8 +521,7 @@ impl Recorder {
             }
             Op::HostRead(_) | Op::Counters { .. } => (),
         }
-        d.cmd_write_timestamp2(cmd, S::BOTTOM_OF_PIPE, self.query, 1);
-        d.end_command_buffer(cmd)?;
+        d.cmd_write_timestamp2(cmd, S::BOTTOM_OF_PIPE, self.query, 2 * offset as u32 + 1);
         Ok(())
     }
 }

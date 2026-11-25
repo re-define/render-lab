@@ -190,6 +190,12 @@ fn main() {
         ("scatter.comp", "classify.comp", &["-DSCATTER"]),
         ("pbr_scene.comp", "pbr.comp", &["-DSCENE_LIGHTING"]),
         ("ibl_sky_hdr.comp", "ibl_sky.comp", &["-DHDR"]),
+        ("vegetation_sky_hdr.comp", "vegetation_sky.comp", &["-DHDR"]),
+        (
+            "river_reflections_hdr.comp",
+            "river_reflections.comp",
+            &["-DHDR"],
+        ),
         (
             "restir_material_hdr.comp",
             "restir_material.comp",
@@ -330,16 +336,37 @@ fn main() {
         .map(|name| (name, name, &[][..]))
         .chain(variants.iter().copied())
     {
-        let status = Command::new(&compiler)
-            .args(defines)
-            .arg("--target-env=vulkan1.2")
-            .arg("-O")
-            .arg(PathBuf::from("shaders").join(source))
-            .arg("-o")
-            .arg(out_dir.join(format!("{file}.spv")))
-            .status()
-            .expect("install Vulkan SDK glslc or set GLSLC");
-        assert!(status.success(), "shader compilation failed for {file}");
+        // Compile both frame color ABIs for geometry materials that participate in composition.
+        let dual_output = matches!(
+            source,
+            "character.comp"
+                | "vegetation_material.comp"
+                | "effect_material.comp"
+                | "river_material.comp"
+        ) || matches!(
+            file,
+            "pbr.comp" | "pbr_scene.comp" | "toon.comp" | "toon_scene.comp"
+        );
+        for linear in [false, true]
+            .into_iter()
+            .take(if dual_output { 2 } else { 1 })
+        {
+            let suffix = if linear { ".linear.spv" } else { ".spv" };
+            let status = Command::new(&compiler)
+                .args(linear.then_some("-DHDR_OUTPUT"))
+                .args(defines)
+                .arg("--target-env=vulkan1.2")
+                .arg("-O")
+                .arg(PathBuf::from("shaders").join(source))
+                .arg("-o")
+                .arg(out_dir.join(format!("{file}{suffix}")))
+                .status()
+                .expect("install Vulkan SDK glslc or set GLSLC");
+            assert!(
+                status.success(),
+                "shader compilation failed for {file}{suffix}"
+            );
+        }
     }
 }
 

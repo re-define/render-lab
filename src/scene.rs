@@ -111,6 +111,20 @@ pub struct Texture {
     pub height: u32,
     pub rgba: Vec<u8>,
 }
+impl Texture {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.width > 0
+                && self.height > 0
+                && (self.width as usize)
+                    .checked_mul(self.height as usize)
+                    .and_then(|n| n.checked_mul(4))
+                    == Some(self.rgba.len()),
+            "invalid texture extent"
+        );
+        Ok(())
+    }
+}
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Material {
     #[serde(default)]
@@ -299,15 +313,7 @@ impl World {
                 );
             }
             if let Some(t) = &e.texture {
-                ensure!(
-                    t.width > 0
-                        && t.height > 0
-                        && (t.width as usize)
-                            .checked_mul(t.height as usize)
-                            .and_then(|n| n.checked_mul(4))
-                            == Some(t.rgba.len()),
-                    "entity {id}: invalid texture extent"
-                );
+                t.validate().with_context(|| format!("entity {id}"))?;
             }
             if let Some(m) = &e.mesh {
                 let n = m.positions.len();

@@ -1,5 +1,5 @@
 //! Render-owned frame products. Logical graph resources carry no scene or viewport semantics.
-use super::{ExtractionStats, rays};
+use super::{ExtractionStats, geometry::SkinBatches, rays};
 use crate::rdg::{Graph, Op, Plan, Resource, Storage};
 use anyhow::{Context, Result, ensure};
 use std::ops::{Deref, DerefMut};
@@ -15,6 +15,7 @@ pub struct FrameProducts {
     pub(crate) request_ray_proxies: bool,
     pub(crate) cluster_shadow: Option<rays::ClusterShadow>,
     pub(crate) material_atlas: Option<Resource>,
+    pub(crate) atlas_build: (u64, usize),
     pub(crate) instance_visits: usize,
 }
 impl FrameProducts {
@@ -24,7 +25,8 @@ impl FrameProducts {
 }
 
 pub struct FrameGraph {
-    graph: Graph,
+    pub(super) graph: Graph,
+    pub(super) skins: SkinBatches,
     pub(crate) products: FrameProducts,
     present: Option<Resource>,
 }
@@ -32,6 +34,7 @@ impl FrameGraph {
     pub fn new(extent: [u32; 2]) -> Self {
         Self {
             graph: Graph::new(extent),
+            skins: SkinBatches::default(),
             products: FrameProducts::default(),
             present: None,
         }
@@ -55,6 +58,7 @@ impl FrameGraph {
         Ok(output)
     }
     pub fn compile(mut self) -> Result<FramePlan> {
+        std::mem::take(&mut self.skins).finish(&mut self.graph);
         let output = self
             .products
             .final_color
@@ -91,10 +95,12 @@ impl FrameGraph {
             self.graph.prefer_local_buffer(atlas);
         }
         Ok(FramePlan {
+            stamp: Default::default(),
             commands: self.graph.compile()?,
             output,
             instance_visits: self.products.instance_visits,
             material_atlas: self.products.material_atlas,
+            atlas_build: self.products.atlas_build,
             build_ms: 0.,
             main_ms: 0.,
             extract_ms: 0.,
@@ -113,11 +119,26 @@ impl DerefMut for FrameGraph {
         &mut self.graph
     }
 }
+/// Monotonic CPU timestamps travel with their admitted render snapshot.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct FrameStamp {
+    pub tick_id: u64,
+    pub snapshot_id: u64,
+    pub skipped_ticks: u64,
+    pub generation: u64,
+    pub origin: Option<std::time::Instant>,
+    pub tick_started: Option<std::time::Instant>,
+    pub snapshot_ready: Option<std::time::Instant>,
+    pub render_dequeued: Option<std::time::Instant>,
+    pub plan_ready: Option<std::time::Instant>,
+}
 pub struct FramePlan {
+    pub(crate) stamp: FrameStamp,
     pub(crate) commands: Plan,
     pub(crate) output: Resource,
     pub(crate) instance_visits: usize,
     pub(crate) material_atlas: Option<Resource>,
+    pub(crate) atlas_build: (u64, usize),
     pub(crate) build_ms: f64,
     pub(crate) main_ms: f64,
     pub(crate) extract_ms: f64,

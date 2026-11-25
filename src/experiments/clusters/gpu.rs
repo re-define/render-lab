@@ -1002,9 +1002,7 @@ impl ClusterLod {
     pub(in crate::experiments) fn atmosphere(
         g: &mut FrameGraph,
         s: &Snapshot,
-        ids: Resource,
-        depth: Resource,
-        color: Resource,
+        inputs: crate::render::SceneLayers,
     ) -> Result<()> {
         let debug = s
             .scene
@@ -1017,7 +1015,7 @@ impl ClusterLod {
             .map(vegetation::Settings::decode)
             .transpose()?;
         if let Some(plants) = plants {
-            vegetation::atmosphere(g, s, ids, depth, color, debug || plants.visualize);
+            vegetation::atmosphere(g, s, inputs, debug || plants.visualize);
         }
         Ok(())
     }
@@ -1046,7 +1044,8 @@ impl Technique for ClusterLod {
                     }
                 })
             },
-            |g, ids, depth, color| Self::atmosphere(g, s, ids, depth, color),
+            |g, inputs| Self::atmosphere(g, s, inputs),
+            |_, _| Ok(()),
         )
     }
 }

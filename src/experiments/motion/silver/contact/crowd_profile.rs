@@ -1,41 +1,15 @@
 //! Reproducible extraction workload. Shared asset entities, independent bodies, skins and pose state.
 use super::*;
-use crate::engine::{
-    SimulationSystem, SystemAccess, SystemContext, SystemOrder, TransformBindings, TransformTargets,
-};
 use std::{
     collections::{BTreeMap, BTreeSet},
     time::Instant,
 };
 
-struct PopulationStage<T>(Vec<T>);
-impl<T: SimulationSystem> SimulationSystem for PopulationStage<T> {
-    fn access(&self) -> SystemAccess {
-        self.0[0].access()
-    }
-    fn order(&self) -> SystemOrder {
-        self.0[0].order()
-    }
-    fn transform_targets(&self, b: &TransformBindings) -> Result<TransformTargets> {
-        let mut all = TransformTargets::default();
-        for s in &self.0 {
-            let t = s.transform_targets(b)?;
-            all.reads.extend(t.reads);
-            all.writes.extend(t.writes);
-        }
-        Ok(all)
-    }
-    fn run(&self, cx: &mut SystemContext, dt: f32) -> Result<()> {
-        cx.for_each_parallel(&self.0, |system, cx| system.run(cx, dt))
-    }
-}
 fn population(n: usize, pool: &rayon::ThreadPool) -> Result<(Arc<World>, Schedule)> {
     let mut initial = Arc::new(scene()?);
     let mut schedule = Schedule::default();
     install(&initial, &mut schedule)?;
     let actor = super::actor(&initial).unwrap();
-    let r = Rig::bind(&initial, actor, true)?;
-    let action_rig = traversal::ActionRig::bind(&initial, actor, &r)?;
     let prototype = initial
         .typed_component::<Contact>(actor, SETTING)?
         .unwrap()
@@ -66,6 +40,11 @@ fn population(n: usize, pool: &rayon::ThreadPool) -> Result<(Arc<World>, Schedul
     nodes.extend(supports);
     nodes.extend([f.rail, f.gate, prototype.target]);
     // Stagger up to twenty states sampled from the real course, including vault and duck.
+    let prototype_parts = initial
+        .entities
+        .values()
+        .filter(|e| e.instance.is_some() && e.skin_binding.is_some())
+        .count();
     let phases = n.min(20);
     let mut seeds = vec![initial.clone()];
     for _ in 1..phases {
@@ -75,9 +54,6 @@ fn population(n: usize, pool: &rayon::ThreadPool) -> Result<(Arc<World>, Schedul
         seeds.push(initial.clone());
     }
     let mut w = (*seeds[0]).clone();
-    let mut intents = Vec::new();
-    let mut dynamics = Vec::new();
-    let mut feedback = Vec::new();
     // Offset the rendered lanes in world space. Each collider and actor simulate in the same lane-local frame.
     let cols = (n as f32 * 1.8).sqrt().ceil() as usize;
     let rows = n.div_ceil(cols);
@@ -131,7 +107,13 @@ fn population(n: usize, pool: &rayon::ThreadPool) -> Result<(Arc<World>, Schedul
             .typed_component::<dynamics::Body>(actor, dynamics::BODY)?
             .unwrap()
             .into_owned();
-        b.support = b.support.map(map);
+        b.remap_supports(map);
+        c.finger.iter_mut().for_each(|m| m.joint = map(m.joint));
+        let spring = seed
+            .typed_component::<dynamics::Spring>(prototype.plate, dynamics::SPRING)?
+            .unwrap()
+            .into_owned();
+        w.set_typed_component(map(prototype.plate), dynamics::SPRING, spring);
         for foot in &mut c.feet {
             foot.anchor = foot.anchor.map(|(k, p)| (map(k), p));
         }
@@ -146,23 +128,20 @@ fn population(n: usize, pool: &rayon::ThreadPool) -> Result<(Arc<World>, Schedul
             rail: map(f.rail),
             gate: map(f.gate),
         });
+        if let Some(binding) = &mut c.source_binding {
+            let binding = Arc::make_mut(binding);
+            binding.bones.clone_from(&p.bones);
+            for (joint, parent) in &mut binding.hierarchy {
+                *joint = map(*joint);
+                *parent = w.entities[joint].parent;
+            }
+            binding.finger.clone_from(&c.finger);
+            (binding.floor, binding.plate, binding.target, binding.course) =
+                (c.floor, c.plate, c.target, c.course);
+        }
         w.set_typed_component(map(actor), PLAYER, p);
         w.set_typed_component(map(actor), SETTING, c);
         w.set_typed_component(map(actor), dynamics::BODY, b);
-        let mut rig = r.clone();
-        rig.ids.iter_mut().for_each(|k| *k = map(*k));
-        let stage = Arc::new(Stage {
-            actor: map(actor),
-            rig,
-            action_rig: Some(action_rig.clone()),
-            supports: supports.iter().copied().map(map).collect(),
-            rail: Some(map(f.rail)),
-            plate: map(prototype.plate),
-            target: map(prototype.target),
-        });
-        intents.push(stage::Prepare(stage.clone()));
-        dynamics.push(dynamics::Integrate(stage.clone()));
-        feedback.push(stage::Feedback(stage));
     }
     w.validate()?;
     let skinned = w
@@ -176,24 +155,154 @@ fn population(n: usize, pool: &rayon::ThreadPool) -> Result<(Arc<World>, Schedul
         w.entities.component_owners(PLAYER).len()
     );
     anyhow::ensure!(
-        skinned > 0
+        prototype_parts > 0
+            && skinned == prototype_parts * n
             && w.entities.component_owners(PLAYER).len() == n
             && w.entities.component_owners(dynamics::BODY).len() == n
     );
     let mut schedule = Schedule::default();
-    let mut matcher = SilverMatcher::load()?;
-    matcher.after = &[PREPARE];
-    schedule.fixed_stage(
-        Duration::from_secs_f64(1. / 60.),
-        8,
-        vec![
-            Arc::new(PopulationStage(intents)),
-            Arc::new(matcher),
-            Arc::new(PopulationStage(dynamics)),
-            Arc::new(PopulationStage(feedback)),
-        ],
-    )?;
+    install(&w, &mut schedule)?;
     Ok((Arc::new(w), schedule))
+}
+
+#[test]
+fn shared_platform_reduces_occupants_once_and_keeps_skeletons_independent() -> Result<()> {
+    let one_worker = rayon::ThreadPoolBuilder::new().num_threads(1).build()?;
+    let four_workers = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+    let (world, _) = population(2, &one_worker)?;
+    let mut w = Arc::try_unwrap(world).ok().unwrap();
+    let ids: [Id; 2] = w.entities.component_owners(SETTING).try_into().unwrap();
+    let mut fixture = w
+        .typed_component::<Contact>(ids[0], SETTING)?
+        .unwrap()
+        .into_owned();
+    let children = rig::children(&w);
+    let alternate = Rig::bind(&w, ids[1], &children)?;
+    let fingertip = alternate.ids[alternate.finger];
+    for &joint in &alternate.ids {
+        w.entities.get_mut(&joint).unwrap().name = format!("alternative rig joint {joint}");
+    }
+    // Both occupants stand on one spring in the same simulation coordinate system.
+    w.entities.get_mut(&ids[1]).unwrap().parent = w.entities[&ids[0]].parent;
+    fixture.course = None;
+    fixture.auto_walk = false;
+    fixture.play = None;
+    fixture.source.clear();
+    fixture.feet = Default::default();
+    let plate = fixture.plate;
+    let top = w.entities[&plate].local.transform_point3(0.5 * Vec3::Y);
+    for (index, &id) in ids.iter().enumerate() {
+        let at = top + Vec3::X * (index as f32 - 0.5) * 0.08;
+        w.entities.get_mut(&id).unwrap().local = Mat4::from_translation(at);
+        let mut p = player(&w, id)?.into_owned();
+        (p.move_root, p.speed, p.side, p.turn) = (false, 0., 0., 0.);
+        w.set_typed_component(id, PLAYER, p);
+        let mut c = fixture.clone();
+        if index == 1 {
+            c.finger = Some(FingerMarker {
+                joint: fingertip,
+                offset: FINGERTIP,
+            });
+        }
+        w.set_typed_component(id, SETTING, c);
+        let mut b = dynamics::Body::new(at);
+        b.support = Some(plate);
+        w.set_typed_component(id, dynamics::BODY, b);
+    }
+    let mut single = w.clone();
+    single
+        .entities
+        .get_mut(&ids[1])
+        .unwrap()
+        .components
+        .remove(SETTING);
+    let mut single_schedule = Schedule::default();
+    install(&single, &mut single_schedule)?;
+    let mut single = Arc::new(single);
+    single_schedule.tick(&mut single, 1. / 60., &one_worker)?;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("shared-plate.scene.json");
+    w.save(&path)?;
+    let mut loaded = World::load(&path)?;
+    crate::experiments::SceneConfiguration::restore(&mut loaded)?;
+    let mut replay = Schedule::default();
+    install(&loaded, &mut replay)?;
+    let mut loaded = Arc::new(loaded);
+    let mut schedule = Schedule::default();
+    install(&w, &mut schedule)?;
+    let joints = {
+        let children = rig::children(&w);
+        let a = Rig::bind(&w, ids[0], &children)?;
+        let b = Rig::bind(&w, ids[1], &children)?;
+        assert!(a.ids.iter().all(|id| !b.ids.contains(id)));
+        assert_eq!(b.ids[b.finger], fingertip);
+        [a.ids, b.ids].concat()
+    };
+    let mut w = Arc::new(w);
+    for step in 0..10 {
+        schedule.tick(&mut w, 1. / 60., &four_workers)?;
+        replay.tick(&mut loaded, 1. / 60., &one_worker)?;
+        assert_eq!(w.entities[&plate].local, loaded.entities[&plate].local);
+        for &id in &joints {
+            assert!(
+                w.entities[&id]
+                    .local
+                    .abs_diff_eq(loaded.entities[&id].local, 2e-5)
+            );
+        }
+        if step == 0 {
+            let velocity = |world: &World| {
+                world
+                    .typed_component::<dynamics::Spring>(plate, dynamics::SPRING)
+                    .unwrap()
+                    .unwrap()
+                    .velocity
+            };
+            let (one, two) = (velocity(&single), velocity(&w));
+            assert!(
+                one < 0. && (two - 2. * one).abs() < 1e-5,
+                "spring velocities {one} {two}"
+            );
+            assert!(w.entities[&plate].local.w_axis.y < single.entities[&plate].local.w_axis.y);
+        }
+    }
+    // Toggle membership without reinstalling the schedule; standalone locomotion remains active.
+    let id = ids[1];
+    let mut contact = w
+        .typed_component::<Contact>(id, SETTING)?
+        .unwrap()
+        .into_owned();
+    Arc::make_mut(&mut w)
+        .entities
+        .get_mut(&id)
+        .unwrap()
+        .components
+        .remove(SETTING);
+    let prior = w
+        .typed_component::<dynamics::Body>(id, dynamics::BODY)?
+        .unwrap()
+        .particle
+        .position;
+    schedule.tick(&mut w, 1. / 60., &four_workers)?;
+    assert_eq!(
+        w.typed_component::<dynamics::Body>(id, dynamics::BODY)?
+            .unwrap()
+            .particle
+            .position,
+        prior
+    );
+    contact.source.clear();
+    Arc::make_mut(&mut w).set_typed_component(id, SETTING, contact);
+    schedule.tick(&mut w, 1. / 60., &four_workers)?;
+    assert_eq!(
+        w.typed_component::<Contact>(id, SETTING)?
+            .unwrap()
+            .source
+            .len(),
+        21
+    );
+    Ok(())
 }
 
 #[test]
@@ -279,6 +388,7 @@ fn silver_crowd_window_profile() -> Result<()> {
     ensure!(!raw.is_null(), "benchmark window unavailable");
     let window = Window(raw as isize);
     let mut engine = crate::experiments::open(scene()?)?;
+    engine.set_ordered_completions(true);
     (engine.world, engine.schedule) = population(count, &engine.tasks)?;
     let cols = (count as f32 * 1.8).sqrt().ceil() as usize;
     engine.camera = Camera {
@@ -318,11 +428,43 @@ fn silver_crowd_window_profile() -> Result<()> {
             if observed > 20 {
                 let p = &frame.profile;
                 assert!(!p.extraction_full_rebuild);
+                ensure!(
+                    p.snapshot_id == done && p.tick_id >= done,
+                    "lost or reordered completed snapshot"
+                );
+                if observed == 21 {
+                    println!(
+                        "frame: {} passes, {} animation passes, {} recording chunks, {} queue submits, {} bound-device bytes",
+                        frame.passes.len(),
+                        frame
+                            .passes
+                            .iter()
+                            .filter(|p| p.phase == crate::rdg::PassPhase::Animation)
+                            .count(),
+                        p.recording_chunks,
+                        frame.submissions,
+                        frame.memory.device_local_bytes
+                    );
+                }
                 for (key, ms) in [
                     ("simulation", p.main_ms),
                     ("extraction", p.extract_ms),
                     ("render build+compile", p.build_ms + p.compile_ms),
                     ("RHI elapsed", p.rhi_ms),
+                    ("render queue", p.render_queue_ms),
+                    ("RHI queue", p.rhi_queue_ms),
+                    ("submit to driver", p.submit_ms),
+                    ("present request", p.present_ms),
+                    ("tick to completion", p.tick_to_completion_ms.unwrap()),
+                    (
+                        "GPU animation scopes",
+                        frame
+                            .passes
+                            .iter()
+                            .filter(|p| p.phase == crate::rdg::PassPhase::Animation)
+                            .map(|p| p.ms)
+                            .sum(),
+                    ),
                     (
                         "GPU span",
                         p.gpu_span_ms.context("aligned GPU timestamps required")?,
@@ -349,6 +491,12 @@ fn silver_crowd_window_profile() -> Result<()> {
             "timed out waiting for crowd frame"
         );
     }
+    let intervals = &series["completion interval"];
+    ensure!(intervals.len() == 96, "expected every completed frame");
+    println!(
+        "throughput {:.2} completed frames/s",
+        1000. * intervals.len() as f64 / intervals.iter().sum::<f64>()
+    );
     for (key, mut values) in series {
         values.sort_by(f64::total_cmp);
         println!(
@@ -358,5 +506,124 @@ fn silver_crowd_window_profile() -> Result<()> {
             values[((values.len() - 1) as f64 * 0.95).round() as usize]
         );
     }
+    verify_character_coverage(engine, count)
+}
+
+#[cfg(windows)]
+fn verify_character_coverage(engine: Engine, count: usize) -> Result<()> {
+    // Release the WSI device before opening the offscreen readback device. Keep the last simulated pose.
+    let (world, camera, post, technique, materials, pool) = (
+        engine.world.clone(),
+        engine.camera,
+        engine.post,
+        engine.technique.clone(),
+        engine.materials.clone(),
+        engine.tasks.clone(),
+    );
+    drop(engine);
+    let mut gpu = crate::rhi::Backend::open()?;
+    let mut view = crate::render::SceneExtractor::default().snapshot(
+        &world,
+        camera,
+        [1920, 1080],
+        materials,
+    )?;
+    view.buffer_atomic64 = gpu.buffer_atomic64();
+    view.ray_caps = gpu.ray_capabilities();
+    crate::render::post::Sequence::default().assign(post, &technique, &mut view);
+    let mut graph = technique.build(&view)?;
+    let ids = graph
+        .products()
+        .visibility
+        .context("missing crowd visibility image")?;
+    let size = graph
+        .image_desc(ids)
+        .context("visibility must be an image")?
+        .extent;
+    let bytes = size[0] as usize * size[1] as usize * 8;
+    let readback = graph.resource(
+        "Crowd surface and triangle IDs",
+        crate::rdg::Storage::Buffer {
+            bytes,
+            initial: None,
+        },
+    );
+    graph.pass(
+        "Read crowd visibility",
+        crate::rdg::Op::ReadPixels {
+            image: ids,
+            buffer: readback,
+        },
+    );
+    // ReadPixels keeps the source image's extent. The frame readback exposes four bytes
+    // per output pixel, so give it two output words for each visibility texel.
+    graph.display_extent = Some([size[0] * 2, size[1]]);
+    graph.set_output(readback);
+    let frame = gpu.execute(graph.compile()?, &pool)?;
+    ensure!(
+        frame.pixels.len() == bytes,
+        "incomplete crowd visibility readback"
+    );
+
+    let actors = world.entities.component_owners(SETTING);
+    let owner = |mut id| loop {
+        if actors.binary_search(&id).is_ok() {
+            return Some(id);
+        }
+        id = world.entities.get(&id)?.parent?;
+    };
+    // This scene has ordinary surfaces only. Its cartoon draw registers one visibility ID per snapshot
+    // instance in slot order. A skin can be shared by several parts belonging to the same character.
+    let mut skin_owners = BTreeMap::new();
+    let mut draw_owners = vec![None];
+    for instance in view.scene.instances() {
+        let skin_id = world.entities[&instance.id].skin_binding;
+        let actor = if let Some(id) = skin_id {
+            if let std::collections::btree_map::Entry::Vacant(slot) = skin_owners.entry(id) {
+                let joints = &world.entities[&id]
+                    .skin
+                    .as_ref()
+                    .context("missing crowd skin")?
+                    .joints;
+                let actor = joints
+                    .first()
+                    .and_then(|&j| owner(j))
+                    .context("no character owns this skin")?;
+                ensure!(
+                    joints.iter().all(|&j| owner(j) == Some(actor)),
+                    "skin mixes character skeletons"
+                );
+                slot.insert(actor);
+            }
+            Some(skin_owners[&id])
+        } else {
+            None
+        };
+        draw_owners.push(actor);
+    }
+    let mut visible = BTreeSet::new();
+    let mut pixels = 0usize;
+    for pixel in frame.pixels.chunks_exact(8) {
+        let surface = u32::from_le_bytes(pixel[..4].try_into()?) as usize;
+        if let Some(actor) = draw_owners
+            .get(surface)
+            .context("unknown crowd surface ID")?
+        {
+            visible.insert(*actor);
+            pixels += 1;
+        }
+    }
+    println!(
+        "Visibility after timing: {} of {} characters, {pixels} character pixels in {}×{}",
+        visible.len(),
+        count,
+        size[0],
+        size[1]
+    );
+    ensure!(
+        visible.len() >= count.div_ceil(2) && pixels >= visible.len() * 4,
+        "insufficient character coverage: {} of {count} characters, {pixels} pixels",
+        visible.len()
+    );
     Ok(())
 }

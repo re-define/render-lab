@@ -91,6 +91,10 @@ impl SceneExtractor {
                         _ => return Ok(None),
                     }
                 }
+                EntityWrite::Texture => {
+                    Arc::make_mut(&mut scene.textures)
+                        .insert(id, entity.texture.clone().context("missing texture asset")?);
+                }
                 EntityWrite::Local | EntityWrite::Material => (),
             }
             if matches!(kind, EntityWrite::Inspect | EntityWrite::Local)

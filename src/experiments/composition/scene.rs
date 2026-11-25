@@ -5,7 +5,12 @@ use std::collections::BTreeMap;
 
 // The two procedural scenery generators produce flat static asset references. Keep character
 // skeletons, animation and typed player state in their original world and ID space.
-fn append_scenery(world: &mut World, source: World, layer: &str, offset: Vec3) -> Result<()> {
+pub(super) fn append_scenery(
+    world: &mut World,
+    source: World,
+    layer: &str,
+    offset: Vec3,
+) -> Result<()> {
     let ids: BTreeMap<_, _> = source
         .entities
         .keys()

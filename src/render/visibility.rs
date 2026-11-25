@@ -204,7 +204,7 @@ pub(crate) fn resolve(
             &format!("Shade {name}"),
             Op::ComputeIndirect {
                 program: Dispatch {
-                    shader: Shader::Compute(shader),
+                    shader: Shader::Compute(shader.select(lighting.linear_hdr, name)?),
                     bindings,
                     push: bin.to_ne_bytes().to_vec(),
                 },

@@ -1,6 +1,51 @@
 use super::*;
 use vk::PipelineStageFlags2 as Stage;
 
+use std::ops::Range;
+
+/// A command buffer never straddles a semaphore signal or a vendor call.
+pub(super) struct RecordingLayout {
+    pub chunks: Vec<Range<usize>>,
+    submissions: Vec<(Range<usize>, Range<usize>)>,
+}
+
+pub(super) const MAX_STEPS_PER_COMMAND: usize = 32;
+
+impl RecordingLayout {
+    fn new(
+        runs: Vec<Range<usize>>,
+        steps: usize,
+        workers: usize,
+        vendor: impl Fn(usize) -> bool,
+    ) -> Self {
+        let max_len = steps
+            .div_ceil(workers.saturating_mul(4).max(1))
+            .clamp(1, MAX_STEPS_PER_COMMAND);
+        let mut result = Self {
+            chunks: Vec::new(),
+            submissions: Vec::new(),
+        };
+        for run in runs {
+            let first = result.chunks.len();
+            let mut start = run.start;
+            while start < run.end {
+                let end = if vendor(start) {
+                    start + 1
+                } else {
+                    let limit = (start + max_len).min(run.end);
+                    (start + 1..limit)
+                        .find(|&rank| vendor(rank))
+                        .unwrap_or(limit)
+                };
+                result.chunks.push(start..end);
+                start = end;
+            }
+            result.submissions.push((run, first..result.chunks.len()));
+        }
+        result
+    }
+}
+
 /// A queue run normally shares one signal. Release the next queue at the last
 /// producer it actually consumes; only the independent suffix gets its own batch.
 fn submission_ranges(
@@ -106,11 +151,27 @@ impl Timelines {
         }
         Ok(result)
     }
+    pub fn recording_layout(&self, p: &Plan, workers: usize) -> RecordingLayout {
+        let queue = |step: &Step| physical_queue(p.graph.passes[step.index].queue, self.sems.len());
+        let device_work = |step: &Step| {
+            !matches!(
+                p.graph.passes[step.index].op,
+                Op::HostRead(_) | Op::Counters { .. }
+            )
+        };
+        RecordingLayout::new(
+            submission_ranges(&p.steps, queue, device_work, self.release_ready),
+            p.steps.len(),
+            workers,
+            |rank| matches!(p.graph.passes[p.steps[rank].index].op, Op::Dlss(_)),
+        )
+    }
     pub fn submit(
         &mut self,
         g: &Gpu,
         p: &Plan,
         recorders: &[Recorder],
+        layout: &RecordingLayout,
         resources: &[Physical],
         image: Option<present::Acquired>,
     ) -> Result<Vec<Arc<frame::QueueBatch>>> {
@@ -120,13 +181,7 @@ impl Timelines {
         let mut signals = vec![(0, 0u64); p.steps.len()];
         let mut covered = vec![vec![(0u64, Stage::empty()); g.queues.len()]; g.queues.len()];
         let mut batches = Vec::with_capacity(p.steps.len());
-        let has_device_work = |step: &Step| {
-            !matches!(
-                p.graph.passes[step.index].op,
-                Op::HostRead(_) | Op::Counters { .. }
-            )
-        };
-        for range in submission_ranges(&p.steps, queue, has_device_work, self.release_ready) {
+        for (range, commands) in &layout.submissions {
             let (start, end) = (range.start, range.end);
             let q = queue(&p.steps[start]);
             self.values[q] += 1;
@@ -225,7 +280,7 @@ impl Timelines {
                 waits.push(sem(img.available, 0, Stage::ALL_COMMANDS));
                 signal.push(sem(img.finished, 0, Stage::ALL_COMMANDS));
             }
-            let cmds = recorders[start..end]
+            let cmds = recorders[commands.clone()]
                 .iter()
                 .map(|r| {
                     vk::CommandBufferSubmitInfo::builder()
@@ -247,6 +302,14 @@ impl Timelines {
     }
     pub fn targets(&self) -> Vec<u64> {
         self.values.clone()
+    }
+    pub fn ready(&self, g: &Gpu, values: &[u64]) -> Result<bool> {
+        for (&semaphore, &value) in self.sems.iter().zip(values) {
+            if value != 0 && unsafe { g.dev.get_semaphore_counter_value(semaphore)? } < value {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
     pub fn retire(&self, g: &Gpu, values: &[u64]) -> Result<()> {
         unsafe {
@@ -289,6 +352,28 @@ impl Drop for Timelines {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_chunks_cover_every_pass_without_crossing_signals_or_sdk_calls() {
+        let runs = vec![0..69, 69..121, 121..132];
+        let layout = RecordingLayout::new(runs.clone(), 132, 1, |rank| rank == 41 || rank == 70);
+        assert_eq!(
+            layout.chunks.iter().cloned().flatten().collect::<Vec<_>>(),
+            (0..132).collect::<Vec<_>>()
+        );
+        assert!(
+            layout
+                .chunks
+                .iter()
+                .all(|range| range.len() <= MAX_STEPS_PER_COMMAND)
+        );
+        assert!(layout.chunks.contains(&(41..42)) && layout.chunks.contains(&(70..71)));
+        for ((steps, chunks), run) in layout.submissions.iter().zip(runs) {
+            assert_eq!(*steps, run);
+            assert_eq!(layout.chunks[chunks.start].start, run.start);
+            assert_eq!(layout.chunks[chunks.end - 1].end, run.end);
+        }
+    }
 
     #[test]
     fn signal_after_last_producer_needed_by_the_entire_next_queue_run() {

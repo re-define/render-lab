@@ -4,8 +4,10 @@ pub(super) const MODULE: SceneModule = SceneModule {
     key: SETTING,
     primary: Primary::Visibility,
     restore: None,
-    install: |_world, a| {
-        a.visibility.cluster = true;
+    install: |world, a| {
+        if super::composition::enabled(world, "forest") {
+            a.visibility.clustered();
+        }
         Ok(())
     },
 };
