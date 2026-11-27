@@ -68,34 +68,78 @@ impl Programs {
     }
 }
 
+#[derive(Default)]
+struct SampledFrame {
+    key: Option<(usize, usize, u32)>,
+    rotations: Vec<Option<Quat>>,
+}
+
+/// Two recent frame pairs let a job reuse both clip inputs of overlapping layers.
+#[derive(Default)]
+pub(super) struct SampleCache {
+    frames: [SampledFrame; 2],
+    recent: usize,
+}
+impl SampleCache {
+    fn channels(&mut self, key: (usize, usize, u32), count: usize) -> &mut [Option<Quat>] {
+        if self.frames[self.recent].key != Some(key) {
+            self.recent ^= 1;
+            let entry = &mut self.frames[self.recent];
+            if entry.key != Some(key) {
+                entry.key = Some(key);
+                entry.rotations.clear();
+                entry.rotations.resize(count, None);
+            }
+        }
+        &mut self.frames[self.recent].rotations
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Scratch {
+    pub pose: rig::PoseBuffers,
+    pub clips: SampleCache,
+}
+
 pub(super) fn blend(
-    layer: &RotationLayer,
+    layers: &[RotationLayer],
+    affected: &[usize],
     bank: &SilverMatcher,
     s: &Stage,
     pose: &mut rig::Pose<'_>,
     seconds: f64,
+    cache: &mut SampleCache,
 ) {
-    let envelope = layer.envelope(seconds);
-    if envelope == 0. {
-        return;
-    }
-    // Include the last -> first interval so a looping clip has no one-frame hold.
-    let phase =
-        (seconds * f64::from(HZ) * f64::from(layer.speed)).rem_euclid(layer.frames.len() as f64);
-    let i = phase.floor() as usize;
-    let a = &bank.poses[layer.frames.start + i];
-    let b = &bank.poses[layer.frames.start + (i + 1) % layer.frames.len()];
     let map = s.binding.rig.as_deref().unwrap_or(&profile::DEFAULT.rig);
-    for &(channel, weight) in &layer.channels {
-        let bone = s.rig.corrected[s.rig.source_slots[channel]];
-        let (scale, base, offset) = pose.local[bone].to_scale_rotation_translation();
-        let q = a.rotations[channel].slerp(b.rotations[channel], phase.fract() as f32);
-        let rotation = base
-            .slerp(map.rotation(channel, q), weight * envelope)
-            .normalize();
-        pose.local[bone] = Mat4::from_scale_rotation_translation(scale, rotation, offset);
+    let mut changed = false;
+    for layer in layers {
+        let envelope = layer.envelope(seconds);
+        if envelope == 0. {
+            continue;
+        }
+        changed = true;
+        let phase = (seconds * f64::from(HZ) * f64::from(layer.speed))
+            .rem_euclid(layer.frames.len() as f64);
+        let i = phase.floor() as usize;
+        let a = layer.frames.start + i;
+        let b = layer.frames.start + (i + 1) % layer.frames.len();
+        let fraction = phase.fract() as f32;
+        let sampled = cache.channels((a, b, fraction.to_bits()), bank.channels.len());
+        for &(channel, weight) in &layer.channels {
+            let bone = s.rig.corrected[s.rig.source_slots[channel]];
+            let (scale, base, offset) = pose.local[bone].to_scale_rotation_translation();
+            let q = *sampled[channel].get_or_insert_with(|| {
+                bank.poses[a].rotations[channel].slerp(bank.poses[b].rotations[channel], fraction)
+            });
+            let rotation = base
+                .slerp(map.rotation(channel, q), weight * envelope)
+                .normalize();
+            pose.local[bone] = Mat4::from_scale_rotation_translation(scale, rotation, offset);
+        }
     }
-    pose.forward();
+    if changed {
+        pose.refresh(affected);
+    }
 }
 
 pub(super) fn command(w: &mut World, id: Id, arg: &str) -> Result<String> {

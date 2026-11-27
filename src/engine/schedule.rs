@@ -307,6 +307,7 @@ fn timed<T>(counter: Option<&mut Duration>, work: impl FnOnce() -> T) -> T {
 }
 #[derive(Default)]
 pub struct Schedule {
+    interrupted: bool,
     profiling: bool,
     profile: TickProfile,
     phases: Vec<Phase>,
@@ -314,6 +315,7 @@ pub struct Schedule {
 }
 #[derive(Default)]
 struct Phase {
+    frame_due: Option<f32>,
     entries: Vec<Entry>,
     automatic: bool,
     fixed: Option<FixedStep>,
@@ -466,7 +468,7 @@ impl Schedule {
         self.push_phase(
             systems,
             Some(FixedStep {
-                seconds: step.as_secs_f64(),
+                seconds: clocks::step_seconds(step),
                 remainder: 0.,
                 max_steps,
             }),
@@ -611,29 +613,69 @@ impl Schedule {
     pub fn tick(&mut self, world: &mut Arc<World>, dt: f32, pool: &ThreadPool) -> Result<()> {
         anyhow::ensure!(dt.is_finite() && dt >= 0., "invalid simulation time");
         self.validate()?;
-        let plan = self.compiled.get_mut().unwrap().as_mut().unwrap();
-        plan.reports.take();
         self.profile = TickProfile::default();
-        let profile = &mut self.profile;
-        let enabled = self.profiling;
-        // Credit all fixed domains before work. On a failed earlier domain, retrying
-        // with dt=0 must still advance every subsequent fixed domain to this tick.
+        if self.interrupted {
+            self.finish_tick(world, world.time_seconds(), pool)?;
+            if dt == 0. {
+                return Ok(());
+            }
+        }
+        let end = world.time_seconds() + f64::from(dt);
         for phase in &mut self.phases {
             if let Some(f) = &mut phase.fixed {
                 let elapsed = f.remainder + f64::from(dt);
-                f.remainder = elapsed.min(f.seconds * f64::from(f.max_steps));
-                phase.dropped_seconds += elapsed - f.remainder;
+                let (retained, dropped) = clocks::bounded_debt(elapsed, f.seconds, f.max_steps);
+                f.remainder = retained;
+                phase.dropped_seconds += dropped;
+            } else {
+                phase.frame_due = Some(dt);
             }
         }
-        let mut first = 0;
-        while first < self.phases.len() {
-            let wave = if self
-                .phases
-                .get(first + 1)
-                .is_some_and(clocks::frame_candidate)
-            {
+        self.finish_tick(world, end, pool)
+    }
+
+    fn finish_tick(&mut self, world: &mut Arc<World>, end: f64, pool: &ThreadPool) -> Result<()> {
+        let result = self.dispatch_due(world, end, pool);
+        if world.time_seconds() != end {
+            Arc::make_mut(world).time_seconds = end;
+        }
+        for phase in &self.phases {
+            if let Some(clock) = phase.clock {
+                let clocks = &mut Arc::make_mut(world).clocks;
+                if let Some(slot) = clocks.get_mut(clock.name) {
+                    *slot = phase.checkpoint();
+                } else {
+                    clocks.insert(clock.name.to_owned(), phase.checkpoint());
+                }
+            }
+        }
+        self.interrupted = result.is_err();
+        result
+    }
+
+    fn dispatch_due(&mut self, world: &mut Arc<World>, end: f64, pool: &ThreadPool) -> Result<()> {
+        let plan = self.compiled.get_mut().unwrap().as_mut().unwrap();
+        plan.reports.take();
+        let profile = &mut self.profile;
+        let enabled = self.profiling;
+        let mut last = 0.;
+        while let Some((first, deadline)) = clocks::next_due(&self.phases, end) {
+            // Equal deadlines execute in registration/dependency order even if rounded differently.
+            last = deadline.max(last);
+            if world.time_seconds() != last {
+                Arc::make_mut(world).time_seconds = last;
+            }
+            let candidates = self.phases[first..]
+                .iter()
+                .take_while(|p| p.frame_due.is_some() && clocks::frame_candidate(p))
+                .count();
+            let wave = if candidates > 1 {
                 timed(enabled.then_some(&mut profile.binding), || {
-                    clocks::bind_frame_wave(&self.phases[first..], &mut plan.phases[first..], world)
+                    clocks::bind_frame_wave(
+                        &self.phases[first..first + candidates],
+                        &mut plan.phases[first..first + candidates],
+                        world,
+                    )
                 })?
             } else {
                 0
@@ -648,7 +690,7 @@ impl Schedule {
                             .map(|(phase, segments)| {
                                 phase.entries[0].prepare(
                                     world,
-                                    dt,
+                                    phase.frame_due.expect("pending frame"),
                                     segments[0].bindings.get(&0).map(Arc::as_ref),
                                 )
                             })
@@ -665,36 +707,36 @@ impl Schedule {
                                 enabled.then_some(&mut profile.counts),
                             );
                         }
+                        phase.frame_due = None;
                         phase.completed += 1;
                     }
                 });
-                first += wave;
                 continue;
             }
-            let p = &mut self.phases[first];
-            let (steps, interval) = match &mut p.fixed {
-                Some(f) => ((f.remainder / f.seconds).floor() as u32, f.seconds as f32),
-                None => (1, dt),
-            };
-            for _ in 0..steps {
-                timed(enabled.then_some(&mut profile.binding), || {
-                    p.refresh_membership(world)
-                })?;
-                run_substep(
-                    p,
-                    &mut plan.phases[first],
-                    world,
-                    interval,
-                    pool,
-                    enabled,
-                    profile,
-                )?;
-                if let Some(f) = &mut p.fixed {
-                    f.remainder = (f.remainder - f.seconds).max(0.);
-                }
-                p.completed += 1;
+            let phase = &mut self.phases[first];
+            let interval = phase
+                .fixed
+                .as_ref()
+                .map(|f| f.seconds as f32)
+                .or(phase.frame_due)
+                .expect("due phase");
+            timed(enabled.then_some(&mut profile.binding), || {
+                phase.refresh_membership(world)
+            })?;
+            run_substep(
+                phase,
+                &mut plan.phases[first],
+                world,
+                interval,
+                pool,
+                enabled,
+                profile,
+            )?;
+            if let Some(f) = &mut phase.fixed {
+                f.remainder = (f.remainder - f.seconds).max(0.);
             }
-            first += 1;
+            phase.frame_due = None;
+            phase.completed += 1;
         }
         Ok(())
     }

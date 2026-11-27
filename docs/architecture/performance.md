@@ -173,6 +173,39 @@ cargo test --release --locked --lib silver_crowd_extraction_profile -- --ignored
 Remove-Item Env:RENDER_LAB_POSE_GRAPH, Env:RENDER_LAB_NPCS, Env:RENDER_LAB_SIM_PROFILE
 ```
 
+## 统一世界时间与姿态求值
+
+这次以 `a471298` 的姿态图为基线。两版在同一台 Ryzen 7 9700X、Release、同一组 16 个 worker 上运行，默认图和上半身图各自新建场景。每个配置与基线交错运行五轮，每轮预热 20 帧、采样 96 帧。每个样本推进六个 60 Hz 角色子步，再执行一次 CPU 场景提取。表中为五轮 P95 的中位数，单位为毫秒，箭头左边是基线，右边是当前实现。worker 为所有模拟阶段工作批次的计时，提交属于整段模拟。[逐轮数据](measurements/world-time-pose-eval.csv) · [人群基准](../../src/experiments/motion/silver/contact/crowd_profile.rs)
+
+| 人数 | 配置 | 模拟 P95 | worker 求值 P95 | ECS 提交 P95 | 提取 P95 |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | 默认图 | 0.44 → 0.43 | 0.36 → 0.36 | 0.03 → 0.03 | 0.03 → 0.03 |
+| 1 | 上半身图 | 0.44 → 0.44 | 0.37 → 0.37 | 0.03 → 0.03 | 0.03 → 0.03 |
+| 500 | 默认图 | 24.15 → 23.19 | 9.95 → 9.20 | 8.37 → 8.52 | 7.46 → 7.40 |
+| 500 | 上半身图 | 24.38 → 23.96 | 10.16 → 9.52 | 8.45 → 8.53 | 7.45 → 7.54 |
+
+在这组数据中，500 人默认图和上半身图的工作线程求值 P95 分别减少 0.75 和 0.64 ms。上半身图的整段模拟 P95 减少 0.42 ms，提交与提取各自略有波动。单个角色的结果在 0.01 ms 的报告精度内接近基线。
+
+为了区分图求值和 ECS、物理的成本，另在一个线程上连续求 500 份姿态。每个样本恢复同一份起始局部与世界矩阵。标量参考在每层之后计算全部 31 个绑定关节的世界矩阵，实际执行器每个连续混合组更新 14 个受影响关节。双层测试叠加两个不同片段，测量期间两层均处于满权重窗口。同相用相同小数帧，错相则为角色错开片段相位。每轮交替测量参考与实际实现，预热 20 次、采样 96 次。单位为毫秒。[等价性检查与内核基准](../../src/experiments/motion/silver/contact/rig/evaluation_tests.rs)
+
+| 混合层数 | 播放相位 | 参考 P50 | 新版 P50 | 参考 P95 | 新版 P95 |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | 同相 | 0.350 | 0.239 | 0.370 | 0.254 |
+| 1 | 错相 | 0.390 | 0.382 | 0.401 | 0.392 |
+| 2 | 同相 | 0.698 | 0.441 | 0.723 | 0.463 |
+| 2 | 错相 | 0.699 | 0.623 | 0.718 | 0.651 |
+
+两种内置图的同机位撑栏静帧（640×480，关闭后处理，16 帧预热）分别和基线逐像素相同。内核只测局部混合与矩阵传播，整段模拟还包含动作查询、接触、IK 和 ECS 提交。
+
+```powershell
+cargo test --release --locked --lib silver_masked_evaluation_profile -- --ignored --nocapture --test-threads=1
+$env:RENDER_LAB_SIM_PROFILE = '1'
+$env:RENDER_LAB_NPCS = '500'
+$env:RENDER_LAB_POSE_GRAPH = 'upper'
+cargo test --release --locked --lib silver_crowd_extraction_profile -- --ignored --nocapture --test-threads=1
+Remove-Item Env:RENDER_LAB_POSE_GRAPH, Env:RENDER_LAB_NPCS, Env:RENDER_LAB_SIM_PROFILE
+```
+
 ## 仓库附带的数据
 
 [crowd-frame-metrics.csv](measurements/crowd-frame-metrics.csv) 保留更早一次银狼蒙皮批处理的采样汇总，列包括人数、测试版本、工作负载、样本数、P50、P95 与均值。`current` 是那次测量的对照版本标签。逐线程均值保存在 [npc-threads.csv](measurements/npc-threads.csv)，单位为每完成帧的 CPU 毫秒。复测时请另存提交号、驱动、开关、分辨率及各帧输出。

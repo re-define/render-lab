@@ -206,9 +206,11 @@ impl SimulationSystem for DisplayPose {
         Some(targets)
     }
     fn run(&self, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
-        cx.for_each_parallel_init(&self.actors, rig::PoseBuffers::default, |scratch, s, cx| {
-            evaluate_pose(s, cx, dt, &self.bank, scratch)
-        })
+        cx.for_each_parallel_init(
+            &self.actors,
+            pose_graph::Scratch::default,
+            |scratch, s, cx| evaluate_pose(s, cx, dt, &self.bank, scratch),
+        )
     }
 }
 
@@ -217,11 +219,11 @@ fn evaluate_pose(
     cx: &mut SystemContext<'_>,
     dt: f32,
     bank: &SilverMatcher,
-    scratch: &mut rig::PoseBuffers,
+    scratch: &mut pose_graph::Scratch,
 ) -> Result<()> {
     let r = &s.rig;
     let mut c = s.state(cx)?;
-    let mut pose = r.pose(cx, &c.source, scratch)?;
+    let mut pose = r.pose(cx, &c.source, &mut scratch.pose)?;
     if let (Some(binding), Some(play)) = (&s.action_rig, c.play) {
         binding.apply(&mut pose, c.section, play);
     }
@@ -242,12 +244,19 @@ fn evaluate_pose(
     if s.program.uses_clips {
         c.graph_seconds += f64::from(dt);
     }
+    let mut masks = s.blend_joints.iter();
     for op in s.program.operations() {
         use crate::animation::Operation;
         match op {
-            Operation::Blend(layer) => {
-                pose_graph::blend(layer, bank, s, &mut pose, c.graph_seconds)
-            }
+            Operation::Blend(layer) => pose_graph::blend(
+                layer,
+                masks.next().expect("bound blend run"),
+                bank,
+                s,
+                &mut pose,
+                c.graph_seconds,
+                &mut scratch.clips,
+            ),
             Operation::PhysicalLimbs => {
                 if let Some(layer) = &mut c.physical_pose {
                     Arc::make_mut(layer).apply(

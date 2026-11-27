@@ -1,4 +1,4 @@
-//! Named simulation phases and their saveable clock state.
+//! Per-module tick rates and deadlines on the shared world simulation timeline.
 use super::*;
 use crate::scene::ClockCheckpoint;
 use anyhow::{Context, ensure};
@@ -24,7 +24,7 @@ impl Declaration {
 
     fn step(self, rate: TickRate) -> Result<Option<f64>> {
         match rate {
-            TickRate::Default => Ok(self.default_step.map(|step| step.as_secs_f64())),
+            TickRate::Default => Ok(self.default_step.map(step_seconds)),
             TickRate::Frame => {
                 ensure!(
                     self.default_step.is_none(),
@@ -41,10 +41,32 @@ impl Declaration {
     }
 }
 
+/// Duration stores nanoseconds. Preserve coincident deadlines for common rates such as 30/60 Hz.
+pub(super) fn step_seconds(step: Duration) -> f64 {
+    let seconds = step.as_secs_f64();
+    let hz = seconds.recip().round();
+    if hz >= 1. && Duration::from_secs_f64(hz.recip()) == step {
+        hz.recip()
+    } else {
+        seconds
+    }
+}
+
+/// Skip whole overdue ticks and retain the fractional phase on the world timeline.
+pub(super) fn bounded_debt(elapsed: f64, step: f64, limit: u32) -> (f64, f64) {
+    let steps = elapsed / step;
+    if steps.floor() <= f64::from(limit) {
+        return (elapsed, 0.);
+    }
+    let retained = (f64::from(limit) + steps.fract()) * step;
+    (retained, elapsed - retained)
+}
+
 impl Phase {
-    fn checkpoint(&self) -> ClockCheckpoint {
+    pub(super) fn checkpoint(&self) -> ClockCheckpoint {
         ClockCheckpoint {
             rate: self.rate,
+            pending_frame: self.frame_due,
             pending_seconds: self.fixed.as_ref().map_or(0., |f| f.remainder),
             completed: self.completed,
             dropped_seconds: self.dropped_seconds,
@@ -60,18 +82,24 @@ impl Phase {
         let clock = self.clock.context("expected a named clock")?;
         checkpoint.validate()?;
         let step = clock.step(rate)?;
-        let pending = checkpoint.pending_seconds;
+        let mut pending = checkpoint.pending_seconds;
+        if step.is_some() {
+            ensure!(
+                !restoring || checkpoint.pending_frame.is_none(),
+                "fixed domain has pending frame update"
+            );
+            pending += f64::from(checkpoint.pending_frame.take().unwrap_or(0.));
+        }
         let fixed = if let Some(seconds) = step {
-            let capacity = seconds * f64::from(clock.max_steps);
+            let (remainder, dropped) = bounded_debt(pending, seconds, clock.max_steps);
             if restoring {
                 ensure!(
-                    pending <= capacity,
+                    dropped == 0.,
                     "pending simulation time exceeds {} catch-up limit",
                     clock.name
                 );
             }
-            let remainder = pending.min(capacity);
-            checkpoint.dropped_seconds += pending - remainder;
+            checkpoint.dropped_seconds += dropped;
             Some(FixedStep {
                 seconds,
                 remainder,
@@ -84,6 +112,7 @@ impl Phase {
             checkpoint.dropped_seconds += pending;
             None
         };
+        self.frame_due = checkpoint.pending_frame;
         self.fixed = fixed;
         self.rate = rate;
         self.completed = checkpoint.completed;
@@ -117,7 +146,7 @@ impl Schedule {
         Ok(self.phases.last_mut().unwrap())
     }
 
-    /// Register a module on its own named clock. Its default is one update per simulation tick.
+    /// Register a module with its own cadence on the world timeline. Its default is one update per simulation tick.
     pub fn add_frame_system(&mut self, name: &'static str, system: Arc<dyn System>) -> Result<()> {
         self.named_phase(Declaration {
             name,
@@ -201,8 +230,35 @@ impl Schedule {
                 p.set_clock(cp.rate, cp, true)?;
             }
         }
+        self.interrupted = self.phases.iter().any(|p| {
+            p.frame_due.is_some() || p.fixed.as_ref().is_some_and(|f| f.remainder >= f.seconds)
+        });
         Ok(())
     }
+}
+
+/// Earliest due tick wins. Ties retain the stage order validated by Plan::compile.
+pub(super) fn next_due(phases: &[Phase], end: f64) -> Option<(usize, f64)> {
+    let mut next: Option<(usize, f64)> = None;
+    for (i, phase) in phases.iter().enumerate() {
+        let overdue = if let Some(f) = &phase.fixed {
+            let debt = f.remainder - f.seconds;
+            if debt < -4. * f64::EPSILON * f.remainder {
+                continue;
+            }
+            debt.max(0.)
+        } else if phase.frame_due.is_some() {
+            0.
+        } else {
+            continue;
+        };
+        // Compare offsets before adding the world epoch, which may be much larger than a tick.
+        let tolerance = 4. * f64::EPSILON * overdue.max(1.);
+        if next.is_none_or(|(_, prior)| overdue > prior + tolerance) {
+            next = Some((i, overdue));
+        }
+    }
+    next.map(|(i, overdue)| (i, (end - overdue).max(0.)))
 }
 
 /// Only adjacent single-system frame modules may coalesce across clock boundaries.
@@ -278,6 +334,87 @@ mod tests {
         }
     }
     #[test]
+    fn deadline_order_is_independent_of_the_world_epoch() {
+        let phase = |debt| Phase {
+            fixed: Some(FixedStep {
+                seconds: 0.0005,
+                remainder: debt,
+                max_steps: 8,
+            }),
+            ..Default::default()
+        };
+        let phases = [phase(0.0005), phase(0.001)];
+        for end in [0.1, 1e12] {
+            assert_eq!(next_due(&phases, end).unwrap().0, 1);
+        }
+    }
+
+    #[test]
+    fn capped_ticks_keep_fraction_and_frame_retry_survives_save() -> Result<()> {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct Observe {
+            events: Arc<Mutex<Vec<(f64, f32)>>>,
+            fail: Arc<AtomicBool>,
+        }
+        impl System for Observe {
+            fn update(&self, w: &World, dt: f32) -> Result<Edit> {
+                ensure!(
+                    !self.fail.swap(false, Ordering::Relaxed),
+                    "injected failure"
+                );
+                self.events.lock().unwrap().push((w.time_seconds(), dt));
+                Ok(Box::new(|_| {}))
+            }
+        }
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+        let fixed = Arc::new(Mutex::new(Vec::new()));
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let fail = Arc::new(AtomicBool::new(true));
+        let make = || -> Result<Schedule> {
+            let mut s = Schedule::default();
+            s.add_fixed_system(
+                FixedDomain {
+                    name: "fixed",
+                    step: Duration::from_millis(125),
+                    max_steps: 2,
+                },
+                Arc::new(Observe {
+                    events: fixed.clone(),
+                    fail: Arc::new(false.into()),
+                }),
+            )?;
+            s.add_frame_system(
+                "presentation input",
+                Arc::new(Observe {
+                    events: frames.clone(),
+                    fail: fail.clone(),
+                }),
+            )?;
+            Ok(s)
+        };
+        let mut a = make()?;
+        let mut world = Arc::new(World::default());
+        assert!(a.tick(&mut world, 0.5625, &pool).is_err());
+        assert_eq!(world.time_seconds(), 0.5625);
+        assert_eq!(*fixed.lock().unwrap(), [(0.375, 0.125), (0.5, 0.125)]);
+        let cp = a.checkpoints(&world)["fixed"];
+        assert_eq!((cp.pending_seconds, cp.dropped_seconds), (0.0625, 0.25));
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("clock.json");
+        world.save(&path)?;
+        let mut world = Arc::new(World::load(&path)?);
+        let mut restored = make()?;
+        restored.restore_clocks(&world)?;
+        restored.tick(&mut world, 0.0625, &pool)?;
+        assert_eq!(*frames.lock().unwrap(), [(0.5625, 0.5625), (0.625, 0.0625)]);
+        assert_eq!(fixed.lock().unwrap().last(), Some(&(0.625, 0.125)));
+        Ok(())
+    }
+
+    #[test]
     fn fixed_clock_saves_between_steps_and_reports_catch_up_overflow() -> Result<()> {
         let domain = FixedDomain {
             name: "solver",
@@ -300,12 +437,14 @@ mod tests {
         w.save_with_clocks(&file, &a.checkpoints(&w))?;
         let mut loaded = Arc::new(World::load(&file)?);
         let mut b = make()?;
+        assert_eq!(loaded.time_seconds(), 1. / 64.);
         b.restore_clocks(&loaded)?;
         b.tick(&mut loaded, 1. / 64., &pool)?;
         assert_eq!(b.stages().next().unwrap().1, 1);
         assert_eq!(b.fixed_seconds("solver"), Some(1. / 32.));
         b.tick(&mut loaded, 0.5, &pool)?;
         let state = b.checkpoints(&loaded)["solver"];
+        assert_eq!(loaded.time_seconds(), 0.53125);
         assert_eq!(state.completed, 5);
         assert_eq!(state.pending_seconds, 0.);
         assert_eq!(state.dropped_seconds, 0.375);
@@ -319,6 +458,7 @@ mod tests {
                 rate: TickRate::Hertz(32),
                 pending_seconds: 1. / 64.,
                 completed: 3,
+                pending_frame: None,
                 dropped_seconds: 0.,
             },
         );

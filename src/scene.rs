@@ -284,6 +284,9 @@ impl<'de> Deserialize<'de> for ControlTarget {
 #[derive(Clone, Deserialize)]
 pub struct World {
     version: u32,
+    /// Simulation seconds at the current dispatch, or the accepted boundary between ticks.
+    #[serde(default)]
+    pub(crate) time_seconds: f64,
     #[serde(default)]
     pub(crate) clocks: BTreeMap<String, ClockCheckpoint>,
     #[serde(default)]
@@ -301,6 +304,7 @@ impl Default for World {
     fn default() -> Self {
         Self {
             version: 1,
+            time_seconds: 0.,
             motion_writers: &[],
             clocks: Default::default(),
             control_target: ControlTarget::Automatic,
@@ -311,6 +315,10 @@ impl Default for World {
     }
 }
 impl World {
+    pub fn time_seconds(&self) -> f64 {
+        self.time_seconds
+    }
+
     /// Absent selects the default driver. Explicit null keeps input released, including in archives.
     pub(crate) fn control_selection(&self) -> Option<Option<Id>> {
         match self.control_target {
@@ -342,6 +350,10 @@ impl World {
             self.version == 1,
             "unsupported scene version {}",
             self.version
+        );
+        ensure!(
+            self.time_seconds.is_finite() && self.time_seconds >= 0.,
+            "invalid world simulation time"
         );
         for (name, clock) in &self.clocks {
             ensure!(!name.is_empty(), "empty simulation clock name");

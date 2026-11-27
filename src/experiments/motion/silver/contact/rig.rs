@@ -175,6 +175,20 @@ impl Rig {
             palm_frame: semantics.palm.frame()?,
         })
     }
+    /// Each masked run updates its affected descendants once, in parent-first order.
+    pub fn affected(&self, channels: impl Iterator<Item = usize>) -> Box<[usize]> {
+        let mut dirty = vec![false; self.ids.len()];
+        for channel in channels {
+            for &i in &self.descendants[self.corrected[self.source_slots[channel]]] {
+                dirty[i] = true;
+            }
+        }
+        dirty
+            .iter()
+            .enumerate()
+            .filter_map(|(i, marked)| marked.then_some(i))
+            .collect()
+    }
     pub fn pose<'a>(
         &'a self,
         cx: &SystemContext<'_>,
@@ -220,7 +234,10 @@ impl Pose<'_> {
         }
     }
     fn refresh_subtree(&mut self, joint: usize) {
-        for &i in &self.rig.descendants[joint] {
+        self.refresh(&self.rig.descendants[joint]);
+    }
+    pub fn refresh(&mut self, joints: &[usize]) {
+        for &i in joints {
             self.world[i] =
                 self.rig.parents[i].map_or(self.local[i], |p| self.world[p] * self.local[i]);
         }
@@ -400,3 +417,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod evaluation_tests;

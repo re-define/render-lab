@@ -76,7 +76,8 @@ impl RotationLayer {
 
 #[derive(Debug)]
 pub enum Operation {
-    Blend(RotationLayer),
+    /// Adjacent local-space blends share one world-transform refresh.
+    Blend(Vec<RotationLayer>),
     PhysicalLimbs,
     FootPlacement,
     HandIk,
@@ -189,16 +190,21 @@ impl PoseGraph {
                     uses_clips = true;
                     (
                         input,
-                        Operation::Blend(RotationLayer {
+                        Operation::Blend(vec![RotationLayer {
                             frames,
                             speed: *speed,
                             channels: bound,
                             window: *window,
-                        }),
+                        }]),
                     )
                 }
             };
-            ops.push(op);
+            match (ops.last_mut(), op) {
+                (Some(Operation::Blend(existing)), Operation::Blend(layers)) => {
+                    existing.extend(layers)
+                }
+                (_, op) => ops.push(op),
+            }
             name = next;
         }
         ensure!(
@@ -210,6 +216,11 @@ impl PoseGraph {
                 .collect::<Vec<_>>()
         );
         ops.reverse();
+        for op in &mut ops {
+            if let Operation::Blend(layers) = op {
+                layers.reverse();
+            }
+        }
         Ok(PoseProgram {
             ops,
             uses_clips,

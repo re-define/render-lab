@@ -215,6 +215,7 @@ fn default_grip_fraction() -> f32 {
 }
 
 struct Stage {
+    blend_joints: Vec<Box<[usize]>>,
     program: Arc<crate::animation::PoseProgram>,
     binding: Arc<PoseBinding>,
     actor: Id,
@@ -389,7 +390,25 @@ fn bind_program(
         target: c.target,
         course: c.course,
     });
+    let blend_joints = program
+        .operations()
+        .iter()
+        .filter_map(|op| {
+            if let crate::animation::Operation::Blend(layers) = op {
+                Some(
+                    rig.affected(
+                        layers
+                            .iter()
+                            .flat_map(|l| l.channels.iter().map(|&(channel, _)| channel)),
+                    ),
+                )
+            } else {
+                None
+            }
+        })
+        .collect();
     Ok(Stage {
+        blend_joints,
         program,
         binding,
         actor,

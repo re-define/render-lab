@@ -11,6 +11,8 @@
 
 银狼可以通过 JSON 图继续用 Motion Matching 驱动基础动作，同时在给定时间窗为上半身混合另一段动作。图绑定只读片段、逐通道权重和求值顺序。角色保留自己的图时钟和物理状态，最后一次性发布姿态。UAF 则公开了可扩展的 Trait、求值 VM 和分层插件。Render Lab 当前支持一条显示姿态链和只读片段分支。采样基础动作与惯性化仍封装在角色的准备阶段，尚不能由图作者替换；扩充节点种类也需要改 Rust。下一步可用第二种基础姿态源检验公共的节点和骨架绑定接口。[本引擎姿态图](../algorithms/pose-graphs.md) · [UE 分层插件](https://dev.epicgames.com/documentation/unreal-engine/API/PluginIndex/UAFLayering?application_version=5.8) · [子步交换类型](../../src/movement/character.rs)
 
+Epic 将动画求值表示成 Evaluation Program，由持有骨架绑定、LOD、求值标志和栈的 Evaluation VM 执行。本引擎借鉴了提前编排操作、按绑定缩小实际工作量的思路。具体执行使用单条可变显示姿态、成组的局部混合、绑定期计算的受影响关节和作业内的片段采样缓存。角色时钟与 IK 状态独立，多个角色可以共享同一个程序。[Epic Evaluation VM](https://dev.epicgames.com/documentation/unreal-engine/API/Plugins/UAFAnimGraph/FEvaluationVM?application_version=5.8) · [本引擎求值算法](../algorithms/pose-graphs.md)
+
 ## Mover 与 Chaos 分别提供什么
 
 Mover 将运动模式及其状态封装为可组合的 Actor 移动模块，并可通过 Network Prediction 或 Chaos 网络物理执行回滚重演。Render Lab 的 Move 已按实体分派输入、声明运动写入者，银狼也能在独立移动和物理接触间交接速度。现有调度回滚负责撤销失败子步的本地修改。要做预测重演，还需要按模拟 tick 保存输入、校正状态和重演所需的外部支撑数据。[Epic Mover](https://dev.epicgames.com/documentation/unreal-engine/mover-in-unreal-engine?application_version=5.8) · [实体运动策略](../../src/scene/motion_policy.rs) · [本引擎子步交换](../architecture/character-motion.md)

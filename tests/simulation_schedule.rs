@@ -1050,3 +1050,54 @@ fn following_clock_keeps_its_time_when_an_earlier_domain_fails() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn world_time_interleaves_rates_and_ties_are_dependency_ordered() -> Result<()> {
+    use render_lab::engine::FixedDomain;
+    use std::sync::Mutex;
+    for cadence in [vec![0.125], vec![0.0625, 0.0625]] {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut schedule = Schedule::default();
+        for (name, hz, after) in [("fast", 64., &[][..]), ("slow", 32., &["fast"][..])] {
+            let log = log.clone();
+            schedule.add_fixed_system(
+                FixedDomain {
+                    name,
+                    step: Duration::from_secs_f64(1. / hz),
+                    max_steps: 8,
+                },
+                task(name, after, &[], &[], move |cx, dt| {
+                    assert_eq!(f64::from(dt), 1. / hz);
+                    log.lock()
+                        .unwrap()
+                        .push(((cx.time_seconds() * 64.).round() as u32, name));
+                    Ok(())
+                }),
+            )?;
+        }
+        let pool = ThreadPoolBuilder::new().num_threads(2).build()?;
+        let mut world = Arc::new(World::default());
+        for dt in cadence {
+            schedule.tick(&mut world, dt, &pool)?;
+        }
+        assert_eq!(world.time_seconds(), 0.125);
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                (1, "fast"),
+                (2, "fast"),
+                (2, "slow"),
+                (3, "fast"),
+                (4, "fast"),
+                (4, "slow"),
+                (5, "fast"),
+                (6, "fast"),
+                (6, "slow"),
+                (7, "fast"),
+                (8, "fast"),
+                (8, "slow")
+            ]
+        );
+    }
+    Ok(())
+}

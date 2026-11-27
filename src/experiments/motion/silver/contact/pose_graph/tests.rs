@@ -24,7 +24,7 @@ fn graph_links_validate_types_cycles_masks_and_state_ownership() -> Result<()> {
         unreachable!()
     };
     for (t, expected) in [(0., 0.), (0.75, 0.5), (1.5, 1.), (2.25, 0.5), (2.5, 0.)] {
-        assert_eq!(layer.envelope(t), expected);
+        assert_eq!(layer[0].envelope(t), expected);
     }
     if let Node::MaskedBlend { window, .. } = timed.nodes.get_mut("upper_body").unwrap() {
         *window = Some([1., 0., 2., 2.5]);

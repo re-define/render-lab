@@ -186,6 +186,7 @@ impl World {
         #[derive(Serialize)]
         struct Document<'a> {
             version: u32,
+            time_seconds: f64,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             clocks: &'a BTreeMap<String, super::ClockCheckpoint>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -214,6 +215,7 @@ impl World {
         };
         Document {
             version: self.version,
+            time_seconds: self.time_seconds,
             clocks,
             control_target: self.control_selection(),
             entities,

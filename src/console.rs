@@ -130,7 +130,11 @@ impl Console {
                     };
                     engine.schedule.set_tick_rate(name, rate)?;
                 }
-                return Ok(engine.schedule.describe_clocks());
+                return Ok(format!(
+                    "World {:.6} s · {}",
+                    engine.world.time_seconds(),
+                    engine.schedule.describe_clocks()
+                ));
             }
             "schedule" => {
                 match arg {

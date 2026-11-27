@@ -144,6 +144,11 @@ impl<'w> SystemContext<'w> {
             changes: Vec::new(),
         }
     }
+    /// End of this system tick on the world simulation timeline, including in nested jobs.
+    pub fn time_seconds(&self) -> f64 {
+        self.world.time_seconds()
+    }
+
     pub(super) fn finish(self) -> Vec<Change> {
         self.changes
     }
@@ -178,14 +183,22 @@ impl<'w> SystemContext<'w> {
             return Ok(());
         }
         let (world, access, targets) = (self.world, self.access, self.targets);
+        // Keep several independent chunks per worker and one ordered edit buffer per chunk.
+        let grain = items
+            .len()
+            .div_ceil(4 * rayon::current_num_threads())
+            .clamp(1, 16);
         let batches = items
-            .par_iter()
-            .map_init(init, |scratch, item| {
+            .par_chunks(grain)
+            .map_init(init, |scratch, chunk| {
                 let mut child = SystemContext::new(world, access, targets);
-                f(scratch, item, &mut child)?;
+                for item in chunk {
+                    f(scratch, item, &mut child)?;
+                }
                 Ok(child.finish())
             })
             .collect::<Result<Vec<_>>>()?;
+        self.changes.reserve(batches.iter().map(Vec::len).sum());
         self.changes.extend(batches.into_iter().flatten());
         Ok(())
     }
