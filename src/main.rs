@@ -35,6 +35,9 @@ fn main() -> Result<()> {
         engine.camera.pitch = 0.48;
         engine.camera.distance *= 0.59;
     }
+    engine
+        .audio
+        .set_scene_cues(matches!(output, Output::Window { benchmark: None }));
     let mut console = render_lab::console::Console::default();
     if experiment == "forest-karst" {
         console.execute(&mut engine, &[], "post taa")?;

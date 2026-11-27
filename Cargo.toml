@@ -23,6 +23,8 @@ serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
 tempfile = "3"
 vulkanalia = { version = "0.35", features = ["libloading"] }
+rodio = { version = "0.21.1", default-features = false, features = ["playback"] }
+hound = "3.5.1"
 
 [build-dependencies]
 cc = "1"

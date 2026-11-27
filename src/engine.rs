@@ -69,6 +69,7 @@ pub struct Engine {
     pub post: post::Settings,
     dlss_unavailable: Option<String>,
     pub ray_caps: crate::rhi::RayCapabilities,
+    pub audio: crate::audio::Audio,
     pub schedule: Schedule,
     pub movement: MovementControls,
     pub technique: Arc<dyn Technique>,
@@ -116,6 +117,7 @@ impl Engine {
             post: Default::default(),
             dlss_unavailable: device.dlss_unavailable,
             ray_caps: device.ray_caps,
+            audio: Default::default(),
             schedule: Schedule::default(),
             movement: Default::default(),
             technique,
@@ -168,6 +170,7 @@ impl Engine {
             );
         }
         let started = std::time::Instant::now();
+        self.audio.update();
         self.schedule.tick(&mut self.world, dt, &self.tasks)?;
         self.tick_id += 1;
         let pending_reports = self.pipeline.completions().full(false)

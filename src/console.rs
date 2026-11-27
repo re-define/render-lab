@@ -14,6 +14,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::{path::Path, sync::Arc};
+mod audio;
 mod lights;
 mod memory;
 mod object;
@@ -23,6 +24,7 @@ const HELP: &str = concat!(
     " · post view motion/reprojection/off · stats · schedule [profile on/off] · tick [MODULE HZ/frame/default] · memory idle/alloc/driver [NAME or #OWNER]",
     " · light list/point/sun/move/aim/power/color/enable/angular-radius · import/save/load PATH · lod PIXELS",
     " · lodview on/off · vegetation auto/triangles/voxels/pixels/wind/time/view/camera",
+    " · audio status/play/stop/volume/cues",
     " · hair status/wind/stiffness/head/view/reset",
     " · control [ENTITY] · drive SIDE FORWARD · motion SPEED TURN [STRAFE] · motionroot controller/clip · motionsearch kd/scan · motionbudget N/off · record PATH · stoprecord",
     " · contact status/physics/auto/manual/target/hand/grip/limbs/feet/view/action/graph · contact mode free/contact · contact gravity G · contact impulse J · contact spin DEG/S",
@@ -53,6 +55,11 @@ impl Default for Console {
     }
 }
 impl Console {
+    pub fn toggle_pause(&mut self, engine: &mut Engine) {
+        self.paused = !self.paused;
+        engine.audio.set_paused(self.paused);
+    }
+
     pub fn execute(
         &mut self,
         engine: &mut Engine,
@@ -69,6 +76,7 @@ impl Console {
                 crate::rhi::timeline::export(passes, Path::new(arg))?;
                 return Ok(format!("GPU timeline saved to {arg}"));
             }
+            "audio" => return audio::command(&mut engine.audio, arg),
             "object" => return object::command(engine, arg),
             "memory" => return memory::describe(engine.last_memory().as_ref(), arg),
             "drive" => {
@@ -167,7 +175,7 @@ impl Console {
                 engine.camera = Camera::fit(&engine.world)?;
                 engine.post.reset();
             }
-            "pause" => self.paused = !self.paused,
+            "pause" => self.toggle_pause(engine),
             "rdg" => self.show_graph = !self.show_graph,
             "hud" => {
                 self.show_hud = match arg {

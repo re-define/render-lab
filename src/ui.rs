@@ -460,7 +460,7 @@ impl Render for Studio {
                     self.console.paused,
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.console.paused = !this.console.paused;
+                    this.console.toggle_pause(&mut this.engine);
                     cx.notify();
                 })),
             )

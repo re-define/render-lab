@@ -7,6 +7,7 @@ flowchart TD
     Input["GPUI 输入、CLI、存档"] --> Main["主线程 · ECS 与模拟时钟"]
     Main -->|移动意图| Action["Move、动画、物理、接触 IK"]
     Action -->|子步提交| Main
+    Main -->|命令试听或已施加冲量| Audio["二维音效 · 设备混音与播放"]
     Main -->|准入成功| Extract["增量提取 · 共享场景快照"]
     Extract --> Render["渲染线程 · 视图、历史、实验装配的 Technique"]
     Render --> Light["可组合光照 · 表面、直接光、滤波、GI、IBL"]
@@ -35,6 +36,7 @@ flowchart TD
 | --- | --- |
 | [scene](../../src/scene.rs) 与 [import](../../src/import.rs) | 世界持有稳定 ID、父子关系、局部矩阵、组件与共享资产。导入器将 glTF 转换成同一套实体引用；场景存档使用 JSON。 |
 | [movement](../../src/movement.rs) 与 [physics](../../src/physics.rs) | Move 接收目标或根运动提议，按实体策略确定最终位姿的写入者。物理维护质量、动量和支撑，角色实验将实际支撑反馈给动画。 |
+| [audio](audio.md) | 主线程管理共享 WAV 片段和播放 ID，按需打开输出设备。设备按采样时钟混音，场景替换时统一停止旧声音。 |
 | [experiments](../../src/experiments/assembly.rs) | 模块声明系统、根运动提供者、材质或主渲染技术。建场和读档走同一套装配规则。候选世界完成恢复、能力检查、时钟和实体绑定后才替换活动场景。 |
 | [render](../../src/render.rs) | 提取器发布与模拟解耦的数据。常规光栅使用可见性缓冲，材质选择着色程序。照明、光追、后处理由实验技术构图；专用光追实验可单独提供主技术。 |
 | [rdg](../../src/rdg.rs) | 接收 pass、资源、历史和外部效果声明，检查读写，裁剪对输出无贡献的工作，编译队列依赖和资源屏障。 |

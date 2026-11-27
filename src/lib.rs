@@ -1,4 +1,5 @@
 pub mod animation;
+pub mod audio;
 pub mod console;
 pub mod engine;
 pub mod experiments;

@@ -43,7 +43,15 @@ pub(super) fn command(engine: &mut Engine, args: &str) -> Result<String> {
         };
         let j = Vec3::new(x.parse()?, y.parse()?, z.parse()?);
         Arc::make_mut(&mut engine.world).apply_body_impulse(id, j, point)?;
-        return Ok(format!("Entity {id} · impulse {j:?} N·s"));
+        let mut reply = format!("Entity {id} · impulse {j:?} N·s");
+        if j != Vec3::ZERO {
+            match engine.audio.scene_impact() {
+                Ok(Some(voice)) => reply.push_str(&format!(" · audio voice {voice}")),
+                Err(err) => reply.push_str(&format!(" · sound unavailable ({err:#})")),
+                Ok(None) => {}
+            }
+        }
+        return Ok(reply);
     }
     let mut next_body = None;
     let next_policy = match tail {

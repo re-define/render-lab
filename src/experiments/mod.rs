@@ -112,6 +112,7 @@ pub fn replace(engine: &mut Engine, mut world: World) -> Result<()> {
     world.validate()?;
     SceneConfiguration::restore(&mut world)?;
     let prepared = SceneConfiguration::prepare(&world, &engine.tasks, engine.ray_caps)?;
+    engine.audio.stop_all();
     engine.world = Arc::new(world);
     prepared.apply(engine);
     Ok(())

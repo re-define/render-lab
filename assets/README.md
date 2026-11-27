@@ -14,6 +14,10 @@
 | [Rock Face 03](environments/rock_face_03_diff_1k.jpg) | Dario Barresi 摄影，Rico Cilliers 处理，Poly Haven，CC0。用于岩壁反照率。[来源](https://polyhaven.com/a/rock_face_03) |
 | [Rocky Terrain](environments/rocky_terrain_diff_1k.jpg) | Amal Kumar，Poly Haven，CC0。用于林地反照率。[来源](https://polyhaven.com/a/rocky_terrain) |
 
+## 音效
+
+[撞击音](audio/impact.wav)为本仓库合成的短音，由衰减振荡和噪声组成。格式是 24 kHz 单声道 16 位 PCM，时长 240 毫秒，用于刚体冲量反馈和控制台试听。
+
 ## 动作与纹理数据
 
 `motion/source` 保存 39 段 SOMA 源动作。`motion/bank.json`、`poses.bin`、`search.json` 用于银狼检索和重定向，`motion/traversal` 存放另行生成的跳跃、翻越和钻行动作。生成器使用 NVIDIA Kimodo-SOMA-RP-v1.2。[项目](https://github.com/nv-tlabs/kimodo) · [模型说明及许可](https://huggingface.co/nvidia/Kimodo-SOMA-RP-v1.2) · [引擎中的使用方式](../docs/algorithms/animation-physics.md)
