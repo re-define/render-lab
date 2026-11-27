@@ -1,5 +1,5 @@
 use super::{Edit, SimulationData, SystemAccess, TransformTargets};
-use crate::scene::{Id, LocalPose, PoseLayout, Stored, World};
+use crate::scene::{Field, Id, LocalPose, PoseLayout, Stored, World};
 use anyhow::{Context, Result, ensure};
 use glam::Mat4;
 use serde::{Serialize, de::DeserializeOwned};
@@ -21,6 +21,23 @@ pub(super) enum Change {
         std::sync::Arc<dyn std::any::Any + Send + Sync>,
     ),
     Whole(Edit),
+}
+
+pub(super) enum Undo {
+    Field(Id, &'static str, Option<Field>),
+    Other(Edit),
+}
+impl Undo {
+    pub fn restore(self, world: &mut World) {
+        match self {
+            Self::Field(id, key, Some(value)) => {
+                world.entities.replace_field(id, key, value);
+                world.binding_changed(key);
+            }
+            Self::Field(id, key, None) => world.remove_typed_component(id, key),
+            Self::Other(revert) => revert(world),
+        }
+    }
 }
 
 impl Change {
@@ -52,7 +69,7 @@ impl Change {
                     }
                 })
             }
-            Self::Component(id, key, _) => Box::new(world.restore_component_on_rollback(*id, key)?),
+            Self::Component(..) => unreachable!("field swaps retain the previous value"),
             Self::Resource(key, _) => {
                 let key = *key;
                 let old = world.simulation_resources.get(key).cloned();
@@ -71,13 +88,13 @@ impl Change {
             }
         })
     }
-    pub(super) fn apply(self, world: &mut World, undo: Option<&mut Vec<Edit>>) {
+    pub(super) fn apply(self, world: &mut World, undo: Option<&mut Vec<Undo>>) {
         self.apply_timed(world, undo, None, None);
     }
     pub(super) fn apply_timed(
         self,
         world: &mut World,
-        undo: Option<&mut Vec<Edit>>,
+        undo: Option<&mut Vec<Undo>>,
         capture: Option<&mut std::time::Duration>,
         mut counts: Option<&mut super::CommitCounts>,
     ) {
@@ -90,11 +107,38 @@ impl Change {
                 _ => {}
             }
         }
+        if let Self::Component(id, key, update) = self {
+            let started = if undo.is_some() {
+                capture.as_ref().map(|_| std::time::Instant::now())
+            } else {
+                None
+            };
+            let binding = !matches!(update, ComponentUpdate::State(_));
+            let field = match update {
+                ComponentUpdate::Raw(v) => Field::Json(v),
+                ComponentUpdate::State(v) | ComponentUpdate::Binding(v) => Field::typed(v),
+            };
+            if let Some(old) = world.entities.replace_field(id, key, field) {
+                if binding {
+                    world.binding_changed(key);
+                }
+                if let Some(undo) = undo {
+                    undo.push(Undo::Field(id, key, old));
+                    if let (Some(total), Some(started)) = (capture, started) {
+                        *total += started.elapsed();
+                    }
+                    if let Some(c) = counts {
+                        c.undo_records += 1;
+                    }
+                }
+            }
+            return;
+        }
         if let Some(undo) = undo
             && let Some(edit) =
                 super::timed(capture, || self.capture_undo(world, counts.as_deref_mut()))
         {
-            undo.push(edit);
+            undo.push(Undo::Other(edit));
             if let Some(c) = counts {
                 c.undo_records += 1;
             }
@@ -104,17 +148,7 @@ impl Change {
             Self::PublishedPose(owner, layout, locals) => {
                 world.entities.publish_pose(owner, layout, locals)
             }
-            Self::Component(id, key, update) => match update {
-                ComponentUpdate::Raw(value) => {
-                    world.set_setting_if_present(id, key, value);
-                }
-                ComponentUpdate::Binding(value) => {
-                    world.set_stored_if_present(id, key, value, true);
-                }
-                ComponentUpdate::State(value) => {
-                    world.set_stored_if_present(id, key, value, false);
-                }
-            },
+            Self::Component(..) => unreachable!(),
             Self::Resource(key, value) => {
                 world.simulation_resources.insert(key, value);
             }

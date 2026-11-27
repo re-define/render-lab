@@ -795,7 +795,7 @@ fn run_substep(
     if result.is_err() {
         timed(enabled.then_some(&mut profile.rollback), || {
             for revert in undo.into_iter().rev() {
-                revert(Arc::make_mut(world));
+                revert.restore(Arc::make_mut(world));
             }
         });
     }

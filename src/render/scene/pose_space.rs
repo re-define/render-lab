@@ -116,7 +116,8 @@ impl PoseSpace {
         if dirty.is_empty() {
             return 0;
         }
-        let matrices = Arc::make_mut(matrices);
+        let mut writable = None;
+        let mut destination = Some(matrices);
         let mut end = 0;
         let mut inspected = 0;
         // Local edit slots and their pose node indices are both in transform preorder.
@@ -134,7 +135,9 @@ impl PoseSpace {
                 }
                 for &j in &self.joints[n.joints.clone()] {
                     inspected += 1;
-                    matrices[j] = next * inverse[j];
+                    let output =
+                        writable.get_or_insert_with(|| Arc::make_mut(destination.take().unwrap()));
+                    output[j] = next * inverse[j];
                 }
                 self.nodes[i].relative = next;
             }

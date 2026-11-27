@@ -294,9 +294,21 @@ pub fn register(materials: &mut MaterialPrograms) -> Result<()> {
     }
     Ok(())
 }
+enum Payload {
+    Source(Arc<Vec<u8>>),
+    Derived(Arc<[u8]>),
+}
+impl AsRef<[u8]> for Payload {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Source(v) => v,
+            Self::Derived(v) => v,
+        }
+    }
+}
 pub struct Gaussian {
     id: Id,
-    blob: Option<Arc<Vec<u8>>>,
+    blob: Option<Payload>,
     atlas: AtlasCache,
 }
 impl Gaussian {
@@ -315,20 +327,29 @@ impl Gaussian {
         let layout = Layout::read(data)?;
         let blob = match settings.mode {
             Mode::Original => None,
-            Mode::Tile => Some(data.clone()),
-            Mode::Bvh => Some(Arc::new(bvh::Tree::build(data, &layout)?.bytes)),
-            Mode::CompactTile | Mode::CompactBvh => Some(Arc::new(compact::build(
+            Mode::Tile => Some(Payload::Source(data.clone())),
+            mode => Some(Payload::Derived(crate::assets::cooked_bytes(
+                mode.program(),
+                1,
                 data,
-                &layout,
-                settings.mode == Mode::CompactBvh,
+                || {
+                    let bytes = match mode {
+                        Mode::Bvh => bvh::Tree::build(data, &layout)?.bytes,
+                        Mode::CompactTile | Mode::CompactBvh => {
+                            compact::build(data, &layout, mode == Mode::CompactBvh)?
+                        }
+                        Mode::Scan => {
+                            let mut scan = data[..32 + 40 * layout.count as usize].to_vec();
+                            scan[..4].copy_from_slice(b"G2S1");
+                            scan[12..16].fill(0);
+                            scan[20..32].fill(0);
+                            scan
+                        }
+                        Mode::Original | Mode::Tile => unreachable!(),
+                    };
+                    Ok(bytes.into())
+                },
             )?)),
-            Mode::Scan => {
-                let mut scan = data[..32 + 40 * layout.count as usize].to_vec();
-                scan[..4].copy_from_slice(b"G2S1");
-                scan[12..16].fill(0);
-                scan[20..32].fill(0);
-                Some(Arc::new(scan))
-            }
         };
         Ok(Self {
             id: settings.texture,
@@ -342,7 +363,7 @@ impl Technique for Gaussian {
         let payloads = self
             .blob
             .as_ref()
-            .map(|v| (self.id, v.as_slice()))
+            .map(|v| (self.id, v.as_ref()))
             .into_iter()
             .collect::<BTreeMap<_, _>>();
         let atlas = self

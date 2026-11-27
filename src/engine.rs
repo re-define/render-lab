@@ -65,6 +65,8 @@ pub struct Engine {
     pub materials: Arc<crate::render::MaterialPrograms>,
     pub(crate) window: Option<isize>,
     pub world: Arc<World>,
+    pub world_stream: Option<crate::scene::partition::Runtime>,
+    pub streaming_sources: Vec<glam::Vec3>,
     pub camera: Camera,
     pub post: post::Settings,
     dlss_unavailable: Option<String>,
@@ -108,10 +110,13 @@ impl Engine {
                 .build()?,
         );
         let (pipeline, device) = Pipeline::start(&tasks)?;
+        let extraction = SceneExtractor::default().with_pose_workers(tasks.clone());
         Ok(Self {
             capture_viewport: false,
             window: None,
             materials: Default::default(),
+            world_stream: crate::scene::partition::Runtime::new(&world)?,
+            streaming_sources: Vec::new(),
             world: Arc::new(world),
             camera: Camera::default(),
             post: Default::default(),
@@ -128,7 +133,7 @@ impl Engine {
             tick_id: 0,
             snapshot_id: 0,
             skipped: 0,
-            extraction: SceneExtractor::default(),
+            extraction,
         })
     }
     /// Save committed component state and the clock phase needed to resume at the next substep.
@@ -171,6 +176,12 @@ impl Engine {
         }
         let started = std::time::Instant::now();
         self.audio.update();
+        if let Some(partition) = &mut self.world_stream {
+            self.streaming_sources.push(self.camera.eye());
+            let update = partition.update(&mut self.world, &self.streaming_sources);
+            self.streaming_sources.pop();
+            update?;
+        }
         self.schedule.tick(&mut self.world, dt, &self.tasks)?;
         self.tick_id += 1;
         let pending_reports = self.pipeline.completions().full(false)

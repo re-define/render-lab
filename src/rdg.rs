@@ -202,6 +202,11 @@ pub enum Op {
         args: Resource,
         offset: u64,
     },
+    CopyStreamPage {
+        src: Resource,
+        dst: Resource,
+        bytes: usize,
+    },
     ReadPixels {
         image: Resource,
         buffer: Resource,
@@ -308,6 +313,9 @@ impl Op {
                 }
             }
             Self::ComputeIndirect { args, .. } => out.push((args, Access::Indirect)),
+            Self::CopyStreamPage { src, dst, .. } => {
+                out.extend([(src, Access::CopySrc), (dst, Access::CopyDst)])
+            }
             Self::ReadPixels { image, buffer } => {
                 out.extend([(image, Access::CopySrc), (buffer, Access::CopyDst)])
             }
@@ -465,6 +473,15 @@ pub struct Graph {
     pub(crate) local_buffers: BTreeSet<Resource>,
     /// A frame-local work buffer keeps its allocation by name and owner across retired frames.
     pub(crate) scratch_owners: std::collections::BTreeMap<Resource, u64>,
+    pub(crate) stream_roots: BTreeSet<Resource>,
+    pub(crate) physical_pages: std::collections::BTreeMap<Resource, Arc<crate::streaming::Lease>>,
+    pub(crate) upload_sources: std::collections::BTreeMap<
+        Resource,
+        (crate::streaming::Upload, Arc<crate::streaming::Lease>),
+    >,
+    pub(crate) page_copies: Vec<(usize, Arc<crate::streaming::CopyTicket>)>,
+    pub(crate) stream_feedback:
+        std::collections::BTreeMap<Resource, Arc<std::sync::atomic::AtomicU32>>,
     pub(crate) resident_inputs: BTreeSet<Resource>,
     pub resources: Vec<(String, Storage)>,
     pub passes: Vec<Pass>,
@@ -578,6 +595,11 @@ impl Graph {
             display_extent: None,
             local_buffers: Default::default(),
             scratch_owners: Default::default(),
+            stream_roots: Default::default(),
+            physical_pages: Default::default(),
+            upload_sources: Default::default(),
+            page_copies: vec![],
+            stream_feedback: Default::default(),
             resident_inputs: Default::default(),
             resources: vec![],
             passes: vec![],
@@ -593,7 +615,9 @@ impl Graph {
         matches!(
             self.resources.get(resource.0),
             Some((_, Storage::Buffer { .. }))
-        ) && !self.histories.contains_key(&resource)
+        ) && !self.physical_pages.contains_key(&resource)
+            && !self.upload_sources.contains_key(&resource)
+            && !self.histories.contains_key(&resource)
             && !self.resident_inputs.contains(&resource)
             && !self.tables.contains_key(&resource)
             && !self.cluster_caches.contains_key(&resource)
@@ -628,6 +652,39 @@ impl Graph {
     pub fn resource(&mut self, name: &str, storage: Storage) -> Resource {
         let r = Resource(self.resources.len());
         self.resources.push((name.into(), storage));
+        r
+    }
+    pub(crate) fn physical_page(&mut self, lease: Arc<crate::streaming::Lease>) -> Resource {
+        if let Some((r, _)) = self
+            .physical_pages
+            .iter()
+            .find(|(_, l)| Arc::ptr_eq(l, &lease))
+        {
+            return *r;
+        }
+        let r = self.resource(
+            "Stream page",
+            Storage::Buffer {
+                bytes: crate::streaming::PAGE_BYTES,
+                initial: Some(Arc::from([])),
+            },
+        );
+        self.physical_pages.insert(r, lease);
+        r
+    }
+    pub(crate) fn upload_page(
+        &mut self,
+        source: crate::streaming::Upload,
+        page: Arc<crate::streaming::Lease>,
+    ) -> Resource {
+        let r = self.resource(
+            "Stream upload",
+            Storage::Buffer {
+                bytes: source.bytes(),
+                initial: Some(Arc::from([])),
+            },
+        );
+        self.upload_sources.insert(r, (source, page));
         r
     }
     pub fn input(&mut self, name: &str, data: Vec<u8>) -> Resource {
@@ -763,7 +820,10 @@ impl Graph {
             Op::Counters { .. } => PassPhase::Counters,
             Op::Present(_) => PassPhase::Present,
             Op::Dlss(_) => PassPhase::Post,
-            Op::HostRead(_) | Op::WritePixels { .. } | Op::ReadPixels { .. } => PassPhase::Transfer,
+            Op::CopyStreamPage { .. }
+            | Op::HostRead(_)
+            | Op::WritePixels { .. }
+            | Op::ReadPixels { .. } => PassPhase::Transfer,
         };
         self.pass_in(phase, name, op)
     }

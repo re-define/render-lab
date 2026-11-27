@@ -400,7 +400,8 @@ fn named_domain_interleaves_plugins_and_rolls_back_an_entire_failed_step() -> Re
                     assert!(
                         measured.evaluate > Duration::ZERO
                             && measured.capture_undo > Duration::ZERO
-                            && measured.rollback > Duration::ZERO
+                            && measured.rollback > Duration::ZERO,
+                        "failed step profile {measured:?}"
                     );
                     assert!(fail && !world.entities[&id].components.contains_key("path"));
                     sched.tick(&mut world, 0., &pool)?;

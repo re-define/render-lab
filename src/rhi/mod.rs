@@ -38,6 +38,8 @@ use std::{
 use vulkanalia::{prelude::v1_4::*, vk::ExtDescriptorHeapExtensionDeviceCommands};
 
 enum Physical {
+    #[cfg(lab_directstorage)]
+    External(crate::streaming::directstorage::Imported),
     Vacant,
     Buffer(Buffer),
     SharedBuffer(Arc<Buffer>),
@@ -259,6 +261,10 @@ pub struct Backend {
     pending: VecDeque<Submitted>,
     completed: VecDeque<Frame>,
     pipes: HashMap<(Shader, usize), Pipeline>,
+    page_retirement: std::sync::mpsc::Sender<(u64, usize)>,
+    retired_pages: std::sync::mpsc::Receiver<(u64, usize)>,
+    stream_roots: std::collections::BTreeSet<(usize, u32)>,
+    stream_pages: HashMap<(u64, usize), (Weak<crate::streaming::Lease>, Arc<Buffer>)>,
     resident: HashMap<(usize, u32), ResidentBuffer>,
     paged_assets: HashMap<(usize, u32), Weak<Buffer>>,
     static_blas: ray::StaticCache,
@@ -306,6 +312,9 @@ impl Backend {
     pub fn ray_capabilities(&self) -> RayCapabilities {
         self.gpu.ray_caps
     }
+    pub(crate) fn stream_adapter(&self) -> Option<[u8; 8]> {
+        self.gpu.stream_adapter
+    }
     pub fn buffer_atomic64(&self) -> bool {
         self.gpu.buffer_atomic64
     }
@@ -330,12 +339,17 @@ impl Backend {
         }
         let slots = [FrameSlot::new(&gpu, 0)?, FrameSlot::new(&gpu, 1)?];
         let timelines = queues::Timelines::new(&gpu)?;
+        let (page_retirement, retired_pages) = std::sync::mpsc::channel();
         Ok(Self {
             gpu,
             slots,
             pending: VecDeque::new(),
             completed: VecDeque::new(),
             pipes: HashMap::new(),
+            page_retirement,
+            retired_pages,
+            stream_pages: HashMap::new(),
+            stream_roots: Default::default(),
             resident: HashMap::new(),
             paged_assets: HashMap::new(),
             static_blas: Default::default(),
@@ -361,6 +375,7 @@ impl Backend {
         index: usize,
         reuse: &transient::Reuse,
     ) -> Result<UploadBytes> {
+        self.prune_stream_pages();
         let g = &self.gpu;
         let graph = &plan.graph;
         let slot = &mut self.slots[index];
@@ -455,6 +470,7 @@ impl Backend {
         let mut skin_pose_bytes = 0;
         let mut table_bytes = 0;
         let mut pooled = HashMap::<usize, Arc<Buffer>>::new();
+
         self.static_blas.prune();
         let resident_source = |r: Resource| match &graph.resources[r.0].1 {
             Storage::Buffer { initial, .. }
@@ -505,7 +521,78 @@ impl Backend {
             if ray_vertices.contains(&Resource(i)) {
                 usage |= vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
             }
-            let shared = if let Some(cache) = graph.cluster_caches.get(&resource) {
+            let shared = if let Some(page) = graph.physical_pages.get(&resource) {
+                page.retirement.get_or_init(|| self.page_retirement.clone());
+                let entry = self.stream_pages.entry((page.pool, page.slot));
+                let pair = match entry {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        ensure!(
+                            !page.complete.load(std::sync::atomic::Ordering::Acquire),
+                            "resident stream page belongs to another Vulkan device"
+                        );
+                        match Buffer::device(
+                            g,
+                            crate::streaming::PAGE_BYTES as u64,
+                            usage,
+                            Class::StreamPage.named(name),
+                        ) {
+                            Ok(buffer) => e.insert((Arc::downgrade(page), Arc::new(buffer))),
+                            Err(err)
+                                if err.is::<memory::BudgetExceeded>()
+                                    || err.downcast_ref::<vk::ErrorCode>()
+                                        == Some(&vk::ErrorCode::OUT_OF_DEVICE_MEMORY) =>
+                            {
+                                let _ = page.failure.set(
+                                    crate::streaming::UploadFailure::Capacity(err.to_string()),
+                                );
+                                slot.resources[i] = Physical::Vacant;
+                                slot.heap.slots[i] = None;
+                                continue;
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
+                };
+                pair.0 = Arc::downgrade(page);
+                Some(pair.1.clone())
+            } else if let Some((source, lease)) = graph.upload_sources.get(&resource) {
+                if lease.failure.get().is_some() {
+                    slot.resources[i] = Physical::Vacant;
+                    slot.heap.slots[i] = None;
+                    continue;
+                }
+                match source {
+                    #[cfg(lab_directstorage)]
+                    crate::streaming::Upload::Direct(page) => {
+                        slot.resources[i] = match page.import(g.dev.handle()) {
+                            Ok(import) => Physical::External(import),
+                            Err(e) => {
+                                let _ = lease
+                                    .failure
+                                    .set(crate::streaming::UploadFailure::Import(e.to_string()));
+                                Physical::Vacant
+                            }
+                        };
+                        slot.heap.slots[i] = None;
+                        continue;
+                    }
+                    crate::streaming::Upload::Host(data) => {
+                        let mut b = Buffer::new(
+                            g,
+                            source.bytes() as u64,
+                            usage,
+                            false,
+                            Class::Transient.named("Stream staging"),
+                        )?;
+                        b.mapped(|v| {
+                            v[..source.bytes()].copy_from_slice(data);
+                            Ok(())
+                        })?;
+                        Some(Arc::new(b))
+                    }
+                }
+            } else if let Some(cache) = graph.cluster_caches.get(&resource) {
                 let Physical::Clusters(owner) = &slot.resources[cache.output.0] else {
                     anyhow::bail!("CLAS version table requires its preceding triangle allocation")
                 };
@@ -539,7 +626,7 @@ impl Backend {
                 };
                 Some(entry.clone())
             } else if let Some(&leader) = reuse.groups.get(&resource) {
-                let Storage::Buffer { bytes, .. } = *s else {
+                let Storage::Buffer { bytes, .. } = graph.resources[leader.0].1 else {
                     unreachable!()
                 };
                 let buffer = match pooled.entry(leader.0) {
@@ -626,6 +713,9 @@ impl Backend {
                     unreachable!()
                 };
                 let key = (source.as_ptr() as usize, usage.bits());
+                if graph.stream_roots.contains(&resource) {
+                    self.stream_roots.insert(key);
+                }
                 let entry = match self.resident.entry(key) {
                     std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::hash_map::Entry::Vacant(entry) => {
@@ -648,10 +738,9 @@ impl Backend {
                 None
             };
             if let Some(buffer) = shared {
-                let bound = if graph.asset_tables.contains_key(&resource) {
-                    graph.tables[&resource].bytes().max(4) as u64
-                } else {
-                    buffer.size
+                let bound = match s {
+                    Storage::Buffer { bytes, .. } => *bytes as u64,
+                    _ => buffer.size,
                 };
                 slot.heap.write(g, i, &buffer, bound)?;
                 slot.resources[i] = Physical::SharedBuffer(buffer);
@@ -905,7 +994,7 @@ impl Backend {
         &mut self,
         plan: FramePlan,
         tasks: &rayon::ThreadPool,
-        window: isize,
+        window: impl Into<Option<isize>>,
     ) -> Result<Option<Frame>> {
         if self.pending.len() == self.slots.len() {
             let completed = self.retire_submitted().expect("full frame queue")?;
@@ -914,7 +1003,7 @@ impl Backend {
         let slot = (0..self.slots.len())
             .find(|idx| self.pending.iter().all(|frame| frame.slot != *idx))
             .unwrap();
-        match self.submit_frame(plan, tasks, Some(window), slot) {
+        match self.submit_frame(plan, tasks, window.into(), slot) {
             Ok(mut frame) => {
                 frame.profile.frames_in_flight = self.pending.len() + 1;
                 self.pending.push_back(frame);
@@ -941,6 +1030,8 @@ impl Backend {
         if let Some(frame) = self.completed.pop_front() {
             return Some(Ok(frame));
         }
+        self.prune_stream_pages();
+
         let front = self.pending.front()?;
         match self.timelines.ready(&self.gpu, &front.retire) {
             Ok(false) => None,
@@ -949,9 +1040,37 @@ impl Backend {
         }
     }
 
+    pub(crate) fn has_stream_allocations(&self) -> bool {
+        !self.stream_pages.is_empty() || !self.stream_roots.is_empty()
+    }
+    fn prune_stream_pages(&mut self) {
+        self.stream_roots.retain(|key| {
+            if self
+                .resident
+                .get(key)
+                .is_some_and(|r| r.source.strong_count() != 0)
+            {
+                true
+            } else {
+                self.resident.remove(key);
+                false
+            }
+        });
+        // GPU frees run only on the RHI thread. A stale notification can follow slot reuse.
+        for key in self.retired_pages.try_iter().take(8) {
+            if self
+                .stream_pages
+                .get(&key)
+                .is_some_and(|(lease, _)| lease.strong_count() == 0)
+            {
+                self.stream_pages.remove(&key);
+            }
+        }
+    }
     fn retire_submitted(&mut self) -> Option<Result<Frame>> {
         self.pending.pop_front().map(|frame| {
             let result = self.finish_frame(frame);
+            self.prune_stream_pages();
             if result.is_err()
                 && let Err(error) = self.recover()
             {
@@ -1334,6 +1453,29 @@ impl Backend {
             }
         }
         let mut counters = std::collections::BTreeMap::new();
+        if !plan.graph.upload_sources.is_empty() {
+            let mut counts = [0u64; 3];
+            for (upload, lease) in plan.graph.upload_sources.values() {
+                let index = if lease.failure.get().is_some() {
+                    2
+                } else if matches!(upload, crate::streaming::Upload::Host(_)) {
+                    0
+                } else {
+                    1
+                };
+                counts[index] += 1;
+            }
+            for (label, n) in [
+                "stream host uploads",
+                "stream DirectStorage uploads",
+                "stream deferred uploads",
+            ]
+            .into_iter()
+            .zip(counts)
+            {
+                counters.insert(label, n);
+            }
+        }
         for pass in &plan.graph.passes {
             if let Op::Counters {
                 buffer,
@@ -1345,6 +1487,14 @@ impl Backend {
                     unreachable!()
                 };
                 b.mapped(|data| {
+                    if first == 0
+                        && let Some(feedback) = plan.graph.stream_feedback.get(&buffer)
+                    {
+                        feedback.store(
+                            u32::from_ne_bytes(data[..4].try_into()?),
+                            std::sync::atomic::Ordering::Release,
+                        );
+                    }
                     for (&name, word) in labels.iter().zip(data[first * 4..].chunks_exact(4)) {
                         *counters.entry(name).or_insert(0) +=
                             u64::from(u32::from_ne_bytes(word.try_into()?));
@@ -1368,6 +1518,12 @@ impl Backend {
         let mut shared = std::collections::BTreeSet::new();
         for r in &slot.resources {
             match r {
+                #[cfg(lab_directstorage)]
+                Physical::External(_) => account(&AllocationInfo {
+                    allocated_bytes: crate::streaming::PAGE_BYTES as u64,
+                    device_local: true,
+                    ..Default::default()
+                }),
                 Physical::Vacant => continue,
                 Physical::Buffer(b) => account(&b.allocation),
                 Physical::SharedBuffer(b) => {
@@ -1456,6 +1612,25 @@ impl Backend {
         } else {
             vec![]
         };
+        for (_, ticket) in &plan.graph.page_copies {
+            if ticket.lease.failure.get().is_some() {
+                continue;
+            }
+            ticket
+                .lease
+                .complete
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        for r in plan
+            .graph
+            .physical_pages
+            .keys()
+            .chain(plan.graph.upload_sources.keys())
+            .chain(&plan.graph.stream_roots)
+        {
+            slot.resources[r.0] = Physical::Vacant;
+            slot.heap.slots[r.0] = None;
+        }
         let completed = Instant::now();
         if let (Some(origin), Some(times)) = (plan.stamp.origin, profile.cpu_times_us.as_mut()) {
             times.retired = (completed - origin).as_micros() as u64;

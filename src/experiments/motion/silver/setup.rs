@@ -18,7 +18,7 @@ pub fn scene() -> Result<World> {
     while let Some(parent) = w.entities[&root].parent {
         root = parent;
     }
-    let bank = SilverMatcher::load()?;
+    let bank = SilverMatcher::shared()?;
     let (range, name) = bank
         .clips
         .iter()

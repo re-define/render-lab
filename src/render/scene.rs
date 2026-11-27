@@ -236,6 +236,7 @@ impl RenderScene {
 }
 
 pub struct SceneExtractor {
+    pose_tasks: Option<Arc<rayon::ThreadPool>>,
     registry: BTreeMap<&'static str, SnapshotComponent>,
     transforms: TransformCache,
     palettes: BTreeMap<Id, Palette>,
@@ -248,6 +249,7 @@ pub struct SceneExtractor {
 }
 
 struct Palette {
+    dependency: usize,
     space: Option<PoseSpace>,
     slots: Vec<usize>,
     joints: Vec<(Id, u64)>,
@@ -256,6 +258,10 @@ struct Palette {
 }
 
 impl SceneExtractor {
+    pub fn with_pose_workers(mut self, pool: Arc<rayon::ThreadPool>) -> Self {
+        self.pose_tasks = Some(pool);
+        self
+    }
     pub fn snapshot(
         &mut self,
         world: &World,
@@ -281,6 +287,7 @@ impl SceneExtractor {
         Ok(Snapshot {
             secondary_view: false,
             buffer_atomic64: false,
+            stream_adapter: None,
             reference_draws: std::env::var_os("RENDER_LAB_REFERENCE_DRAWS").is_some(),
             ray_caps: Default::default(),
             scene,
@@ -388,7 +395,8 @@ impl SceneExtractor {
                         index
                     } else {
                         stats.palettes_updated += usize::from(self.update_palette(world, skin)?);
-                        let palette = &self.palettes[&skin];
+                        let palette = self.palettes.get_mut(&skin).unwrap();
+                        palette.dependency = dependencies.skins.len();
                         stats.palette_joints_examined += palette.slots.len();
                         let index = dependencies.skins.len();
                         if let Some(space) = &palette.space {
@@ -559,6 +567,7 @@ impl SceneExtractor {
         self.palettes.insert(
             id,
             Palette {
+                dependency: 0,
                 space,
                 slots,
                 joints,

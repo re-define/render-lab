@@ -198,6 +198,7 @@ impl SceneExtractor {
             focused_actor: None,
             pending_visual: false,
             palettes: Default::default(),
+            pose_tasks: None,
             previous: None,
             cursor: None,
             dependencies: Default::default(),

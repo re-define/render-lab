@@ -1,4 +1,5 @@
 pub mod animation;
+pub mod assets;
 pub mod audio;
 pub mod console;
 pub mod engine;
@@ -11,3 +12,4 @@ pub mod recording;
 pub mod render;
 pub mod rhi;
 pub mod scene;
+pub mod streaming;

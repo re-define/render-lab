@@ -7,6 +7,7 @@ pub mod gaussian;
 pub mod hair;
 pub mod ibl;
 mod light_stack;
+pub mod streaming_lab;
 use assembly::SceneConfiguration;
 pub mod lighting;
 pub mod mixed;
@@ -112,6 +113,9 @@ pub fn replace(engine: &mut Engine, mut world: World) -> Result<()> {
     world.validate()?;
     SceneConfiguration::restore(&mut world)?;
     let prepared = SceneConfiguration::prepare(&world, &engine.tasks, engine.ray_caps)?;
+    let stream = crate::scene::partition::Runtime::new(&world)?;
+    engine.world_stream = stream;
+    engine.streaming_sources.clear();
     engine.audio.stop_all();
     engine.world = Arc::new(world);
     prepared.apply(engine);

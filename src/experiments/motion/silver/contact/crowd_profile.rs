@@ -206,6 +206,7 @@ fn silver_crowd_extraction_profile() -> Result<()> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(std::thread::available_parallelism()?.get().min(16))
         .build()?;
+    let pool = Arc::new(pool);
     let (mut world, mut schedule) = population(count, &pool)?;
     if let Ok(graph) = std::env::var("RENDER_LAB_POSE_GRAPH") {
         let world = Arc::make_mut(&mut world);
@@ -225,7 +226,7 @@ fn silver_crowd_extraction_profile() -> Result<()> {
         }
         println!("Driven right arm and both legs enabled on all {count} actors");
     }
-    let mut extractor = SceneExtractor::default();
+    let mut extractor = SceneExtractor::default().with_pose_workers(pool.clone());
     let mut times = Vec::new();
     let mut sim_times = Vec::new();
     let mut pose_counts = [0usize; 3];

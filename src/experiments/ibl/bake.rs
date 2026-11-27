@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-const HDR: &[u8] = include_bytes!("../../../assets/environments/studio_small_02_1k.hdr");
+pub(super) const HDR: &[u8] = include_bytes!("../../../assets/environments/studio_small_02_1k.hdr");
 const SAMPLES: u32 = 256;
 const LEVELS: usize = 7;
 const LUT_EDGE: u32 = 128;

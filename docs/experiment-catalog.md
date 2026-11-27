@@ -28,6 +28,15 @@ cargo run --release --locked -- --scene target/saved.json
 
 几何树与材质、运动与碰撞各自有独立入口。林地样本由种子生成，截图对照时可固定风时间。银狼运动时钟与物理状态可通过 `save target/saved.json` 保存，再用 `load target/saved.json` 接续。[植物生成](../src/experiments/vegetation.rs) · [稠密河谷规模回归](../src/experiments/vegetation/river_forest.rs) · [特效实现](../src/experiments/effects.rs) · [角色求解](algorithms/animation-physics.md)
 
+## 资产流式驻留与世界分区
+
+| 预设 | 实际观察 |
+| --- | --- |
+| `streaming` | 面向织纹曲面拉近、拉远或转开镜头。分辨率足够时，贴图、几何与骨骼三级各自精化。在帧计数器里看 `texture level`、`geometry level`、`joint level` 与 `page uploads`。 |
+| `world-stream` | 移动实验中三组各六个刚体沿 X 方向布置，相机接近时激活重力模拟，离开后冻结。保存再加载能够恢复位置和动量。 |
+
+两种场景的默认预算、显存退役和可选 DirectStorage 配置见[运行时资源](architecture/runtime-resources.md)。
+
 ## 材质、压缩、直接光与间接光
 
 | 预设 | 资产和要观察的现象 | 建议的同机位操作 |

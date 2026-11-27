@@ -63,7 +63,7 @@ pub(crate) fn cosmetic_pose(w: &World, actor: Id) -> bool {
 }
 pub const PLAYER: &str = "lab.silver_wolf.motion";
 fn install(world: &World, schedule: &mut crate::engine::Schedule) -> Result<()> {
-    let bank = Arc::new(SilverMatcher::load()?);
+    let bank = SilverMatcher::shared()?;
     schedule.add_frame_system("silver-motion", bank.clone())?;
     contact::register(world, schedule, bank)
 }

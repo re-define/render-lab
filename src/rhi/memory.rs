@@ -26,6 +26,7 @@ pub enum Class {
     Transient,
     History,
     Asset,
+    StreamPage,
     Acceleration,
     BuildScratch,
     Infrastructure,
@@ -37,6 +38,7 @@ pub struct MemoryBreakdown {
     pub transient: u64,
     pub history: u64,
     pub asset: u64,
+    pub stream_page: u64,
     pub acceleration: u64,
     pub build_scratch: u64,
     pub infrastructure: u64,
@@ -48,6 +50,7 @@ impl MemoryBreakdown {
         self.transient
             + self.history
             + self.asset
+            + self.stream_page
             + self.acceleration
             + self.build_scratch
             + self.infrastructure
@@ -57,6 +60,7 @@ impl MemoryBreakdown {
         match class {
             Class::Transient => &mut self.transient,
             Class::History => &mut self.history,
+            Class::StreamPage => &mut self.stream_page,
             Class::Asset => &mut self.asset,
             Class::Acceleration => &mut self.acceleration,
             Class::BuildScratch => &mut self.build_scratch,
@@ -111,6 +115,8 @@ pub struct ManagedMemory {
     /// Bound ranges allocated and returned within ordinary buffer blocks.
     pub suballocations: AllocationActivity,
     pub pool_blocks: usize,
+    /// Committed Vulkan blocks dedicated to fixed-size streamed pages.
+    pub stream_pool_bytes: u64,
     /// Snapshot sequence, including submissions without a presented image.
     pub submission: u64,
     pub purposes: std::sync::Arc<[super::PurposeMemory]>,

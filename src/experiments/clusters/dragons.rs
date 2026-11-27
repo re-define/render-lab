@@ -65,7 +65,7 @@ pub fn scene() -> Result<World> {
     }
     let cube = w.spawn(Entity {
         name: "Ordinary indexed block".into(),
-        components: BTreeMap::from([(ORDINARY.into(), true.into())]),
+        components: [(ORDINARY.into(), true.into())].into(),
         mesh: Some(Arc::new(Mesh {
             positions: vec![
                 [-8., 0., -4.],

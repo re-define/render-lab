@@ -333,32 +333,44 @@ impl Entities {
         self.journal.write(id, kind);
         Some(row)
     }
-    /// Keep steady-state typed updates allocation-free in the serialized membership map.
-    pub(super) fn mark_typed_value(&mut self, id: Id, key: &'static str) -> bool {
-        let Some(row) = self.rows.get_mut(&id) else {
-            return false;
-        };
-        let write = if row.components.contains_key(key) {
+    pub(crate) fn replace_field(
+        &mut self,
+        id: Id,
+        key: &'static str,
+        value: super::component_set::Field,
+    ) -> Option<Option<super::component_set::Field>> {
+        let row = self.rows.get_mut(&id)?;
+        let raw = matches!(&value, super::Field::Json(_));
+        let old = row.components.replace(key, value);
+        let write = if old.is_some() {
             Write::TypedValue(key)
         } else {
-            row.components.insert(key.into(), Value::Null);
             self.owners.take();
             Write::TypedMembership(key)
         };
-        self.journal.write(id, write);
-        true
+        self.journal
+            .write(id, if raw { Write::Component(key) } else { write });
+        Some(old)
     }
     pub(super) fn remove_extension(&mut self, id: Id, key: &'static str) {
         if let Some(e) = self.rows.get_mut(&id)
-            && e.components.remove(key).is_some()
+            && e.components.contains_key(key)
         {
             self.owners.take();
+            e.components.remove(key);
             self.journal.write(id, Write::Component(key));
         }
     }
+    pub(crate) const LEAF_SIMULATION_KEYS: [&'static str; 3] = [
+        super::MOTION_POLICY,
+        crate::movement::linear::LINEAR_BODY,
+        crate::physics::ANGULAR_BODY,
+    ];
     pub(crate) fn plain_leaf(e: &Entity) -> bool {
         (e.instance.is_some() || e.light.is_some())
-            && e.components.is_empty()
+            && e.components
+                .keys()
+                .all(|k| Self::LEAF_SIMULATION_KEYS.contains(&k.as_str()))
             && e.mesh.is_none()
             && e.geometry_assets.is_none()
             && e.skin.is_none()
@@ -401,6 +413,23 @@ impl Entities {
             self.highest_id = id;
         }
         let sparse = Self::plain_leaf(&entity);
+        if sparse && let Some(owners) = self.owners.get_mut() {
+            if let Some(old) = self.rows.get(&id) {
+                for key in old.components.keys() {
+                    if let Some(ids) = owners.get_mut(key)
+                        && let Ok(i) = ids.binary_search(&id)
+                    {
+                        ids.remove(i);
+                    }
+                }
+            }
+            for key in entity.components.keys() {
+                let ids = owners.entry(key.clone()).or_default();
+                if let Err(i) = ids.binary_search(&id) {
+                    ids.insert(i, id);
+                }
+            }
+        }
         let old = self.rows.insert(id, entity);
         self.structure_changed(id, sparse && old.as_ref().is_none_or(Self::plain_leaf));
         old
@@ -408,6 +437,15 @@ impl Entities {
     pub fn remove(&mut self, id: &Id) -> Option<Entity> {
         self.remember_highest_id();
         let row = self.rows.remove(id)?;
+        if let Some(owners) = self.owners.get_mut() {
+            for key in row.components.keys() {
+                if let Some(ids) = owners.get_mut(key)
+                    && let Ok(i) = ids.binary_search(id)
+                {
+                    ids.remove(i);
+                }
+            }
+        }
         self.incarnations.remove(id);
         self.structure_changed(*id, Self::plain_leaf(&row));
         Some(row)
@@ -435,6 +473,10 @@ impl Entities {
 }
 impl World {
     pub fn set_local(&mut self, id: Id, local: Mat4) -> Result<()> {
+        ensure!(
+            local.is_finite(),
+            "non-finite local transform at entity {id}"
+        );
         self.entities
             .set_local_if_present(id, local)
             .context("missing transform entity")
@@ -494,8 +536,7 @@ impl World {
         key: &'static str,
         value: Value,
     ) -> Option<()> {
-        self.runtime.binding_changed(key);
-        self.runtime.remove_component(id, key);
+        self.binding_changed(key);
         self.entities
             .edit(id, Write::Component(key))?
             .components

@@ -98,8 +98,8 @@ impl World {
             .entities
             .get(&id)
             .context("motion entity does not exist")?;
-        let policy = match entity.components.get(MOTION_POLICY) {
-            Some(raw) => *self.component_value::<MotionPolicy>(id, MOTION_POLICY, raw)?,
+        let policy = match entity.components.read::<MotionPolicy>(MOTION_POLICY)? {
+            Some(value) => *value,
             None => fallback,
         };
         policy.validate()?;

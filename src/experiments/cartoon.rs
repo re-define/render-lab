@@ -239,7 +239,7 @@ pub fn from_gltf(path: &Path) -> Result<World> {
     };
     w.spawn(Entity {
         name: "Cartoon experiment".into(),
-        components: BTreeMap::from([(SETTING.into(), serde_json::to_value(settings)?)]),
+        components: [(SETTING.into(), serde_json::to_value(settings)?)].into(),
         ..Default::default()
     });
     w.validate()?;

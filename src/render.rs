@@ -141,6 +141,7 @@ pub use materials::{LightingInput, MaterialCode, MaterialPrograms};
 pub mod post;
 pub struct Snapshot {
     pub(crate) secondary_view: bool,
+    pub(crate) stream_adapter: Option<[u8; 8]>,
     /// Capabilities of the backend which will execute this snapshot.
     pub buffer_atomic64: bool,
     /// Keep individual mesh draws for correctness and performance comparisons.
@@ -167,6 +168,7 @@ impl Snapshot {
     pub(crate) fn for_camera(&self, camera: Camera, extent: [u32; 2]) -> Self {
         Self {
             secondary_view: true,
+            stream_adapter: self.stream_adapter,
             camera,
             extent,
             scene: self.scene.clone(),

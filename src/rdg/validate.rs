@@ -51,7 +51,38 @@ impl Graph {
             _ => None,
         };
         let fits = |r: Resource, bytes: u64| matches!(self.resources.get(r.0),Some((_,Storage::Buffer{bytes:size,..})) if *size as u64>=bytes);
+        if !self.physical_pages.is_empty() || !self.upload_sources.is_empty() {
+            for (r, a) in self.uses(&p.op) {
+                ensure!(
+                    !self.physical_pages.contains_key(&r)
+                        || !a.writes()
+                        || matches!(p.op, Op::CopyStreamPage {dst,..} if dst==r),
+                    "stream pages are immutable after upload"
+                );
+                ensure!(
+                    !self.upload_sources.contains_key(&r)
+                        || matches!(p.op,Op::CopyStreamPage{src,..} if src==r),
+                    "page staging is transfer-only"
+                );
+            }
+        }
         match p.op {
+            Op::CopyStreamPage { src, dst, bytes } => {
+                ensure!(
+                    bytes > 0
+                        && bytes.is_multiple_of(4)
+                        && self
+                            .upload_sources
+                            .get(&src)
+                            .is_some_and(|(s, page)| s.bytes() == bytes
+                                && self
+                                    .physical_pages
+                                    .get(&dst)
+                                    .is_some_and(|to| Arc::ptr_eq(to, page)))
+                        && fits(dst, bytes as u64),
+                    "invalid streaming page copy"
+                );
+            }
             Op::HostRead(r) | Op::Counters { buffer: r, .. } => {
                 ensure!(
                     self.host_readable_buffer(r),

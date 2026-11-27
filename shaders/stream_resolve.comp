@@ -1,0 +1,37 @@
+#version 460
+#define PAGE_TABLE 1
+#include "stream_pages.glsl"
+#include "visibility_image.glsl"
+layout(set=0,binding=2,std430) readonly buffer Scene {mat4 vp;uvec4 offsets;uvec4 sizes;};
+layout(set=0,binding=3,std430) buffer OutputColor {uint color[];};
+layout(set=0,binding=4,std430) buffer Feedback {uint demand[];};
+layout(local_size_x=8,local_size_y=8) in;
+shared uint groupDemand;
+void main(){
+    if(gl_LocalInvocationIndex==0)groupDemand=0;
+    barrier();
+    uvec2 p=gl_GlobalInvocationID.xy, extent=uvec2(textureSize(visibilityImage,0));
+    if(all(lessThan(p,extent))){
+        uvec2 hit=visibilityAt(p);
+        vec3 c=vec3(.065,.084,.10);
+        if(hit.x!=0){
+            vec2 uv=unpackUnorm2x16(hit.y);
+            uint side=sizes.x;
+            uvec2 texel=min(uvec2(uv*side),uvec2(side-1));
+            c=unpackUnorm4x8(wordAt(offsets.x,texel.y*side+texel.x)).rgb;
+            uvec2 nx=visibilityAt(min(p+uvec2(1,0),extent-1)), ny=visibilityAt(min(p+uvec2(0,1),extent-1));
+            if(nx.x!=0 && ny.x!=0){
+                vec2 dx=uv-unpackUnorm2x16(nx.y),dy=uv-unpackUnorm2x16(ny.y);
+                float pixels=1.0/max(max(length(dx),length(dy)),1e-5);
+                // Unary demand bits merge monotonically across lanes and workgroups.
+                uint wanted=uint(pixels>24.)|(uint(pixels>96.)<<1);
+                wanted|=(uint(pixels>18.)|(uint(pixels>78.)<<1))<<4;
+                wanted|=(uint(pixels>32.)|(uint(pixels>120.)<<1))<<8;
+                atomicOr(groupDemand,wanted);
+            }
+        }
+        color[p.y*extent.x+p.x]=packUnorm4x8(vec4(c.bgr,1));
+    }
+    barrier();
+    if(gl_LocalInvocationIndex==0 && groupDemand!=0)atomicOr(demand[0],groupDemand);
+}

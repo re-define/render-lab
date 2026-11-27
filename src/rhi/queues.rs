@@ -11,7 +11,7 @@ pub(super) fn queue_count_for_frame(
     explicit: bool,
     plan: &Plan,
 ) -> usize {
-    if explicit || available == 1 {
+    if explicit || available == 1 || !plan.graph.page_copies.is_empty() {
         return available;
     }
     if plan
@@ -167,6 +167,7 @@ pub(super) fn remove_semaphore_covered_reads(plan: &mut Plan, queue_count: usize
 /// Queues in one universal family share ownership of all frame resources. Each physical
 /// queue has its own monotonically increasing semaphore, including on two-queue devices.
 pub(super) struct Timelines {
+    generation: u64,
     gpu: Arc<Gpu>,
     sems: Vec<vk::Semaphore>,
     values: Vec<u64>,
@@ -180,7 +181,9 @@ impl Timelines {
             Ok("release") => true,
             _ => anyhow::bail!("RENDER_LAB_GPU_BATCHING must be release or compact"),
         };
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let mut result = Self {
+            generation: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             release_ready,
             gpu: g.clone(),
             sems: vec![],
@@ -287,6 +290,12 @@ impl Timelines {
                     }
                 }
                 for &(r, a) in &uses[step.index] {
+                    if let Some(page) = p.graph.physical_pages.get(&r)
+                        && let Some(&(generation, src, point)) = page.ready.get()
+                        && generation == self.generation
+                    {
+                        require(src, point, wait_stage(a));
+                    }
                     if let Some(key) = p.graph.histories.get(&r) {
                         if let Some(prior) = previous.get(key) {
                             for (src, &point) in prior.iter().enumerate() {
@@ -309,6 +318,14 @@ impl Timelines {
                     .build()
             };
             let mut waits = vec![];
+            #[cfg(lab_directstorage)]
+            for step in &p.steps[start..end] {
+                if let Op::CopyStreamPage { src, .. } = p.graph.passes[step.index].op
+                    && let Physical::External(import) = &resources[src.0]
+                {
+                    waits.push(sem(import.semaphore, 1, Stage::COPY));
+                }
+            }
             let mut sources = vec![];
             for (src, &(v, stages)) in needed.iter().enumerate() {
                 let (done, mask) = &mut covered[q][src];
@@ -355,6 +372,12 @@ impl Timelines {
                 g.dev
                     .queue_submit2(g.queues[q], &[info], vk::Fence::null())?;
             }
+        }
+        for (index, ticket) in &p.graph.page_copies {
+            let _ = ticket
+                .lease
+                .ready
+                .set((self.generation, signals[*index].0, signals[*index].1));
         }
         Ok(batches)
     }

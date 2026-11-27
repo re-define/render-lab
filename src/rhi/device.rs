@@ -35,6 +35,7 @@ pub(super) struct Gpu {
     pub physical: vk::PhysicalDevice,
     pub family: u32,
     pub name: String,
+    pub stream_adapter: Option<[u8; 8]>,
     pub explicit_queue_count: bool,
     pub memory: vk::PhysicalDeviceMemoryProperties,
     pub allocator: std::sync::Mutex<Allocator>,
@@ -221,6 +222,53 @@ impl Gpu {
                     c"VK_KHR_swapchain".as_ptr(),
                     c"VK_EXT_mesh_shader".as_ptr(),
                 ];
+                #[cfg(lab_directstorage)]
+                let stream_adapter = if supported(vk::KHR_EXTERNAL_MEMORY_WIN32_EXTENSION.name)
+                    && supported(vk::KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION.name)
+                {
+                    let mut id = vk::PhysicalDeviceIDProperties::default();
+                    ins.get_physical_device_properties2(
+                        pd,
+                        &mut vk::PhysicalDeviceProperties2::builder().push_next(&mut id),
+                    );
+                    let mut memory = vk::ExternalBufferProperties::default();
+                    ins.get_physical_device_external_buffer_properties(
+                        pd,
+                        &vk::PhysicalDeviceExternalBufferInfo::builder()
+                            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                            .handle_type(vk::ExternalMemoryHandleTypeFlags::D3D12_RESOURCE),
+                        &mut memory,
+                    );
+                    let mut sem = vk::ExternalSemaphoreProperties::default();
+                    let mut ty = vk::SemaphoreTypeCreateInfo::builder()
+                        .semaphore_type(vk::SemaphoreType::TIMELINE);
+                    ins.get_physical_device_external_semaphore_properties(
+                        pd,
+                        &vk::PhysicalDeviceExternalSemaphoreInfo::builder()
+                            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::D3D12_FENCE)
+                            .push_next(&mut ty),
+                        &mut sem,
+                    );
+                    let ok = id.device_luid_valid != 0
+                        && memory
+                            .external_memory_properties
+                            .external_memory_features
+                            .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+                        && sem
+                            .external_semaphore_features
+                            .contains(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE);
+                    if ok {
+                        exts.extend([
+                            c"VK_KHR_external_memory_win32".as_ptr(),
+                            c"VK_KHR_external_semaphore_win32".as_ptr(),
+                        ]);
+                    }
+                    ok.then_some(*id.device_luid)
+                } else {
+                    None
+                };
+                #[cfg(not(lab_directstorage))]
+                let stream_adapter = None;
                 let ngx_device = ngx.as_ref().map_err(|e| anyhow!("{e:#}")).and_then(|(request, _)| {
                     ensure!(props.vendor_id == 0x10de, "the rendering adapter is not NVIDIA");
                     let required = request.extensions(ins.handle(), pd)?;
@@ -347,6 +395,7 @@ impl Gpu {
                     allocator: Default::default(),
                     physical: pd,
                     family: family as u32,
+                    stream_adapter,
                     name: props.device_name.to_string(),
                     explicit_queue_count: std::env::var_os("RENDER_LAB_GPU_QUEUES").is_some(),
                     memory,

@@ -9,6 +9,17 @@ impl SceneExtractor {
         ids: &BTreeSet<Id>,
         scene: &mut RenderScene,
     ) -> Result<bool> {
+        // Custom snapshot schemas can observe simulation component membership as a setting.
+        if Entities::LEAF_SIMULATION_KEYS.iter().any(|key| {
+            self.registry.contains_key(key)
+                || self
+                    .dependencies
+                    .components
+                    .values()
+                    .any(|owner| owner.watched_settings.contains_key(key))
+        }) {
+            return Ok(false);
+        }
         for &id in ids {
             if let Some(&slot) = self.transforms.slots.get(&id) {
                 if !self.transforms.removable_leaf(slot)

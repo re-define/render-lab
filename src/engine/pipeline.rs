@@ -79,6 +79,7 @@ struct Submission {
 pub(super) struct DeviceInfo {
     pub(super) dlss_unavailable: Option<String>,
     pub(super) ray_caps: RayCapabilities,
+    stream_adapter: Option<[u8; 8]>,
     buffer_atomic64: bool,
 }
 
@@ -118,10 +119,11 @@ impl Pipeline {
         let device = startup.recv()?.map_err(anyhow::Error::msg)?;
         let shared = pipeline.shared.clone();
         let atomic64 = device.buffer_atomic64;
+        let adapter = device.stream_adapter;
         let rays = device.ray_caps;
         let render = thread::Builder::new()
             .name("lab-render".into())
-            .spawn(move || run_render(scenes, out, &shared, atomic64, rays))?;
+            .spawn(move || run_render(scenes, out, &shared, adapter, atomic64, rays))?;
         pipeline.threads.push(render);
         Ok((pipeline, device))
     }
@@ -162,6 +164,7 @@ fn run_rhi(
     if ready
         .send(Ok(DeviceInfo {
             dlss_unavailable: backend.dlss_unavailable(),
+            stream_adapter: backend.stream_adapter(),
             buffer_atomic64: backend.buffer_atomic64(),
             ray_caps: backend.ray_capabilities(),
         }))
@@ -180,6 +183,8 @@ fn run_rhi(
     loop {
         let incoming = if backend.has_pending() {
             plans.recv_timeout(Duration::from_millis(1))
+        } else if backend.has_stream_allocations() {
+            plans.recv_timeout(Duration::from_millis(100))
         } else {
             plans.recv().map_err(|_| RecvTimeoutError::Disconnected)
         };
@@ -232,6 +237,7 @@ fn run_render(
     scenes: Receiver<Input>,
     out: SyncSender<Submission>,
     shared: &Shared,
+    stream_adapter: Option<[u8; 8]>,
     buffer_atomic64: bool,
     ray_caps: RayCapabilities,
 ) {
@@ -252,6 +258,7 @@ fn run_render(
         }
         frame.stamp.generation = epoch;
         frame.stamp.render_dequeued = Some(Instant::now());
+        frame.snapshot.stream_adapter = stream_adapter;
         frame.snapshot.buffer_atomic64 = buffer_atomic64;
         frame.snapshot.ray_caps = ray_caps;
         let secondary = frame.secondary.map(|view| {

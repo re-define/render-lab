@@ -16,6 +16,61 @@ pub(super) struct SkinDependency {
     pub instances: Vec<usize>,
 }
 
+impl Palette {
+    /// Writes one actor's palette independently; instance changes are published in a serial merge.
+    fn update_dirty(
+        &mut self,
+        transforms: &TransformCache,
+        mut dirty: DirtyJoints,
+        deferred: &BTreeSet<Id>,
+    ) -> Option<(usize, Mat4)> {
+        if let Some(space) = &mut self.space {
+            let root = &transforms.rows[space.root];
+            if !space.pending.is_empty() {
+                dirty.indices.append(&mut space.pending);
+                dirty.indices.sort_unstable();
+                dirty.indices.dedup();
+            }
+            let n = if deferred.contains(&root.id) {
+                space.pending = dirty.indices;
+                0
+            } else {
+                space.update(
+                    transforms,
+                    &dirty.indices,
+                    &self.inverse_bind,
+                    &mut self.matrices,
+                )
+            };
+            if n == 0 && root.version == space.root_version {
+                return None;
+            }
+            space.root_version = root.version;
+            return Some((n, root.world));
+        }
+        if dirty.count == 0 {
+            return None;
+        }
+        let len = self.slots.len();
+        let matrices = Arc::make_mut(&mut self.matrices);
+        let update = |i: usize| {
+            let t = &transforms.rows[self.slots[i]];
+            if t.version != self.joints[i].1 {
+                matrices[i] = t.world * self.inverse_bind[i];
+                self.joints[i].1 = t.version;
+            }
+        };
+        let n = if dirty.count * 2 > len {
+            (0..len).for_each(update);
+            len
+        } else {
+            dirty.indices.into_iter().for_each(update);
+            dirty.count
+        };
+        Some((n, Mat4::IDENTITY))
+    }
+}
+
 impl RenderScene {
     pub(super) fn instance_index(&self, id: Id) -> Option<usize> {
         self.instances
@@ -319,65 +374,43 @@ impl SceneExtractor {
         };
         self.pending_visual = !deferred.is_empty();
         scene.stats.held_visual_actors = deferred.len();
-        for (index, mut dirty) in dirty_skins.into_iter().enumerate() {
-            let skin = &self.dependencies.skins[index];
-            let len = skin.joint_count;
-            let palette = self
-                .palettes
-                .get_mut(&skin.id)
-                .expect("skin dependency must have a palette");
-            if let Some(space) = &mut palette.space {
-                let root = &self.transforms.rows[space.root];
-                if !space.pending.is_empty() {
-                    dirty.indices.append(&mut space.pending);
-                    dirty.indices.sort_unstable();
-                    dirty.indices.dedup();
-                }
-                let inspected = if deferred.contains(&root.id) {
-                    space.pending = dirty.indices;
-                    0
-                } else {
-                    space.update(
-                        &self.transforms,
-                        &dirty.indices,
-                        &palette.inverse_bind,
-                        &mut palette.matrices,
-                    )
-                };
-                if inspected != 0 || root.version != space.root_version {
-                    space.root_version = root.version;
-                    visited.insert(skin.id);
-                    scene.stats.palette_joints_examined += inspected;
-                    scene.stats.palettes_updated += usize::from(inspected != 0);
-                    for &index in &skin.instances {
-                        changed_instances
-                            .insert(index, Some((palette.matrices.clone(), root.world)));
-                    }
-                }
-                continue;
-            }
-            if dirty.count == 0 {
-                continue;
-            }
-            visited.insert(skin.id);
-            let matrices = Arc::make_mut(&mut palette.matrices);
-            let update = |i: usize| {
-                let transform = &self.transforms.rows[palette.slots[i]];
-                if transform.version != palette.joints[i].1 {
-                    matrices[i] = transform.world * palette.inverse_bind[i];
-                    palette.joints[i].1 = transform.version;
+        if !dirty_skins.is_empty() {
+            let transforms = &self.transforms;
+            let deps = &self.dependencies.skins;
+            let jobs = self.palettes.values_mut().map(|palette| {
+                let slot = palette.dependency;
+                (slot, palette, std::mem::take(&mut dirty_skins[slot]))
+            });
+            let evaluate = |(slot, palette, dirty): (usize, &mut Palette, DirtyJoints)| {
+                palette
+                    .update_dirty(transforms, dirty, &deferred)
+                    .map(|(n, root)| (slot, n, root, palette.matrices.clone()))
+            };
+            let mut publish = |(slot, n, root, matrices): (usize, usize, Mat4, Arc<[Mat4]>)| {
+                let skin = &deps[slot];
+                visited.insert(skin.id);
+                scene.stats.palette_joints_examined += n;
+                scene.stats.palettes_updated += usize::from(n != 0);
+                for &index in &skin.instances {
+                    changed_instances.insert(index, Some((matrices.clone(), root)));
                 }
             };
-            if dirty.count * 2 > len {
-                scene.stats.palette_joints_examined += len;
-                (0..len).for_each(update);
+            if let Some(pool) = self
+                .pose_tasks
+                .as_ref()
+                .filter(|_| deps.len() >= 32 && moved.len() >= 128)
+            {
+                use rayon::prelude::*;
+                let jobs = jobs.collect::<Vec<_>>();
+                let completed = pool.install(|| {
+                    jobs.into_par_iter()
+                        .with_min_len(8)
+                        .filter_map(evaluate)
+                        .collect::<Vec<_>>()
+                });
+                completed.into_iter().for_each(publish);
             } else {
-                scene.stats.palette_joints_examined += dirty.count;
-                dirty.indices.into_iter().for_each(update);
-            }
-            scene.stats.palettes_updated += 1;
-            for &index in &skin.instances {
-                changed_instances.insert(index, Some((palette.matrices.clone(), Mat4::IDENTITY)));
+                jobs.filter_map(evaluate).for_each(&mut publish);
             }
         }
         scene.stats.instances_updated += if structural.is_empty() {

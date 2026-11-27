@@ -1,4 +1,4 @@
-//! Reuse equal-size temporary buffers only across proven queue lifetimes.
+//! Reuse capacity-compatible temporary buffers only across proven queue lifetimes.
 use super::{queues::physical_queue, *};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -85,24 +85,27 @@ impl Reuse {
             }
         }
         starts.sort_by_key(|&(rank, r, ..)| (rank, r));
-        let mut chains = BTreeMap::<(usize, bool), Vec<Vec<Resource>>>::new();
+        let mut pools: [BTreeMap<usize, Vec<Vec<Resource>>>; 2] = Default::default();
         let mut result = Self::default();
         for (start, r, bytes, first_access) in starts {
             let index = plan.steps[start].index;
             let q = physical_queue(plan.graph.passes[index].queue, queues);
-            let chains = chains
-                .entry((bytes, plan.graph.local_buffers.contains(&r)))
-                .or_default();
+            let pool = &mut pools[usize::from(plan.graph.local_buffers.contains(&r))];
             let mut seen = clocks[index];
-            seen[q] = start; // Two resources touched in one pass always overlap.
-            let Some(chain) = chains.iter_mut().find(|chain| {
-                intervals[chain.last().unwrap().0]
-                    .last
-                    .iter()
-                    .zip(seen)
-                    .all(|(&end, frontier)| end <= frontier)
-            }) else {
-                chains.push(vec![r]);
+            seen[q] = start; // Resources touched by one pass overlap.
+            // Best fit. Limit the search to the next size octave to preserve larger allocations.
+            let Some(chain) = pool
+                .range_mut(bytes..=bytes.saturating_mul(2))
+                .flat_map(|(_, chains)| chains)
+                .find(|chain| {
+                    intervals[chain.last().unwrap().0]
+                        .last
+                        .iter()
+                        .zip(seen)
+                        .all(|(&end, frontier)| end <= frontier)
+                })
+            else {
+                pool.entry(bytes).or_default().push(vec![r]);
                 continue;
             };
             let previous = &intervals[chain.last().unwrap().0];
@@ -127,8 +130,13 @@ impl Reuse {
             result.saved_bytes += bytes as u64;
             chain.push(r);
         }
-        for chain in chains.into_values().flatten().filter(|c| c.len() > 1) {
-            let leader = *chain.iter().min().unwrap();
+        for chain in pools
+            .into_iter()
+            .flat_map(BTreeMap::into_values)
+            .flatten()
+            .filter(|c| c.len() > 1)
+        {
+            let leader = chain[0]; // First user supplies the maximum physical capacity.
             result.groups.extend(chain.into_iter().map(|r| (r, leader)));
         }
         result
@@ -185,6 +193,18 @@ mod tests {
         g.compile()
     }
 
+    #[test]
+    fn smaller_successor_reuses_capacity_only_after_all_readers() -> Result<()> {
+        for (ordered, expected) in [(true, true), (false, false)] {
+            let mut p = graph(Queue::Graphics, ordered, false)?;
+            if let Storage::Buffer { bytes, .. } = &mut p.commands.graph.resources[1].1 {
+                *bytes = 3072
+            }
+            let reuse = Reuse::plan(&mut p, 3);
+            assert_eq!(reuse.groups.contains_key(&Resource(1)), expected);
+        }
+        Ok(())
+    }
     #[test]
     fn scratch_has_a_private_allocation_and_requires_a_gpu_write() -> Result<()> {
         let mut plan = graph(Queue::Compute, false, false)?;

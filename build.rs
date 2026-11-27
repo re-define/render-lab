@@ -1,5 +1,6 @@
 use std::{env, path::PathBuf, process::Command};
 fn main() {
+    build_storage();
     build_ngx();
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
@@ -9,6 +10,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GLSLC");
     println!("cargo:rerun-if-changed=shaders");
     let shaders = [
+        "stream.mesh",
+        "stream.frag",
+        "stream_resolve.comp",
         "plain.mesh",
         "ordinary_cull.comp",
         "ordinary_work.comp",
@@ -414,4 +418,49 @@ fn build_ngx() {
     println!("cargo:rustc-link-lib=advapi32");
     println!("cargo:rustc-link-lib=user32");
     println!("cargo:rustc-cfg=render_lab_ngx");
+}
+
+fn build_storage() {
+    println!("cargo:rustc-check-cfg=cfg(lab_directstorage)");
+    println!("cargo:rerun-if-env-changed=RENDER_LAB_DSTORAGE_SDK");
+    println!("cargo:rerun-if-env-changed=VULKAN_SDK");
+    println!("cargo:rerun-if-changed=src/rhi/storage_bridge.cpp");
+    let Some(root) = env::var_os("RENDER_LAB_DSTORAGE_SDK").map(PathBuf::from) else {
+        return;
+    };
+    assert!(
+        env::var("TARGET").is_ok_and(|s| s == "x86_64-pc-windows-msvc"),
+        "DirectStorage bridge requires x64 MSVC"
+    );
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let profile = out.ancestors().nth(3).unwrap();
+    for dir in [
+        profile.to_owned(),
+        profile.join("deps"),
+        profile.join("examples"),
+    ] {
+        std::fs::create_dir_all(&dir).expect("create DirectStorage runtime directory");
+        for name in ["dstorage.dll", "dstoragecore.dll"] {
+            let source = root.join("bin/x64").join(name);
+            println!("cargo:rerun-if-changed={}", source.display());
+            std::fs::copy(source, dir.join(name))
+                .expect("stage DirectStorage runtime beside executable");
+        }
+    }
+    let vk = PathBuf::from(env::var_os("VULKAN_SDK").expect("Vulkan SDK required"));
+    cc::Build::new()
+        .cpp(true)
+        .std("c++17")
+        .file("src/rhi/storage_bridge.cpp")
+        .include(root.join("include"))
+        .include(vk.join("Include"))
+        .compile("lab_storage");
+    println!(
+        "cargo:rustc-link-search=native={}",
+        vk.join("Lib").display()
+    );
+    for lib in ["d3d12", "dxgi", "vulkan-1"] {
+        println!("cargo:rustc-link-lib={lib}");
+    }
+    println!("cargo:rustc-cfg=lab_directstorage");
 }

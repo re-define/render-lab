@@ -117,6 +117,7 @@ impl FreeRanges {
 }
 
 struct Block {
+    stream: bool,
     backing: Backing,
     ty: u32,
     bytes: u64,
@@ -178,7 +179,10 @@ impl Allocator {
         let (req, dedicated) = target.requirements(g);
         let poolable = matches!(target, Target::Buffer(..))
             && !dedicated
-            && matches!(class, Class::Transient | Class::History | Class::Asset)
+            && matches!(
+                class,
+                Class::Transient | Class::History | Class::Asset | Class::StreamPage
+            )
             && req.size <= 8 << 20;
         let compatible = (0..g.memory.memory_type_count).filter(|&ty| {
             req.memory_type_bits & (1 << ty) != 0
@@ -212,8 +216,13 @@ impl Allocator {
                 ..Default::default()
             };
             if poolable
-                && let Some((backing, offset)) =
-                    self.try_range(g, target, req.alignment, &binding, id)?
+                && let Some((backing, offset)) = self.try_range(
+                    g,
+                    target,
+                    req.alignment,
+                    &binding,
+                    (id, class == Class::StreamPage),
+                )?
             {
                 binding.pooled = true;
                 binding.offset = offset;
@@ -268,11 +277,15 @@ impl Allocator {
         target: Target,
         alignment: u64,
         info: &AllocationInfo,
-        opener: usize,
+        (opener, stream): (usize, bool),
     ) -> Result<Option<(Backing, u64)>> {
         let size = info.allocated_bytes;
         let ty = info.memory_type;
-        for block in self.blocks.iter_mut().filter(|block| block.ty == ty) {
+        for block in self
+            .blocks
+            .iter_mut()
+            .filter(|block| block.ty == ty && block.stream == stream)
+        {
             if let Some(offset) = block.free.take(size, alignment) {
                 return Ok(Some((block.backing, offset)));
             }
@@ -281,7 +294,7 @@ impl Allocator {
         if !self.stats.allows(info.device_local, bytes) {
             return Ok(None);
         }
-        match self.open_block(g, target, ty, bytes, info.device_local, opener) {
+        match self.open_block(g, target, ty, bytes, info.device_local, (opener, stream)) {
             Ok(block) => {
                 let offset = block
                     .free
@@ -301,7 +314,7 @@ impl Allocator {
         ty: u32,
         bytes: u64,
         local: bool,
-        opener: usize,
+        (opener, stream): (usize, bool),
     ) -> Result<&mut Block, vk::ErrorCode> {
         let memory = target.allocate_memory(g, ty, bytes, false)?;
         self.stats.allocate(Class::PoolFree, local, bytes);
@@ -332,6 +345,7 @@ impl Allocator {
             None
         };
         self.blocks.push(Block {
+            stream,
             backing: Backing {
                 memory,
                 mapping,
@@ -343,6 +357,9 @@ impl Allocator {
             free: FreeRanges::new(bytes),
         });
         self.stats.pool_blocks += 1;
+        if stream {
+            self.stats.stream_pool_bytes += bytes;
+        }
         Ok(self.blocks.last_mut().unwrap())
     }
 
@@ -378,6 +395,9 @@ impl Allocator {
         if matches!(block.free.0.as_slice(), [range] if range.start == 0 && range.end == block.bytes)
         {
             let block = self.blocks.swap_remove(i);
+            if block.stream {
+                self.stats.stream_pool_bytes -= block.bytes;
+            }
             unsafe {
                 if backing.mapping.is_some() {
                     g.dev.unmap_memory(backing.memory);

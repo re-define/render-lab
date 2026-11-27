@@ -1,6 +1,6 @@
 use super::*;
 use serde::{Serializer, de::DeserializeOwned};
-use std::{any::Any, borrow::Cow, collections::HashMap};
+use std::{any::Any, borrow::Cow};
 
 pub(crate) trait Stored: Send + Sync {
     fn value(&self) -> &dyn Any;
@@ -16,68 +16,14 @@ impl<T: Serialize + Send + Sync + 'static> Stored for T {
     }
 }
 
-#[derive(Clone, Default)]
-pub(super) struct RuntimeComponents {
-    values: HashMap<Id, BTreeMap<&'static str, Arc<dyn Stored>>>,
-    binding_edits: BTreeMap<&'static str, u64>,
-}
-impl RuntimeComponents {
-    pub(super) fn binding_changed(&mut self, key: &'static str) {
+impl World {
+    pub(crate) fn binding_changed(&mut self, key: &'static str) {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(1);
         self.binding_edits
             .insert(key, NEXT.fetch_add(1, Ordering::Relaxed));
     }
-    fn get(&self, id: Id, key: &str) -> Option<&Arc<dyn Stored>> {
-        self.values.get(&id)?.get(key)
-    }
-    fn insert(&mut self, id: Id, key: &'static str, value: Arc<dyn Stored>) {
-        self.values.entry(id).or_default().insert(key, value);
-    }
-    pub(super) fn remove_component(&mut self, id: Id, key: &'static str) {
-        if let Some(row) = self.values.get_mut(&id) {
-            row.remove(key);
-            if row.is_empty() {
-                self.values.remove(&id);
-            }
-        }
-    }
-    pub(super) fn remove_entity(&mut self, entity: Id) {
-        self.values.remove(&entity);
-    }
-}
-
-impl World {
-    pub(crate) fn restore_component_on_rollback(
-        &self,
-        id: Id,
-        key: &'static str,
-    ) -> Option<impl FnOnce(&mut Self) + Send + use<>> {
-        let previous = self.entities.get(&id)?.components.get(key).cloned();
-        let typed = self.runtime.get(id, key).cloned();
-        Some(move |world: &mut Self| {
-            let row = world
-                .entities
-                .get_mut(&id)
-                .expect("component rollback entity");
-            match previous {
-                Some(value) => {
-                    row.components.insert(key.into(), value);
-                }
-                None => {
-                    row.components.remove(key);
-                }
-            }
-            match typed {
-                Some(value) => {
-                    world.runtime.insert(id, key, value);
-                }
-                None => world.runtime.remove_component(id, key),
-            }
-        })
-    }
     /// First entity (in stable ID order) carrying this serialized extension key.
-    /// Typed runtime components may store a JSON null marker here.
     pub fn first_raw_component(&self, key: &str) -> Option<(Id, &Value)> {
         let &id = self.entities.component_owners(key).first()?;
         Some((id, &self.entities[&id].components[key]))
@@ -88,27 +34,10 @@ impl World {
         id: Id,
         key: &'static str,
     ) -> Result<Option<Cow<'_, T>>> {
-        let Some(raw) = self.entities.get(&id).and_then(|e| e.components.get(key)) else {
-            return Ok(None);
-        };
-        self.component_value(id, key, raw).map(Some)
-    }
-
-    pub(super) fn component_value<T: Clone + DeserializeOwned + 'static>(
-        &self,
-        id: Id,
-        key: &'static str,
-        raw: &Value,
-    ) -> Result<Cow<'_, T>> {
-        if let Some(value) = self.runtime.get(id, key) {
-            return Ok(Cow::Borrowed(
-                value
-                    .value()
-                    .downcast_ref::<T>()
-                    .context("component type mismatch")?,
-            ));
+        match self.entities.get(&id) {
+            Some(row) => row.components.read(key),
+            None => Ok(None),
         }
-        Ok(Cow::Owned(serde_json::from_value(raw.clone())?))
     }
 
     pub(crate) fn set_typed_component<T: Serialize + Send + Sync + 'static>(
@@ -124,11 +53,10 @@ impl World {
     }
     pub(crate) fn remove_typed_component(&mut self, id: Id, key: &'static str) {
         self.entities.remove_extension(id, key);
-        self.runtime.remove_component(id, key);
-        self.runtime.binding_changed(key);
+        self.binding_changed(key);
     }
     pub(crate) fn binding_version(&self, key: &'static str) -> u64 {
-        self.runtime.binding_edits.get(key).copied().unwrap_or(0)
+        self.binding_edits.get(key).copied().unwrap_or(0)
     }
     /// Dynamic writes preserve the binding version; introducing a key still invalidates membership.
     pub(crate) fn set_stored_if_present(
@@ -138,13 +66,16 @@ impl World {
         value: Arc<dyn Stored>,
         changes_binding: bool,
     ) -> bool {
-        if !self.entities.mark_typed_value(id, key) {
+        if self
+            .entities
+            .replace_field(id, key, component_set::Field::typed(value))
+            .is_none()
+        {
             return false;
         }
         if changes_binding {
-            self.runtime.binding_changed(key);
+            self.binding_changed(key);
         }
-        self.runtime.insert(id, key, value);
         true
     }
 
@@ -159,7 +90,7 @@ impl World {
             .component_owners(key)
             .iter()
             .copied()
-            .filter(|id| self.runtime.get(*id, key).is_none())
+            .filter(|id| !self.entities[id].components.is_typed(key))
             .map(|id| {
                 serde_json::from_value::<T>(self.entities[&id].components[key].clone())
                     .map(|value| (id, value))
@@ -174,13 +105,14 @@ impl World {
 
 impl Serialize for World {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        self.serialize_with_clocks(&self.clocks, serializer)
+        self.serialize_with_layout(&self.clocks, self.partition.as_deref(), serializer)
     }
 }
 impl World {
-    pub(super) fn serialize_with_clocks<S: Serializer>(
+    pub(super) fn serialize_with_layout<S: Serializer>(
         &self,
         clocks: &BTreeMap<String, super::ClockCheckpoint>,
+        partition: Option<&super::partition::Layout>,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         #[derive(Serialize)]
@@ -191,34 +123,17 @@ impl World {
             clocks: &'a BTreeMap<String, super::ClockCheckpoint>,
             #[serde(skip_serializing_if = "Option::is_none")]
             control_target: Option<Option<Id>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            partition: Option<&'a super::partition::Layout>,
             entities: &'a BTreeMap<Id, Entity>,
         }
-        let owned;
-        let entities: &BTreeMap<Id, Entity> = if self.runtime.values.is_empty() {
-            &self.entities
-        } else {
-            owned = {
-                let mut entities = BTreeMap::clone(&self.entities);
-                for (id, fields) in &self.runtime.values {
-                    let Some(entity) = entities.get_mut(id) else {
-                        continue;
-                    };
-                    for (&key, value) in fields {
-                        if let Some(raw) = entity.components.get_mut(key) {
-                            *raw = value.to_json().map_err(serde::ser::Error::custom)?;
-                        }
-                    }
-                }
-                entities
-            };
-            &owned
-        };
         Document {
             version: self.version,
             time_seconds: self.time_seconds,
             clocks,
             control_target: self.control_selection(),
-            entities,
+            entities: &self.entities,
+            partition,
         }
         .serialize(serializer)
     }

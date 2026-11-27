@@ -1,0 +1,26 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#define PAGE_TABLE 0
+#include "stream_pages.glsl"
+layout(local_size_x=32) in;
+layout(triangles,max_vertices=96,max_primitives=32) out;
+layout(set=0,binding=1,std430) readonly buffer Scene {mat4 vp;uvec4 offsets;uvec4 sizes;};
+layout(location=0) out vec2 uv[];
+void main(){
+    uint faces=2*sizes.y*sizes.y;
+    uint start=gl_WorkGroupID.x*32, count=min(32u,faces-start);
+    SetMeshOutputsEXT(count*3,count);
+    uint lane=gl_LocalInvocationIndex;
+    if(lane>=count)return;
+    uint tri=start+lane;
+    for(uint i=0;i<3;i++){
+        uint offset=(3*tri+i)*2;
+        vec2 t=unpackUnorm2x16(wordAt(offsets.y,offset));
+        vec3 pos=vec3(2*t.x-1,2*t.y-1,uintBitsToFloat(wordAt(offsets.y,offset+1)));
+        uint joint=min(uint(t.y*float(sizes.z)),sizes.z-1);
+        pos.z+=uintBitsToFloat(wordAt(offsets.z,joint))*t.y;
+        gl_MeshVerticesEXT[lane*3+i].gl_Position=vp*vec4(pos,1);
+        uv[lane*3+i]=t;
+    }
+    gl_PrimitiveTriangleIndicesEXT[lane]=uvec3(3*lane)+uvec3(0,1,2);
+}

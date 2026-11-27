@@ -13,6 +13,11 @@ use std::path::Path;
 type SceneBuilder = fn() -> Result<World>;
 
 pub(super) const PRESETS: &[(&str, SceneBuilder)] = &[
+    (
+        "world-stream",
+        render_lab::experiments::movement_lab::partitioned,
+    ),
+    ("streaming", render_lab::experiments::streaming_lab::scene),
     ("clusters", clusters::scene),
     ("vegetation", vegetation::scene),
     ("vegetation-scale", vegetation::forest),

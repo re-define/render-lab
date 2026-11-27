@@ -10,7 +10,11 @@ use std::{
 mod changes;
 pub(crate) use changes::{Cursor as ChangeCursor, PublishedPose, Write as EntityWrite};
 pub use changes::{Entities, LocalPose, PoseLayout};
+mod component_set;
+pub use component_set::ComponentSet;
+pub(crate) use component_set::Field;
 mod components;
+pub mod partition;
 pub(crate) use components::Stored;
 mod geometry_assets;
 pub use geometry_assets::{GeometryAssets, LocalBounds};
@@ -225,7 +229,7 @@ pub struct Entity {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plant: Option<Arc<PlantGeometry>>,
     // Namespaced plugin components round-trip even when their systems are absent.
-    pub components: BTreeMap<String, Value>,
+    pub components: ComponentSet,
 }
 impl Instance {
     pub fn new(mesh: Id, material: Option<Id>) -> Self {
@@ -258,7 +262,7 @@ impl Default for Entity {
             hierarchy: None,
             topology: None,
             plant: None,
-            components: BTreeMap::new(),
+            components: ComponentSet::default(),
         }
     }
 }
@@ -284,6 +288,8 @@ impl<'de> Deserialize<'de> for ControlTarget {
 #[derive(Clone, Deserialize)]
 pub struct World {
     version: u32,
+    #[serde(default)]
+    pub partition: Option<Arc<partition::Layout>>,
     /// Simulation seconds at the current dispatch, or the accepted boundary between ticks.
     #[serde(default)]
     pub(crate) time_seconds: f64,
@@ -296,7 +302,7 @@ pub struct World {
     pub(crate) motion_writers: &'static [RootWriter],
     pub entities: Entities,
     #[serde(skip)]
-    runtime: components::RuntimeComponents,
+    binding_edits: BTreeMap<&'static str, u64>,
     #[serde(skip)]
     pub(crate) simulation_resources: BTreeMap<&'static str, Arc<dyn std::any::Any + Send + Sync>>,
 }
@@ -304,12 +310,13 @@ impl Default for World {
     fn default() -> Self {
         Self {
             version: 1,
+            partition: None,
             time_seconds: 0.,
             motion_writers: &[],
             clocks: Default::default(),
             control_target: ControlTarget::Automatic,
             entities: Entities::default(),
-            runtime: Default::default(),
+            binding_edits: Default::default(),
             simulation_resources: Default::default(),
         }
     }
@@ -341,8 +348,9 @@ impl World {
             .entities
             .last_key_value()
             .map_or(1, |(k, _)| k.checked_add(1).expect("entity IDs exhausted"));
+        let id = self.partition.as_ref().map_or(id, |l| l.reserve_after(id));
         self.entities.insert(id, e);
-        self.runtime.remove_entity(id);
+
         id
     }
     pub fn validate(&self) -> Result<()> {
@@ -534,7 +542,9 @@ impl World {
         for id in self.transform_order()? {
             let entity = &self.entities[&id];
             let parent = entity.parent.map_or(Mat4::IDENTITY, |p| output[&p]);
-            output.insert(id, parent * entity.local);
+            let model = parent * entity.local;
+            ensure!(model.is_finite(), "non-finite transform at entity {id}");
+            output.insert(id, model);
         }
         Ok(output)
     }
@@ -578,7 +588,12 @@ impl World {
         let mut file = tempfile::NamedTempFile::new_in(dir)?;
         {
             let mut writer = std::io::BufWriter::new(file.as_file_mut());
-            self.serialize_with_clocks(clocks, &mut serde_json::Serializer::new(&mut writer))?;
+            let layout = self.partition.as_ref().map(|l| l.export(dir)).transpose()?;
+            self.serialize_with_layout(
+                clocks,
+                layout.as_ref(),
+                &mut serde_json::Serializer::new(&mut writer),
+            )?;
             std::io::Write::flush(&mut writer)?;
         }
         file.as_file().sync_all()?;
@@ -588,6 +603,11 @@ impl World {
     pub fn load(path: &Path) -> Result<Self> {
         let mut world: Self =
             serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(path)?))?;
+        if let Some(l) = &mut world.partition {
+            let l = Arc::make_mut(l);
+            l.base = path.parent().unwrap_or(Path::new(".")).to_owned();
+            l.validate()?;
+        }
         world.validate()?;
         // v1 stored the shading path on each use. Split only mismatching legacy uses
         // and share a material variant between all uses with the same old model.

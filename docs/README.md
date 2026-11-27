@@ -13,3 +13,5 @@
 **追一次银狼触地。** [角色子步协议](architecture/character-motion.md)说明谁能写根变换，[动作匹配](algorithms/animation-physics.md)说明怎样选姿，[物理骨链与末端约束](algorithms/physical-animation.md)说明怎样承重、落脚和扶栏。换角色时的组合能力见[UAF、Mover 与 Chaos 对照](unreal/animation-physics.md)。
 
 修改引擎时使用[开发与验证规范](../CONTRIBUTING.md)。使用仓库附带的模型、动作和环境贴图时查阅[资产来源与许可](../assets/README.md)。
+
+**追一次流式卸载。** [运行时资源与流式驻留](architecture/runtime-resources.md)按文件请求、传输提交、GPU 地址表发布和最后一次引用释放解释资产页的寿命，也包含世界单元与物理模拟的边界。

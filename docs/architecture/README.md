@@ -8,6 +8,7 @@ flowchart TD
     Main -->|移动意图| Action["Move、动画、物理、接触 IK"]
     Action -->|子步提交| Main
     Main -->|命令试听或已施加冲量| Audio["二维音效 · 设备混音与播放"]
+    Cells["世界分区 · 后台读档与检查点"] -->|按流式源激活或卸载| Main
     Main -->|准入成功| Extract["增量提取 · 共享场景快照"]
     Extract --> Render["渲染线程 · 视图、历史、实验装配的 Technique"]
     Render --> Light["可组合光照 · 表面、直接光、滤波、GI、IBL"]
@@ -17,6 +18,8 @@ flowchart TD
     Light --> RDG
     RDG --> RHI["RHI 线程 · 资源与帧槽、命令录制、提交"]
     RHI --> GPU["Vulkan 物理队列"]
+    GPU -->|可见页需求，随帧退役| Pages["资产页管理 · 预算与后台 I/O"]
+    Pages -->|不可变帧地址表与 transfer pass| RDG
     GPU -->|主视口| Window["交换链呈现 · GPUI HUD"]
     GPU -->|显式读回| Export["截图、录像、诊断"]
     RHI -->|已完成帧与时间戳| Reports["HUD、控制台、基准"]
@@ -54,3 +57,5 @@ flowchart TD
 - [世界与模块时钟](world-runtime.md)说明场景装配、实体运动权和系统依赖；[角色子步协议](character-motion.md)定义 Move、动画与物理之间的写入边界。
 - [场景提取](extraction.md)说明资产与姿态怎样进入不可变快照；[渲染图与 RHI](render-graph.md)说明快照怎样变成资源、队列提交和最终画面。
 - [性能与复现](performance.md)区分各线程、GPU 时间跨度和窗口间隔，并给出森林和人群基准的采样条件。
+
+CPU 自定义资产、文件页、设备页池、跨帧引用与世界单元的销毁顺序见[运行时资源与流式驻留](runtime-resources.md)。

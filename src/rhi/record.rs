@@ -459,6 +459,32 @@ impl Recorder {
                     .unwrap()
                     .trace(d, cmd, extent);
             }
+            Op::CopyStreamPage { src, dst, .. }
+                if matches!(res[src.0], Physical::Vacant)
+                    || matches!(res[dst.0], Physical::Vacant) => {}
+            Op::CopyStreamPage { src, dst, bytes } => {
+                let region = vk::BufferCopy::builder().size(bytes as u64);
+                let source = match &res[src.0] {
+                    #[cfg(lab_directstorage)]
+                    Physical::External(import) => {
+                        let acquire = vk::BufferMemoryBarrier2::builder()
+                            .src_stage_mask(S::NONE)
+                            .dst_stage_mask(S::COPY)
+                            .dst_access_mask(A::TRANSFER_READ)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+                            .dst_queue_family_index(self.gpu.family)
+                            .buffer(import.buffer)
+                            .size(vk::WHOLE_SIZE);
+                        d.cmd_pipeline_barrier2(
+                            cmd,
+                            &vk::DependencyInfo::builder().buffer_memory_barriers(&[acquire]),
+                        );
+                        import.buffer
+                    }
+                    source => source.buffer().raw,
+                };
+                d.cmd_copy_buffer(cmd, source, res[dst.0].buffer().raw, &[region]);
+            }
             Op::ReadPixels { image, buffer } | Op::WritePixels { image, buffer } => {
                 let [width, height] = plan.graph.image_desc(image).unwrap().extent;
                 let layers = vk::ImageSubresourceLayers::builder()

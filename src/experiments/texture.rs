@@ -92,7 +92,7 @@ pub fn scene() -> Result<World> {
     settings.bind(&mut w);
     w.spawn(Entity {
         name: "Modern Hall texture compression".into(),
-        components: BTreeMap::from([(SETTING.into(), serde_json::to_value(settings)?)]),
+        components: [(SETTING.into(), serde_json::to_value(settings)?)].into(),
         ..Default::default()
     });
     Ok(w)

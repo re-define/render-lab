@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail, ensure};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 pub const SETTING: &str = "lab.ibl";
 const PROGRAM: &str = "Environment PBR";
@@ -25,7 +25,6 @@ pub(super) const CAMERA: Camera = Camera {
     yaw: 0.,
     pitch: 0.01,
 };
-static TABLES: OnceLock<Arc<[u8]>> = OnceLock::new();
 
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
 #[repr(u32)]
@@ -170,13 +169,12 @@ struct Uniform {
 pub(super) struct Ibl(Arc<[u8]>);
 impl Ibl {
     pub(super) fn new(tasks: &rayon::ThreadPool) -> Result<Self> {
-        let tables = if let Some(tables) = TABLES.get() {
-            tables
-        } else {
-            let baked = tasks.install(bake::tables)?;
-            TABLES.get_or_init(|| baked)
-        };
-        Ok(Self(tables.clone()))
+        Ok(Self(crate::assets::cooked_bytes(
+            "ibl-studio",
+            1,
+            bake::HDR,
+            || tasks.install(bake::tables),
+        )?))
     }
 
     pub(super) fn resources(

@@ -43,6 +43,11 @@ pub(super) struct Pose {
     pub(super) turn_step: f32,
 }
 impl SilverMatcher {
+    pub(super) fn shared() -> Result<Arc<Self>> {
+        static BANK: std::sync::LazyLock<crate::assets::SharedAsset<SilverMatcher>> =
+            std::sync::LazyLock::new(Default::default);
+        BANK.acquire(|| Self::load().map(Arc::new))
+    }
     pub fn load() -> Result<Self> {
         let index: Index = serde_json::from_str(INDEX)?;
         ensure!(
