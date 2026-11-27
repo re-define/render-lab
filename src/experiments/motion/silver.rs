@@ -24,7 +24,7 @@ pub(in crate::experiments) const MODULE: SceneModule = SceneModule {
                 );
             }
         }
-        a.movement = Some(MOVEMENT);
+        a.movement.register(MOVEMENT)?;
         install(world, &mut a.schedule)
     },
 };
@@ -33,6 +33,7 @@ use crate::movement::{MovementDriver, RootMotionRequest};
 use crate::scene::{MOTION_POLICY, Mobility, MotionPolicy, PhysicsParticipation};
 pub mod contact;
 mod locomotion;
+mod profile;
 mod search;
 mod trajectory_view;
 use crate::experiments::cartoon;
@@ -45,7 +46,7 @@ pub(super) const MOVEMENT: MovementDriver = MovementDriver {
             .contains_key(contact::SETTING)
     },
     active: |world, id| Ok(player(world, id)?.move_root),
-    apply: |world, id, intent| set_actor_goal(world, id, intent.side, intent.forward),
+    apply: |world, id, intent| set_analog_goal(world, id, intent.side, intent.forward),
 };
 pub(crate) fn cosmetic_pose(w: &World, actor: Id) -> bool {
     w.entities.get(&actor).is_some_and(|e| {
@@ -99,6 +100,12 @@ struct State {
     #[serde(default)]
     evaluated: usize,
     bones: Vec<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rig: Option<Arc<profile::RigMap>>,
+    #[serde(default)]
+    root_source: profile::RootSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed: Option<locomotion::Observed>,
     #[serde(skip)]
     layout: Option<crate::scene::PoseLayout>,
     /// Actual parent-space velocity to hand off if contact dynamics takes the root.
@@ -127,6 +134,51 @@ struct State {
     yaw: f32,
 }
 impl State {
+    fn observe_motion(
+        &mut self,
+        root: Mat4,
+        velocity: Vec3,
+        support_velocity: Vec3,
+        normal: Option<Vec3>,
+        feet: [bool; 2],
+    ) {
+        let facing = root.to_scale_rotation_translation().1.conjugate();
+        let planar = |v: Vec3| {
+            let local = facing * v;
+            Vec2::new(local.x, local.z)
+        };
+        let blocking_normal = normal
+            .filter(|n| n.y.abs() < 0.7)
+            .and_then(|n| planar(n).try_normalize());
+        let observation = locomotion::Observed {
+            velocity: planar(velocity - support_velocity),
+            blocking_normal,
+            planted: [feet[1], feet[0]],
+        };
+        if self.observed.and_then(|p| p.blocking_normal).is_some() != blocking_normal.is_some() {
+            self.search_in = 0;
+        }
+        self.observed = Some(observation);
+    }
+    fn query_features(&self, predicted: &Pose) -> search::Feature {
+        let mut raw = [0.; 24];
+        for (i, time) in HORIZONS.into_iter().enumerate() {
+            let (path, facing) = self.predict(time);
+            raw[4 * i..4 * i + 2].copy_from_slice(&path.to_array());
+            raw[4 * i + 2..4 * i + 4].copy_from_slice(&facing.to_array());
+        }
+        raw[12..].copy_from_slice(&predicted.feet);
+        if let Some(m) = self.observed {
+            for (foot, planted) in m.planted.into_iter().enumerate() {
+                if planted {
+                    // A planted ankle on its support moves opposite the root in bank-local space.
+                    raw[18 + foot * 3] = -m.velocity.x;
+                    raw[20 + foot * 3] = -m.velocity.y;
+                }
+            }
+        }
+        raw
+    }
     fn target_velocity(&self) -> Vec2 {
         Vec2::new(self.side, self.speed)
     }
@@ -144,7 +196,19 @@ impl State {
 
     fn predict(&self, time: f32) -> (Vec2, Vec2) {
         if self.move_root {
-            let travel = self.advance(time);
+            let travel = self.observed.map_or_else(
+                || self.advance(time),
+                |m| {
+                    locomotion::travel(
+                        m.velocity,
+                        m.allowed(self.acceleration),
+                        self.yaw_rate,
+                        m.allowed(self.target_velocity()),
+                        self.turn,
+                        time,
+                    )
+                },
+            );
             return (
                 travel.displacement,
                 Vec2::new(travel.turn.sin(), travel.turn.cos()),
@@ -172,7 +236,16 @@ fn player(world: &World, id: Id) -> Result<std::borrow::Cow<'_, State>> {
 }
 
 pub(in crate::experiments) fn hydrate(world: &mut World) -> Result<()> {
-    world.hydrate_components::<State>(PLAYER)
+    world.hydrate_components::<State>(PLAYER)?;
+    for &actor in world.entities.component_owners(PLAYER) {
+        let state = player(world, actor)?;
+        state
+            .rig
+            .as_deref()
+            .unwrap_or(&profile::DEFAULT.rig)
+            .validate(state.bones.len())?;
+    }
+    Ok(())
 }
 
 pub struct Status {
@@ -213,6 +286,8 @@ struct Pose {
     hip: Vec3,
     rotations: Vec<Quat>,
     ground_velocity: Vec2,
+    root_step: Vec2,
+    turn_step: f32,
 }
 pub struct SilverMatcher {
     search: search::Index,
@@ -242,7 +317,7 @@ impl SilverMatcher {
             "invalid motion bank length"
         );
         let mut poses = Vec::with_capacity(offset);
-        let mut raw_features = Vec::with_capacity(offset);
+        let mut raw_features: Vec<search::Feature> = Vec::with_capacity(offset);
         for bytes in DATA.chunks_exact(width * 4) {
             let f: Vec<_> = bytes
                 .chunks_exact(4)
@@ -264,7 +339,24 @@ impl SilverMatcher {
                 hip: Vec3::from_slice(&f[25..28]),
                 rotations,
                 ground_velocity: Vec2::from_slice(&f[..2]) / HORIZONS[0],
+                root_step: Vec2::ZERO,
+                turn_step: 0.,
             });
+        }
+        // The first baked trajectory feature points six samples ahead (clamped at clip end).
+        // Recover the root path up to a constant translation, then take exact one-frame deltas.
+        for (range, _) in &clips {
+            let mut positions = vec![Vec2::ZERO; range.len()];
+            for i in (0..range.len() - 1).rev() {
+                let row = range.start + i;
+                let heading = poses[row].heading;
+                let rot = glam::Mat2::from_angle(-heading);
+                positions[i] = positions[(i + 6).min(range.len() - 1)]
+                    - rot * Vec2::from_slice(&raw_features[row][..2]);
+                poses[row].root_step = rot.transpose() * (positions[i + 1] - positions[i]);
+                let angle = poses[row + 1].heading - heading;
+                poses[row].turn_step = angle.sin().atan2(angle.cos());
+            }
         }
         let search = search::Index::load(raw_features, &clips)?;
         Ok(Self {
@@ -275,7 +367,7 @@ impl SilverMatcher {
     }
     fn step(&self, p: &mut State) -> Result<Option<(usize, usize)>> {
         let outgoing = p.sample;
-        let (span, current_clip) = self
+        let (span, _) = self
             .clips
             .iter()
             .find(|(r, _)| r.contains(&p.sample))
@@ -289,29 +381,26 @@ impl SilverMatcher {
         // Once the controller settles, keep start/stop clips out of the steady
         // loop. During acceleration, braking and changes of direction all poses
         // remain available.
-        let target = p.target_velocity();
-        let class = if target == Vec2::ZERO {
-            (!p.move_root || p.velocity.length_squared() < 0.08f32.powi(2))
+        let target = p
+            .observed
+            .map_or(p.target_velocity(), |m| m.allowed(p.target_velocity()));
+        let speed = p.observed.map_or(p.velocity, |m| m.velocity);
+        let class = if target.length_squared() < 1e-10 {
+            (!p.move_root || speed.length_squared() < 0.08f32.powi(2))
                 .then_some(search::Candidate::Idle)
         } else {
-            (p.move_root && (p.velocity - target).length() < target.length() * 0.26)
+            (p.move_root && (speed - target).length() < target.length() * 0.26)
                 .then_some(search::Candidate::Steady)
         };
         if p.search_in > 0
             && next + LOOKAHEAD < span.end
-            && class.is_none_or(|candidate| candidate == search::Candidate::of(current_clip))
+            && class.is_none_or(|candidate| candidate == self.search.candidate(p.sample))
         {
             p.sample = next;
             p.search_in -= 1;
             return Ok(None);
         }
-        let mut raw = [0.; 24];
-        for (i, time) in HORIZONS.into_iter().enumerate() {
-            let (path, facing) = p.predict(time);
-            raw[4 * i..4 * i + 2].copy_from_slice(&path.to_array());
-            raw[4 * i + 2..4 * i + 4].copy_from_slice(&facing.to_array());
-        }
-        raw[12..].copy_from_slice(&predicted.feet);
+        let raw = p.query_features(predicted);
         let hit = self
             .search
             .nearest(&raw, p.mode, next, span, &self.clips, class);
@@ -337,9 +426,27 @@ impl SilverMatcher {
         dt: f32,
     ) -> Result<()> {
         let root = cx.local(id)?.context("missing motion root")?;
-        let (requested, joints) = self.sample_pose(p, root, dt, |_, id| {
+        let inherited = if p.standalone_velocity.is_none() {
+            cx.component::<crate::movement::character::ResolvedMotion>(
+                id,
+                crate::movement::character::RESOLVED,
+            )?
+            .map(|m| m.velocity)
+        } else {
+            None
+        };
+        if let Some(velocity) = inherited {
+            let local = root.to_scale_rotation_translation().1.conjugate() * velocity;
+            p.velocity = Vec2::new(local.x, local.z);
+            p.acceleration = Vec2::ZERO;
+        }
+        p.observed = None;
+        let (mut requested, joints) = self.sample_pose(p, root, dt, |_, id| {
             cx.local(id)?.context("missing motion joint")
         })?;
+        if let Some(velocity) = inherited {
+            requested.w_axis = (root.w_axis.truncate() + velocity * dt).extend(1.);
+        }
         if p.layout
             .as_ref()
             .is_none_or(|layout| layout.joints() != p.bones)
@@ -364,19 +471,24 @@ impl SilverMatcher {
         mut previous_local: impl FnMut(usize, Id) -> Result<Mat4>,
     ) -> Result<(Mat4, Vec<Mat4>)> {
         ensure!(
-            p.sample < self.poses.len() && p.bones.len() == self.poses[p.sample].rotations.len(),
+            p.sample < self.poses.len()
+                && (0. ..1.).contains(&p.fraction)
+                && p.bones.len() == self.poses[p.sample].rotations.len(),
             "invalid motion binding"
         );
         let time = dt.min(0.25);
         let scale = root.to_scale_rotation_translation().0;
         let mut root = root.w_axis.truncate();
+        let clip_root = p.move_root && matches!(p.root_source, profile::RootSource::Clip);
         if p.move_root {
             let travel = p.advance(time);
             let delta = travel.displacement;
-            root += Quat::from_rotation_y(p.yaw) * Vec3::new(delta.x, 0., delta.y);
+            if !clip_root {
+                root += Quat::from_rotation_y(p.yaw) * Vec3::new(delta.x, 0., delta.y);
+                p.yaw = (p.yaw + travel.turn).rem_euclid(std::f32::consts::TAU);
+            }
             p.velocity = travel.velocity;
             p.acceleration = travel.acceleration;
-            p.yaw = (p.yaw + travel.turn).rem_euclid(std::f32::consts::TAU);
             p.yaw_rate = travel.yaw_rate;
         }
         let mut playback = 1.;
@@ -389,11 +501,24 @@ impl SilverMatcher {
                 playback = (p.velocity.dot(motion) / speed.powi(2)).clamp(0.85, 1.15);
             }
         }
-        p.fraction += time * HZ * playback;
+        let mut samples = time * HZ * playback;
         let mut jump = None;
-        while p.fraction >= 1. {
-            p.fraction -= 1.;
-            jump = self.step(p)?.or(jump);
+        while samples > 0. {
+            let weight = samples.min(1. - p.fraction);
+            if clip_root {
+                let pose = &self.poses[p.sample];
+                let delta = pose.root_step * weight;
+                // All fractions of a sample share its original facing, including after a save/reload.
+                let facing = p.yaw - p.fraction * pose.turn_step;
+                root += Quat::from_rotation_y(facing) * Vec3::new(delta.x, 0., delta.y);
+                p.yaw += pose.turn_step * weight;
+            }
+            samples -= weight;
+            p.fraction += weight;
+            if p.fraction >= 1. {
+                p.fraction = 0.;
+                jump = self.step(p)?.or(jump);
+            }
         }
         let pose = &self.poses[p.sample];
         let end = self
@@ -404,6 +529,7 @@ impl SilverMatcher {
             .0
             .end;
         let after = &self.poses[(p.sample + 1).min(end - 1)];
+        let rig = p.rig.as_deref().unwrap_or(&profile::DEFAULT.rig);
         let mut transition = jump.map(|(old, next)| {
             let old = &self.poses[old];
             let old_next = &self.poses[next];
@@ -414,7 +540,8 @@ impl SilverMatcher {
                     elapsed: 0.,
                     hip: locomotion::Offset {
                         value: Vec3::ZERO,
-                        velocity: ((old_next.hip - old.hip) - (after.hip - pose.hip)) * HZ,
+                        velocity: rig.hip_offset((old_next.hip - old.hip) - (after.hip - pose.hip))
+                            * HZ,
                     },
                     joints: Vec::with_capacity(p.bones.len()),
                 },
@@ -426,21 +553,21 @@ impl SilverMatcher {
                 p.transition = None;
             }
         }
-        let target_hip = p.hip_origin + pose.hip.lerp(after.hip, p.fraction);
+        let target_hip = p.hip_origin + rig.hip_offset(pose.hip.lerp(after.hip, p.fraction));
         let mut joints = Vec::with_capacity(p.bones.len());
         for (i, &bone) in p.bones.iter().enumerate() {
             let (scale, previous, mut translation) =
                 previous_local(i, bone)?.to_scale_rotation_translation();
-            let target = pose.rotations[i].slerp(after.rotations[i], p.fraction);
+            let target = rig.rotation(i, pose.rotations[i].slerp(after.rotations[i], p.fraction));
             let rotation = if let Some((old, next, blend)) = &mut transition {
                 blend.joints.push(locomotion::Offset {
                     value: locomotion::rotation_difference(target, previous),
                     velocity: (locomotion::rotation_difference(
-                        old.rotations[i],
-                        next.rotations[i],
+                        rig.rotation(i, old.rotations[i]),
+                        rig.rotation(i, next.rotations[i]),
                     ) - locomotion::rotation_difference(
-                        pose.rotations[i],
-                        after.rotations[i],
+                        rig.rotation(i, pose.rotations[i]),
+                        rig.rotation(i, after.rotations[i]),
                     )) * HZ,
                 });
                 previous
@@ -449,7 +576,7 @@ impl SilverMatcher {
             } else {
                 target
             };
-            if i == 0 {
+            if i == rig.pelvis {
                 if let Some((_, _, blend)) = &mut transition {
                     blend.hip.value = translation - target_hip;
                 } else {
@@ -482,6 +609,7 @@ impl SimulationSystem for SilverMatcher {
             reads: &[
                 Component(PLAYER),
                 Component(contact::SETTING),
+                Component(crate::movement::character::RESOLVED),
                 Component(MOTION_POLICY),
                 LocalTransformsById,
             ],
@@ -548,19 +676,36 @@ pub fn set_keyboard_goal(w: &mut World, side: i8, forward: i8) -> Result<()> {
     set_actor_goal(w, id, side, forward)
 }
 fn set_actor_goal(w: &mut World, id: Id, side: i8, forward: i8) -> Result<()> {
+    set_analog_goal(w, id, f32::from(side), f32::from(forward))
+}
+fn set_analog_goal(w: &mut World, id: Id, side: f32, forward: f32) -> Result<()> {
     let mut p = player(w, id)?.into_owned();
-    if forward > 0 && side != 0 {
-        p.speed = 1.35;
-        p.side = 0.;
-        p.turn = f32::from(side) * 1.35;
+    if forward >= 0. {
+        p.speed = 1.35 * forward;
+        p.side = 1.2 * side * (1. - forward);
+        p.turn = side * forward * 1.35;
     } else {
-        let direction = Vec2::new(f32::from(side), f32::from(forward)).clamp_length_max(1.);
+        let direction = Vec2::new(side, forward).clamp_length_max(1.);
         p.side = direction.x * 1.2;
-        p.speed = direction.y * if direction.y < 0. { 0.9 } else { 1.35 };
+        p.speed = direction.y * 0.9;
         p.turn = 0.;
     }
     p.move_root = true;
     p.search_in = 0;
+    w.set_typed_component(id, PLAYER, p);
+    Ok(())
+}
+pub fn set_root_source(w: &mut World, target: Option<Id>, mode: &str) -> Result<()> {
+    let source = match mode {
+        "controller" => profile::RootSource::Controller,
+        "clip" => profile::RootSource::Clip,
+        _ => anyhow::bail!("motionroot controller/clip"),
+    };
+    let id = target
+        .or_else(|| actor(w))
+        .context("no Silver Wolf motion player")?;
+    let mut p = player(w, id)?.into_owned();
+    p.root_source = source;
     w.set_typed_component(id, PLAYER, p);
     Ok(())
 }
@@ -615,6 +760,9 @@ pub fn scene() -> Result<World> {
         mode: Default::default(),
         evaluated: 0,
         bones,
+        rig: Some(Arc::new(profile::DEFAULT.rig.clone())),
+        root_source: Default::default(),
+        observed: None,
         layout: None,
         standalone_velocity: None,
         hip_origin,
@@ -648,6 +796,111 @@ pub fn scene() -> Result<World> {
 mod tests {
     use super::*;
     use crate::engine::System;
+
+    #[test]
+    fn blocked_and_carried_motion_use_solver_space_and_database_units() -> Result<()> {
+        let world = scene()?;
+        let mut p = player(&world, actor(&world).unwrap())?.into_owned();
+        p.move_root = true;
+        p.speed = 1.;
+        p.side = 0.;
+        p.turn = 0.;
+        let facing = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let moving_platform = Vec3::new(3., 0., -1.);
+        let normal = facing * Vec3::NEG_Z;
+        let bank = SilverMatcher::load()?;
+        let pose = &bank.poses[p.sample];
+        p.observe_motion(
+            Mat4::from_quat(facing),
+            moving_platform,
+            moving_platform,
+            Some(normal),
+            [false, true],
+        );
+        let blocked = p.query_features(pose);
+        for feature in blocked[..12].chunks_exact(4) {
+            assert!(feature[0].abs() < 1e-5 && feature[1].abs() < 1e-5);
+        }
+        assert_eq!([blocked[18], blocked[20]], [0., 0.]);
+        assert_eq!(&blocked[21..24], &pose.feet[9..12]);
+        bank.step(&mut p)?;
+        assert!(bank.search.candidate(p.sample) == search::Candidate::Idle);
+        let velocity = moving_platform + facing * Vec3::new(0.5, 0., 0.25);
+        p.observe_motion(
+            Mat4::from_quat(facing),
+            velocity,
+            moving_platform,
+            None,
+            [true, false],
+        );
+        let released = p.query_features(pose);
+        assert!(released[1] > blocked[1]);
+        assert!((released[21] + 0.5).abs() < 1e-5 && (released[23] + 0.25).abs() < 1e-5);
+        assert_eq!(&released[18..21], &pose.feet[6..9]);
+        p.observe_motion(
+            Mat4::from_quat(facing),
+            moving_platform + facing * (p.speed * Vec3::Z),
+            moving_platform,
+            None,
+            [false; 2],
+        );
+        bank.step(&mut p)?;
+        assert!(bank.search.candidate(p.sample) == search::Candidate::Steady);
+        Ok(())
+    }
+
+    #[test]
+    fn authored_locomotion_root_reproduces_the_baked_track_and_resumes_mid_sample() -> Result<()> {
+        let mut world = scene()?;
+        let id = actor(&world).unwrap();
+        set_root_source(&mut world, Some(id), "clip")?;
+        let mut p = player(&world, id)?.into_owned();
+        let bank = SilverMatcher::load()?;
+        // Check the independent 14- and 23-frame channels against the reconstructed 6-frame chain.
+        let stride = 28 + 4 * p.bones.len();
+        for (range, _) in &bank.clips {
+            for row in (range.start..range.end - 23).step_by(7) {
+                for (offset, horizon) in [(4, 14), (8, 23)] {
+                    let mut sum = Vec2::ZERO;
+                    for pose in &bank.poses[row..row + horizon] {
+                        sum += glam::Mat2::from_angle(bank.poses[row].heading - pose.heading)
+                            * pose.root_step;
+                    }
+                    let value = |k: usize| {
+                        let at = (row * stride + offset + k) * 4;
+                        f32::from_le_bytes(DATA[at..at + 4].try_into().unwrap())
+                    };
+                    assert!(sum.distance(Vec2::new(value(0), value(1))) < 1e-4);
+                }
+            }
+        }
+        let span = &bank
+            .clips
+            .iter()
+            .find(|(_, name)| name == "walk_41")
+            .unwrap()
+            .0;
+        p.sample = span.start + 12;
+        p.move_root = true;
+        assert!(matches!(p.root_source, profile::RootSource::Clip));
+        p.fraction = 0.;
+        p.yaw = 0.;
+        p.search_in = 20;
+        let read = |_: usize, id| Ok(world.entities[&id].local);
+        let start = p.sample;
+        let (half, _) = bank.sample_pose(&mut p, Mat4::IDENTITY, 0.5 / HZ, read)?;
+        let encoded = serde_json::to_vec(&p)?;
+        let mut loaded: State = serde_json::from_slice(&encoded)?;
+        let (resume, _) = bank.sample_pose(&mut loaded, half, 0.5 / HZ, read)?;
+        let (reference, _) = bank.sample_pose(&mut p, half, 0.5 / HZ, read)?;
+        assert!(resume.abs_diff_eq(reference, 1e-6));
+        let expected = bank.poses[start].root_step;
+        assert!(
+            Vec2::new(resume.w_axis.x, resume.w_axis.z).distance(expected) < 1e-5
+                && expected.length() > 0.001
+        );
+        Ok(())
+    }
 
     #[test]
     fn standalone_motion_preserves_fixed_root_and_rejects_unowned_dynamic_authority() -> Result<()>
@@ -941,6 +1194,9 @@ mod tests {
             mode: Default::default(),
             evaluated: 0,
             bones: vec![],
+            rig: None,
+            root_source: Default::default(),
+            observed: None,
             layout: None,
             standalone_velocity: None,
             hip_origin: Vec3::ZERO,

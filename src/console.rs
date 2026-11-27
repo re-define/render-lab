@@ -23,12 +23,12 @@ const HELP: &str = concat!(
     " · post view motion/reprojection/off · stats · schedule [profile on/off] · tick [MODULE HZ/frame/default] · memory idle/alloc/driver [NAME or #OWNER]",
     " · light list/point/sun/move/aim/power/color/enable/angular-radius · import/save/load PATH · lod PIXELS",
     " · lodview on/off · vegetation auto/triangles/voxels/pixels/wind/time/view/camera",
-    " · control [ENTITY] · motion SPEED TURN [STRAFE] · motionsearch kd/scan · motionbudget N/off · record PATH · stoprecord",
-    " · contact status/physics/auto/manual/target/hand/feet/view/action · contact gravity G · contact impulse J · contact spin DEG/S",
+    " · control [ENTITY] · drive SIDE FORWARD · motion SPEED TURN [STRAFE] · motionroot controller/clip · motionsearch kd/scan · motionbudget N/off · record PATH · stoprecord",
+    " · contact status/physics/auto/manual/target/hand/grip/limbs/feet/view/action · contact mode free/contact · contact gravity G · contact impulse J · contact spin DEG/S",
     " · toon outline/width/light/threshold/sdf/view · texture neural/original/stats",
     " · gaussian tile/bvh/compact-tile/compact-bvh/scan/original/stats",
     " · gi off/ssgi/probes/ray/view/camera · shadow hard/pcf/pcss/ray/size/bias/view/camera",
-    " · object [ID [static|movable off|query|simulated] | velocity X Y Z] · rt view/camera",
+    " · object [ID [static|movable off|query|simulated] | velocity X Y Z | drive SPEED/off] · rt view/camera",
     " · restir uniform/ris/reuse/reference/denoise/source/lights/candidates/samples/ev/camera/history-stats",
     " · ibl ev/yaw/view/sky · effect restart/time SECONDS",
     " · rays hardware/software/normals/distance/off",
@@ -70,6 +70,22 @@ impl Console {
             }
             "object" => return object::command(engine, arg),
             "memory" => return memory::describe(engine.last_memory().as_ref(), arg),
+            "drive" => {
+                let mut words = arg.split_whitespace();
+                let side = words.next().context("drive SIDE FORWARD")?.parse()?;
+                let forward = words.next().context("drive SIDE FORWARD")?.parse()?;
+                ensure!(words.next().is_none(), "drive SIDE FORWARD");
+                let id = engine
+                    .movement
+                    .target(&engine.world)
+                    .context("select a controlled entity")?;
+                engine.movement.apply_analog(
+                    Arc::make_mut(&mut engine.world),
+                    id,
+                    crate::movement::AnalogMove { side, forward },
+                )?;
+                return Ok(format!("Entity {id}: axes {side}, {forward}"));
+            }
             "control" => {
                 if !arg.is_empty() {
                     engine
@@ -111,8 +127,8 @@ impl Console {
                     _ => anyhow::bail!("schedule [profile [on|off]]"),
                 }
                 return Ok(engine.schedule.tick_profile().map_or_else(||"Simulation profiling off".into(), |p| format!(
-                    "Last tick (ms): binding {:.3}, worker evaluation {:.3}, commit {:.3}, rollback preparation {:.3}, rollback {:.3}",
-                    p.binding.as_secs_f64()*1e3,p.evaluate.as_secs_f64()*1e3,p.commit.as_secs_f64()*1e3,p.capture_undo.as_secs_f64()*1e3,p.rollback.as_secs_f64()*1e3
+                    "Last tick (ms): binding {:.3}, worker evaluation {:.3}, commit {:.3}, rollback preparation {:.3}, rollback {:.3} · writes {} (components {}) · pose {} B · undo {} records / {} matrix B",
+                    p.binding.as_secs_f64()*1e3,p.evaluate.as_secs_f64()*1e3,p.commit.as_secs_f64()*1e3,p.capture_undo.as_secs_f64()*1e3,p.rollback.as_secs_f64()*1e3, p.counts.writes,p.counts.components,p.counts.pose_bytes,p.counts.undo_records,p.counts.undo_pose_bytes
                 )));
             }
             "record" => {
@@ -288,6 +304,10 @@ impl Console {
                     engine.extraction.visual_pose_budget(),
                     engine.extraction.held_visual_actors()
                 ));
+            }
+            "motionroot" => {
+                let target = engine.movement.target(&engine.world);
+                motion::silver::set_root_source(Arc::make_mut(&mut engine.world), target, arg)?;
             }
             "motionsearch" => motion::silver::set_search(Arc::make_mut(&mut engine.world), arg)?,
             "motion" => {

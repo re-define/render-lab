@@ -44,16 +44,21 @@ impl SimulationSystem for Prepare {
             reads: &[
                 Component(SETTING),
                 Component(PLAYER),
+                Component(RESOLVED),
                 Component(MOTION_POLICY),
                 LocalTransformsById,
             ],
-            writes: &[Component(SETTING), Component(PLAYER)],
+            writes: &[Component(SETTING), Component(PLAYER), Component(PROPOSED)],
         }
     }
     fn bound_transforms(&self) -> Option<TransformTargets> {
         let mut targets = TransformTargets::default();
         for stage in &self.actors {
-            targets.reads.extend([stage.actor, stage.binding.target]);
+            targets.reads.push(stage.actor);
+            targets.reads.extend(stage.target.reads());
+            if let Some(rail) = &stage.rail {
+                targets.reads.extend(rail.reads());
+            }
             targets.reads.extend_from_slice(&stage.binding.bones);
         }
         Some(targets)
@@ -70,19 +75,41 @@ impl SimulationSystem for Prepare {
             if inherited_velocity.is_some() {
                 c.play = None;
             }
-            if inherited_velocity.is_some()
+            let binding_changed = inherited_velocity.is_some()
                 || c.source_binding
                     .as_ref()
-                    .is_some_and(|old| !Arc::ptr_eq(old, &s.binding) && **old != *s.binding)
-            {
-                c.source.clear();
+                    .is_some_and(|old| !Arc::ptr_eq(old, &s.binding) && **old != *s.binding);
+            if binding_changed {
+                c.source = Default::default();
                 c.feet = Default::default();
+                if let Some(layer) = &mut c.physical_pose {
+                    Arc::make_mut(layer).reset();
+                }
                 (c.pelvis, c.reach, c.palm_load) = (0., 0., 0.);
                 p.transition = None;
                 p.search_in = 0;
             }
             c.source_binding = Some(s.binding.clone());
             let root = local(cx, id)?;
+            let previous = cx.component::<ResolvedMotion>(id, RESOLVED)?;
+            if let Some(solved) = previous
+                .as_deref()
+                .filter(|m| !binding_changed && m.root_local.abs_diff_eq(root, 1e-4))
+            {
+                let planted = c
+                    .feet
+                    .each_ref()
+                    .map(|f| f.anchor.is_some() && !f.releasing);
+                p.observe_motion(
+                    root,
+                    solved.velocity,
+                    solved.support_velocity,
+                    solved.blocking_normal,
+                    planted,
+                );
+            } else {
+                p.observed = None;
+            }
             let policy = cx.motion_policy(id, MotionPolicy::DYNAMIC)?;
             if policy.physics != PhysicsParticipation::Simulated {
                 // Traversal waits for physical take-off and landing; free locomotion still samples the pose.
@@ -92,7 +119,11 @@ impl SimulationSystem for Prepare {
                     &mut c,
                     &mut p,
                     root.w_axis.truncate(),
-                    target_point(local(cx, s.binding.target)?),
+                    target_point(s.target.relative(|id| local(cx, id))?),
+                    s.rail
+                        .as_ref()
+                        .map(|r| r.relative(|id| local(cx, id)))
+                        .transpose()?,
                     dt,
                 );
             }
@@ -102,17 +133,38 @@ impl SimulationSystem for Prepare {
                     None => local(cx, bone),
                 }
             })?;
-            c.source.resize(base.len(), Mat4::IDENTITY);
+            let source = Arc::make_mut(&mut c.source);
+            source.resize(base.len(), Mat4::IDENTITY);
             for (&slot, joint) in s.rig.source_slots.iter().zip(base) {
-                c.source[slot] = joint;
+                source[slot] = joint;
             }
             if let Some(play) = c.play {
                 root.w_axis = c.section.ground_goal(play).extend(1.);
             }
-            c.request = Some(ContactMotion {
-                root: RootMotionRequest::new(root)?,
-                inherited_velocity,
-            });
+            let grip = s
+                .rail
+                .as_ref()
+                .filter(|_| {
+                    c.section == traversal::Section::Rail
+                        && c.play.is_some()
+                        && c.palm_load > 0.
+                        && c.grip_fraction > 0.
+                })
+                .map(|rail| GripSupport {
+                    support: rail.id,
+                    load: c.palm_load,
+                    fraction: c.grip_fraction,
+                });
+            cx.set_bound_state(
+                id,
+                PROPOSED,
+                ProposedMotion::next(
+                    previous.as_deref(),
+                    RootMotionRequest::new(root)?,
+                    inherited_velocity,
+                    grip,
+                )?,
+            )?;
             cx.set_bound_state(id, SETTING, c)?;
             cx.set_bound_state(id, PLAYER, p)
         })
@@ -129,11 +181,7 @@ impl SimulationSystem for Feedback {
     fn access(&self) -> SystemAccess {
         SystemAccess {
             name: "Foot placement and fingertip IK",
-            reads: &[
-                Component(SETTING),
-                Component(dynamics::BODY),
-                LocalTransformsById,
-            ],
+            reads: &[Component(SETTING), Component(RESOLVED), LocalTransformsById],
             writes: &[Component(SETTING), LocalTransformsById],
         }
     }
@@ -141,10 +189,10 @@ impl SimulationSystem for Feedback {
         let mut targets = TransformTargets::default();
         for s in &self.0 {
             targets.reads.extend_from_slice(&s.rig.ids);
-            targets
-                .reads
-                .extend(s.binding.course.map(|fixtures| fixtures.rail));
-            targets.reads.push(s.binding.target);
+            if let Some(rail) = &s.rail {
+                targets.reads.extend(rail.reads());
+            }
+            targets.reads.extend(s.target.reads());
             targets
                 .writes
                 .extend_from_slice(s.rig.published_joints.joints());
@@ -163,11 +211,24 @@ fn feedback(s: &Stage, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
     if let (Some(binding), Some(play)) = (&s.action_rig, c.play) {
         binding.apply(&mut pose, c.section, play);
     }
-    let body = cx
-        .component::<dynamics::Body>(s.actor, dynamics::BODY)?
-        .context("missing physics feedback")?;
-    let airborne = body.support.is_none();
-    let boxes = body.faces.as_ref();
+    let solved = cx
+        .component::<ResolvedMotion>(s.actor, RESOLVED)?
+        .context("missing resolved motion for pose feedback")?;
+    let airborne = solved.support.is_none();
+    let boxes = &solved.surfaces;
+    // Determine physical eligibility from the authored pose before applying any optional visual IK.
+    let rail_contact =
+        if let (traversal::Section::Rail, Some(play), Some(rail)) = (c.section, c.play, &s.rail) {
+            Some((play, rail.relative(|id| local(cx, id))?))
+        } else {
+            None
+        };
+    c.palm_load = rail_contact.map_or(0., |(play, rail)| {
+        traversal::grip_load(r, &pose, play, rail)
+    });
+    if let Some(layer) = &mut c.physical_pose {
+        Arc::make_mut(layer).apply(r, &mut pose, solved.gravity, boxes, dt)?;
+    }
     let facing = pose.rotation(0);
     let mut goals = [None; 2];
     let mut height = 0.;
@@ -244,17 +305,15 @@ fn feedback(s: &Stage, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
     } else {
         c.pelvis = 0.;
     }
-    let target = target_point(local(cx, s.binding.target)?);
+    let target = target_point(s.target.relative(|id| local(cx, id))?);
     let [shoulder, _, wrist] = r.arm;
     let from = pose.position(shoulder);
     let tip = pose.world[r.finger].transform_point3(r.fingertip);
     let offset = tip - pose.position(wrist);
-    c.palm_load = 0.;
     if c.hand_ik
-        && c.section == traversal::Section::Rail
-        && let (Some(play), Some(rail)) = (c.play, s.binding.course.map(|fixtures| fixtures.rail))
+        && let Some((play, rail)) = rail_contact
     {
-        c.palm_load = traversal::brace(r, &mut pose, play.frame, local(cx, rail)?);
+        traversal::brace(r, &mut pose, play, rail);
     }
     let desire = if c.hand_ik
         && c.play.is_none()
@@ -313,9 +372,16 @@ mod request_tests {
         let mut world = Arc::new(world);
         let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build()?;
         schedule.tick(&mut world, 1. / 60., &pool)?;
-        let c = world.typed_component::<Contact>(id, SETTING)?.unwrap();
+        let proposal = world
+            .typed_component::<ProposedMotion>(id, PROPOSED)?
+            .unwrap();
         assert_eq!(before, world.entities[&id].local);
-        assert!(c.request.unwrap().root.target_local().w_axis.z > before.w_axis.z);
+        assert!(proposal.root.target_local().w_axis.z > before.w_axis.z);
+        assert!(
+            world
+                .typed_component::<ResolvedMotion>(id, RESOLVED)?
+                .is_none()
+        );
         Ok(())
     }
 }

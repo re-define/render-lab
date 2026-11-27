@@ -12,7 +12,10 @@ pub(super) const MODULE: Registration = Registration {
     key: LINEAR_BODY,
     primary: Primary::Simulation,
     restore: None,
-    install: |_, assembly| crate::movement::linear::register(&mut assembly.schedule),
+    install: |_, assembly| {
+        crate::movement::linear::register(&mut assembly.schedule)?;
+        assembly.movement.register(crate::movement::linear::DRIVER)
+    },
 };
 
 /// Left: stationary, middle: commanded horizontal motion, right: free fall.
@@ -45,6 +48,7 @@ pub fn scene() -> Result<World> {
         )?;
         world.set_motion_policy(id, policy)?;
     }
+    world.enable_linear_control(walker, 1.5)?;
     world.validate()?;
     Ok(world)
 }

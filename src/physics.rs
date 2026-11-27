@@ -1,8 +1,37 @@
-//! Translational dynamics in SI units. The caller owns the fixed clock and collision geometry.
+//! Rigid motion, collision geometry and pose constraints in SI units. The caller owns the fixed clock.
+mod angular;
+pub mod articulation;
+pub use angular::{ANGULAR_BODY, AngularBody};
+pub(crate) mod collision;
 mod support;
+mod sweep;
+pub use collision::{BoxCollider, BoxSurface, COLLIDER, Capsule};
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 pub use support::SupportFace;
+pub(crate) use sweep::sweep_capsule;
+
+impl crate::scene::World {
+    pub(crate) fn validate_physics_components(&self) -> anyhow::Result<()> {
+        use anyhow::{Context, ensure};
+        for &id in self.entities.component_owners(COLLIDER) {
+            self.typed_component::<BoxCollider>(id, COLLIDER)?
+                .context("missing box shape")?
+                .validate()?;
+        }
+        for &id in self.entities.component_owners(ANGULAR_BODY) {
+            let body = self
+                .typed_component::<AngularBody>(id, ANGULAR_BODY)?
+                .context("missing angular body")?;
+            ensure!(
+                self.linear_body(id)?.is_some(),
+                "angular integration requires a linear body on entity {id}"
+            );
+            body.validate()?;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct Particle {

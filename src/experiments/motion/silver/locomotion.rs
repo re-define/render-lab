@@ -1,6 +1,22 @@
 use glam::{Quat, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
+/// Measurements expressed in the character facing frame, in the bank's metres and seconds.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub(super) struct Observed {
+    pub velocity: Vec2,
+    pub blocking_normal: Option<Vec2>,
+    pub planted: [bool; 2], // bank order: left, right
+}
+impl Observed {
+    pub fn allowed(self, intent: Vec2) -> Vec2 {
+        match self.blocking_normal {
+            Some(n) => intent - n * intent.dot(n).min(0.),
+            None => intent,
+        }
+    }
+}
+
 /// Integrate a critically damped velocity target and its displacement together.
 /// Prediction and real movement use this same step with different time horizons.
 pub(super) fn integrate(

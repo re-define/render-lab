@@ -396,6 +396,7 @@ fn named_domain_interleaves_plugins_and_rolls_back_an_entire_failed_step() -> Re
             for &dt in cadence {
                 if sched.tick(&mut world, dt, &pool).is_err() {
                     let measured = sched.tick_profile().unwrap();
+                    assert!(measured.counts.undo_records > 0 && measured.counts.components > 0);
                     assert!(
                         measured.evaluate > Duration::ZERO
                             && measured.capture_undo > Duration::ZERO

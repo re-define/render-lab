@@ -55,12 +55,17 @@ impl SupportFace {
         }
     }
 
-    /// Signed parent-Y angular drive about a stationary box origin (radians per second).
+    /// Signed parent-Y angular drive about the owning entity origin (radians per second).
     /// Retain the sign and speed when sampling aliased poses, including on the first tick.
-    pub(crate) fn set_driven_rotation(&mut self, radians_per_second: f32) {
+    pub(crate) fn set_driven_rotation(
+        &mut self,
+        radians_per_second: f32,
+        pivot: Vec3,
+        linear: Vec3,
+    ) {
         self.angular_velocity = Vec3::Y * radians_per_second;
-        self.pivot = self.world.w_axis.truncate();
-        self.velocity = Vec3::ZERO;
+        self.pivot = pivot;
+        self.velocity = linear;
     }
 
     /// Velocity of a material point expressed in the current world frame.
@@ -180,11 +185,17 @@ mod tests {
         let mut deck = SupportFace::from_box(1, transform, 0.6).unwrap();
         let dt = 1.;
         let omega = -2.5 * std::f32::consts::TAU;
-        deck.set_driven_rotation(omega);
+        deck.set_driven_rotation(omega, deck.world.w_axis.truncate(), Vec3::ZERO);
         let point = origin + Vec3::X;
         assert!(deck.velocity_at(point).abs_diff_eq(-omega * Vec3::Z, 1e-5));
         assert!(deck.carry(point, dt).abs_diff_eq(origin - Vec3::X, 2e-5));
         assert_eq!(deck.velocity_at(origin), Vec3::ZERO);
+        let pivot = origin - Vec3::X * 1.5;
+        deck.set_driven_rotation(2., pivot, Vec3::X);
+        assert!(
+            deck.velocity_at(origin)
+                .abs_diff_eq(Vec3::X - 3. * Vec3::Z, 1e-6)
+        );
     }
 
     #[test]

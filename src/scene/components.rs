@@ -1,8 +1,8 @@
 use super::*;
 use serde::{Serializer, de::DeserializeOwned};
-use std::{any::Any, borrow::Cow};
+use std::{any::Any, borrow::Cow, collections::HashMap};
 
-trait Stored: Send + Sync {
+pub(crate) trait Stored: Send + Sync {
     fn value(&self) -> &dyn Any;
     fn to_json(&self) -> serde_json::Result<Value>;
 }
@@ -18,7 +18,7 @@ impl<T: Serialize + Send + Sync + 'static> Stored for T {
 
 #[derive(Clone, Default)]
 pub(super) struct RuntimeComponents {
-    values: BTreeMap<(Id, &'static str), Arc<dyn Stored>>,
+    values: HashMap<Id, BTreeMap<&'static str, Arc<dyn Stored>>>,
     binding_edits: BTreeMap<&'static str, u64>,
 }
 impl RuntimeComponents {
@@ -28,21 +28,22 @@ impl RuntimeComponents {
         self.binding_edits
             .insert(key, NEXT.fetch_add(1, Ordering::Relaxed));
     }
+    fn get(&self, id: Id, key: &str) -> Option<&Arc<dyn Stored>> {
+        self.values.get(&id)?.get(key)
+    }
+    fn insert(&mut self, id: Id, key: &'static str, value: Arc<dyn Stored>) {
+        self.values.entry(id).or_default().insert(key, value);
+    }
     pub(super) fn remove_component(&mut self, id: Id, key: &'static str) {
-        self.values.remove(&(id, key));
+        if let Some(row) = self.values.get_mut(&id) {
+            row.remove(key);
+            if row.is_empty() {
+                self.values.remove(&id);
+            }
+        }
     }
     pub(super) fn remove_entity(&mut self, entity: Id) {
-        // Removing the highest ID can make the next spawn reuse it. Clear only that ID's values.
-        let from = std::ops::Bound::Included((entity, ""));
-        let to = entity
-            .checked_add(1)
-            .map_or(std::ops::Bound::Unbounded, |id| {
-                std::ops::Bound::Excluded((id, ""))
-            });
-        let keys: Vec<_> = self.values.range((from, to)).map(|(&key, _)| key).collect();
-        for key in keys {
-            self.values.remove(&key);
-        }
+        self.values.remove(&entity);
     }
 }
 
@@ -51,10 +52,10 @@ impl World {
         &self,
         id: Id,
         key: &'static str,
-    ) -> impl FnOnce(&mut Self) + Send + use<> {
-        let previous = self.entities[&id].components.get(key).cloned();
-        let typed = self.runtime.values.get(&(id, key)).cloned();
-        move |world| {
+    ) -> Option<impl FnOnce(&mut Self) + Send + use<>> {
+        let previous = self.entities.get(&id)?.components.get(key).cloned();
+        let typed = self.runtime.get(id, key).cloned();
+        Some(move |world: &mut Self| {
             let row = world
                 .entities
                 .get_mut(&id)
@@ -69,11 +70,11 @@ impl World {
             }
             match typed {
                 Some(value) => {
-                    world.runtime.values.insert((id, key), value);
+                    world.runtime.insert(id, key, value);
                 }
                 None => world.runtime.remove_component(id, key),
             }
-        }
+        })
     }
     /// First entity (in stable ID order) carrying this serialized extension key.
     /// Typed runtime components may store a JSON null marker here.
@@ -99,7 +100,7 @@ impl World {
         key: &'static str,
         raw: &Value,
     ) -> Result<Cow<'_, T>> {
-        if let Some(value) = self.runtime.values.get(&(id, key)) {
+        if let Some(value) = self.runtime.get(id, key) {
             return Ok(Cow::Borrowed(
                 value
                     .value()
@@ -116,24 +117,35 @@ impl World {
         key: &'static str,
         value: T,
     ) {
+        assert!(
+            self.set_stored_if_present(id, key, Arc::new(value), true),
+            "missing component entity"
+        );
+    }
+    pub(crate) fn remove_typed_component(&mut self, id: Id, key: &'static str) {
+        self.entities.remove_extension(id, key);
+        self.runtime.remove_component(id, key);
         self.runtime.binding_changed(key);
-        self.set_bound_state(id, key, value);
     }
     pub(crate) fn binding_version(&self, key: &'static str) -> u64 {
         self.runtime.binding_edits.get(key).copied().unwrap_or(0)
     }
-    /// Runtime state produced from an existing binding. New membership still invalidates the owner index.
-    pub(crate) fn set_bound_state<T: Serialize + Send + Sync + 'static>(
+    /// Dynamic writes preserve the binding version; introducing a key still invalidates membership.
+    pub(crate) fn set_stored_if_present(
         &mut self,
         id: Id,
         key: &'static str,
-        value: T,
-    ) {
-        self.mark_component(id, key)
-            .components
-            .entry(key.into())
-            .or_insert(Value::Null);
-        self.runtime.values.insert((id, key), Arc::new(value));
+        value: Arc<dyn Stored>,
+        changes_binding: bool,
+    ) -> bool {
+        if !self.entities.mark_typed_value(id, key) {
+            return false;
+        }
+        if changes_binding {
+            self.runtime.binding_changed(key);
+        }
+        self.runtime.insert(id, key, value);
+        true
     }
 
     pub(crate) fn hydrate_components<
@@ -147,7 +159,7 @@ impl World {
             .component_owners(key)
             .iter()
             .copied()
-            .filter(|id| !self.runtime.values.contains_key(&(*id, key)))
+            .filter(|id| self.runtime.get(*id, key).is_none())
             .map(|id| {
                 serde_json::from_value::<T>(self.entities[&id].components[key].clone())
                     .map(|value| (id, value))
@@ -176,6 +188,8 @@ impl World {
             version: u32,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             clocks: &'a BTreeMap<String, super::ClockCheckpoint>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            control_target: Option<Option<Id>>,
             entities: &'a BTreeMap<Id, Entity>,
         }
         let owned;
@@ -184,12 +198,14 @@ impl World {
         } else {
             owned = {
                 let mut entities = BTreeMap::clone(&self.entities);
-                for (&(id, key), value) in &self.runtime.values {
-                    if let Some(raw) = entities
-                        .get_mut(&id)
-                        .and_then(|e| e.components.get_mut(key))
-                    {
-                        *raw = value.to_json().map_err(serde::ser::Error::custom)?;
+                for (id, fields) in &self.runtime.values {
+                    let Some(entity) = entities.get_mut(id) else {
+                        continue;
+                    };
+                    for (&key, value) in fields {
+                        if let Some(raw) = entity.components.get_mut(key) {
+                            *raw = value.to_json().map_err(serde::ser::Error::custom)?;
+                        }
                     }
                 }
                 entities
@@ -199,6 +215,7 @@ impl World {
         Document {
             version: self.version,
             clocks,
+            control_target: self.control_selection(),
             entities,
         }
         .serialize(serializer)

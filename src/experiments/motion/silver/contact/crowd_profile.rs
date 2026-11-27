@@ -74,7 +74,7 @@ fn shared_platform_reduces_occupants_once_and_keeps_skeletons_independent() -> R
     fixture.course = None;
     fixture.auto_walk = false;
     fixture.play = None;
-    fixture.source.clear();
+    fixture.source = Default::default();
     fixture.feet = Default::default();
     let plate = fixture.plate;
     let top = w.entities[&plate].local.transform_point3(0.5 * Vec3::Y);
@@ -183,7 +183,7 @@ fn shared_platform_reduces_occupants_once_and_keeps_skeletons_independent() -> R
             .position,
         prior
     );
-    contact.source.clear();
+    contact.source = Default::default();
     Arc::make_mut(&mut w).set_motion_policy(id, MotionPolicy::DYNAMIC)?;
     Arc::make_mut(&mut w).set_typed_component(id, SETTING, contact);
     schedule.tick(&mut w, 1. / 60., &four_workers)?;
@@ -207,6 +207,18 @@ fn silver_crowd_extraction_profile() -> Result<()> {
         .num_threads(std::thread::available_parallelism()?.get().min(16))
         .build()?;
     let (mut world, mut schedule) = population(count, &pool)?;
+    if std::env::var("RENDER_LAB_PHYSICAL_LIMBS").as_deref() == Ok("1") {
+        let world = Arc::make_mut(&mut world);
+        for id in world.entities.component_owners(SETTING).to_vec() {
+            let mut contact = world
+                .typed_component::<Contact>(id, SETTING)?
+                .unwrap()
+                .into_owned();
+            physical_pose::PhysicalPose::configure(&mut contact.physical_pose, "on")?;
+            world.set_typed_component(id, SETTING, contact);
+        }
+        println!("Driven right arm and both legs enabled on all {count} actors");
+    }
     let mut extractor = SceneExtractor::default();
     let mut times = Vec::new();
     let mut sim_times = Vec::new();
@@ -247,6 +259,9 @@ fn silver_crowd_extraction_profile() -> Result<()> {
                 *sum += n;
             }
             if let Some(p) = schedule.tick_profile() {
+                if frame == 20 {
+                    println!("first measured tick commit counts: {:?}", p.counts);
+                }
                 for (series, d) in stages.iter_mut().zip([
                     p.binding,
                     p.evaluate,

@@ -20,7 +20,7 @@ pub(super) struct Assembly {
     pub caps: RayCapabilities,
     pub materials: MaterialPrograms,
     pub schedule: Schedule,
-    pub movement: Option<crate::engine::MovementDriver>,
+    pub movement: crate::engine::MovementControls,
     pub camera: Option<Camera>,
     pub technique: Option<Arc<dyn Technique>>,
     pub visibility: composition::GeometryModules,
@@ -52,7 +52,7 @@ pub(super) struct SceneConfiguration {
     camera: Camera,
     materials: Arc<MaterialPrograms>,
     schedule: Schedule,
-    movement: Option<crate::engine::MovementDriver>,
+    movement: crate::engine::MovementControls,
     technique: Arc<dyn Technique>,
 }
 impl SceneConfiguration {
@@ -116,7 +116,7 @@ impl SceneConfiguration {
             caps,
             materials: MaterialPrograms::default(),
             schedule: Schedule::default(),
-            movement: None,
+            movement: Default::default(),
             camera: None,
             technique: None,
             visibility: Default::default(),
@@ -124,6 +124,7 @@ impl SceneConfiguration {
         for m in active {
             (m.install)(world, &mut a)?;
         }
+        a.movement.validate(world)?;
         a.schedule.restore_clocks(world)?;
         a.schedule.bind_transforms(world)?;
         let (technique, camera) = match a.technique {
@@ -144,14 +145,13 @@ impl SceneConfiguration {
     }
     pub fn apply_layers(mut self, e: &mut Engine) {
         self.camera = e.camera;
-        e.movement.rebind(self.movement);
         self.apply_rendering_and_schedule(e);
     }
     pub fn apply(self, e: &mut Engine) {
-        e.movement = crate::engine::MovementControls::new(self.movement);
         self.apply_rendering_and_schedule(e);
     }
     fn apply_rendering_and_schedule(self, e: &mut Engine) {
+        e.movement = self.movement;
         e.camera = self.camera;
         e.materials = self.materials;
         e.schedule = self.schedule;
@@ -162,6 +162,90 @@ impl SceneConfiguration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn silver_and_linear_drivers_share_input_and_restore_selection() -> Result<()> {
+        use crate::movement::{AnalogMove, linear::LinearBody};
+        use crate::scene::{Entity, MotionPolicy};
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build()?;
+        let mut world = motion::silver::scene()?;
+        let actor = world.entities.component_owners(motion::silver::PLAYER)[0];
+        let probe = world.spawn(Entity::default());
+        world.set_linear_body(probe, LinearBody::default())?;
+        world.set_motion_policy(probe, MotionPolicy::KINEMATIC)?;
+        world.enable_linear_control(probe, 2.)?;
+        SceneConfiguration::restore(&mut world)?;
+        let mut scene = SceneConfiguration::prepare(&world, &pool, Default::default())?;
+        assert!(scene.movement.candidates(&world).contains(&actor));
+        assert!(scene.movement.candidates(&world).contains(&probe));
+        scene.movement.select(&mut world, actor)?;
+        scene.movement.apply_analog(
+            &mut world,
+            actor,
+            AnalogMove {
+                side: 0.,
+                forward: 0.25,
+            },
+        )?;
+        let initial = world.entities[&actor].local;
+        let mut w = Arc::new(world);
+        scene.schedule.tick(&mut w, 1. / 60., &pool)?;
+        let moved = w.entities[&actor].local;
+        assert_ne!(moved.w_axis, initial.w_axis);
+        let world = Arc::make_mut(&mut w);
+        scene.movement.select(world, probe)?;
+        scene.movement.apply_analog(
+            world,
+            probe,
+            AnalogMove {
+                side: 0.25,
+                forward: -0.5,
+            },
+        )?;
+        assert_eq!(
+            world.linear_body(probe)?.unwrap().target_velocity,
+            glam::Vec3::new(0.5, 0., -1.0)
+        );
+        assert!(
+            scene
+                .movement
+                .apply_analog(
+                    world,
+                    probe,
+                    AnalogMove {
+                        side: f32::NAN,
+                        forward: 0.
+                    }
+                )
+                .is_err()
+        );
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("controllers.json");
+        world.save_with_clocks(&path, &scene.schedule.checkpoints(world))?;
+        let mut imported = World::load(&path)?;
+        SceneConfiguration::restore(&mut imported)?;
+        let mut copy = SceneConfiguration::prepare(&imported, &pool, Default::default())?;
+        assert_eq!(copy.movement.target(&imported), Some(probe));
+        let mut imported = Arc::new(imported);
+        let many = rayon::ThreadPoolBuilder::new().num_threads(16).build()?;
+        for _ in 0..4 {
+            scene.schedule.tick(&mut w, 1. / 60., &pool)?;
+            copy.schedule.tick(&mut imported, 1. / 60., &many)?;
+        }
+        assert_eq!(w.entities[&probe].local, imported.entities[&probe].local);
+        assert!(
+            w.entities[&actor]
+                .local
+                .abs_diff_eq(imported.entities[&actor].local, 1e-5)
+        );
+        let w = Arc::make_mut(&mut w);
+        scene.movement.select(w, actor)?;
+        assert_eq!(
+            w.linear_body(probe)?.unwrap().target_velocity,
+            glam::Vec3::ZERO
+        );
+        Ok(())
+    }
+
     #[test]
     fn simulation_roles_are_resolved_before_workers_start() -> Result<()> {
         use crate::{

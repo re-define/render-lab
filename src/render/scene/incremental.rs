@@ -150,7 +150,9 @@ impl SceneExtractor {
                         return Ok(None);
                     }
                 }
-                EntityWrite::Component(key) | EntityWrite::TypedValue(key) => {
+                EntityWrite::Component(key)
+                | EntityWrite::TypedMembership(key)
+                | EntityWrite::TypedValue(key) => {
                     for (&dependent_key, owner) in &self.dependencies.components {
                         if owner.watched_settings.contains_key(key) {
                             dirty_components.insert(dependent_key);
@@ -158,7 +160,13 @@ impl SceneExtractor {
                     }
                     let Some(spec) = self.registry.get(key) else {
                         // Existing typed state preserves entity membership and raw render settings.
-                        if matches!(kind, EntityWrite::TypedValue(_)) {
+                        // A new typed state on a non-render row only affects explicitly watched settings.
+                        // MotionPolicy membership also establishes character-space skin anchors.
+                        if matches!(kind, EntityWrite::TypedValue(_))
+                            || matches!(kind, EntityWrite::TypedMembership(_))
+                                && entity.instance.is_none()
+                                && key != crate::scene::MOTION_POLICY
+                        {
                             continue;
                         }
                         // Raw settings can also affect geometry routes or visibility.

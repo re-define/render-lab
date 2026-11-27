@@ -1,8 +1,9 @@
 //! Character locomotion uses a translation-only body; posed limbs supply contact intents.
 use super::*;
 use crate::{
-    engine::SimulationData::{Component, LocalTransformsById},
-    physics::{Particle, SupportFace},
+    engine::SimulationData::{Component, LocalTransformsById, Resource as SimResource},
+    movement::character::{PROPOSED, ProposedMotion, RESOLVED, ResolvedMotion},
+    physics::{BoxSurface, Capsule, Particle, SupportFace, collision::Bounds, sweep_capsule},
 };
 
 pub(super) fn register(systems: &mut CharacterSystems, schedule: &mut Schedule) -> Result<()> {
@@ -25,7 +26,7 @@ pub(crate) const TURNTABLE: &str = "lab.physics.turntable";
 pub(crate) const SPRING: &str = "lab.physics.spring_plate";
 const PLATE_MASS: f32 = 22.;
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub(super) struct Spring {
     pub rest_y: f32,
     pub velocity: f32,
@@ -79,9 +80,8 @@ pub(super) struct Body {
     pub flight_time: f32,
     pub landing_impulse: f32,
     pub palm_impulse: f32,
-    /// Final support poses for same-substep IK. Recomputed before the first IK after load.
-    #[serde(skip)]
-    pub faces: Arc<[SupportFace]>,
+    #[serde(default)]
+    pub capsule: Capsule,
     #[serde(default, alias = "previous_centers")]
     previous_faces: Vec<(Id, PreviousFace)>,
     #[serde(default)]
@@ -101,7 +101,7 @@ impl Body {
             flight_time: 0.,
             landing_impulse: 0.,
             palm_impulse: 0.,
-            faces: Arc::default(),
+            capsule: Capsule::default(),
             previous_faces: Vec::new(),
             base_velocity: Vec3::ZERO,
         }
@@ -121,9 +121,9 @@ impl Body {
         self.palm_impulse = 0.;
         self.base_velocity = Vec3::ZERO;
         self.previous_faces.clear();
-        self.faces = Arc::default();
     }
     pub fn validate(&self) -> Result<()> {
+        self.capsule.validate()?;
         ensure!(
             self.particle.position.is_finite()
                 && self.particle.momentum.is_finite()
@@ -142,9 +142,6 @@ impl Body {
         );
         Ok(())
     }
-}
-fn support(id: Id, model: Mat4) -> Result<SupportFace> {
-    SupportFace::from_box(id, model, 0.65).context("invalid walkable support transform")
 }
 /// Optional yaw drive, registered independently on the character clock. Its state is
 /// the support entity's transform plus its speed in radians per second.
@@ -205,11 +202,13 @@ impl SimulationSystem for Turntables {
 // A platform is integrated once per substep. All occupants see its same predicted state.
 pub(super) struct Integrate(pub Vec<Vec<Arc<Stage>>>);
 struct Solved {
+    step: u64,
+    blocking_normal: Option<Vec3>,
     request: RootMotionRequest,
     before: Mat4,
     policy: MotionPolicy,
     body: Body,
-    contact: Contact,
+    contact: Option<Contact>,
     plate_velocity_delta: f32,
     plate_height_delta: f32,
     faces: Vec<SupportFace>,
@@ -218,7 +217,7 @@ impl SimulationSystem for Integrate {
     fn order(&self) -> SystemOrder {
         SystemOrder {
             key: Some(BODY),
-            after: &[PLAYER, TURNTABLE],
+            after: &[PLAYER, collision::QUERY],
         }
     }
     fn access(&self) -> SystemAccess {
@@ -227,12 +226,15 @@ impl SimulationSystem for Integrate {
             reads: &[
                 Component(MOTION_POLICY),
                 Component(BODY),
-                Component(TURNTABLE),
+                Component(PROPOSED),
+                Component(RESOLVED),
+                SimResource(collision::QUERY),
                 Component(SETTING),
                 Component(SPRING),
                 LocalTransformsById,
             ],
             writes: &[
+                Component(RESOLVED),
                 Component(BODY),
                 Component(SETTING),
                 Component(SPRING),
@@ -245,7 +247,7 @@ impl SimulationSystem for Integrate {
         for group in &self.0 {
             targets.writes.push(group[0].binding.plate);
             for s in group {
-                targets.reads.extend_from_slice(&s.supports);
+                targets.reads.push(s.binding.plate);
                 targets.reads.push(s.actor);
                 targets.writes.push(s.actor);
             }
@@ -253,12 +255,20 @@ impl SimulationSystem for Integrate {
         Some(targets)
     }
     fn run(&self, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
+        if self.0.is_empty() {
+            return Ok(());
+        }
+        let query = cx
+            .resource::<collision::Query>(collision::QUERY)?
+            .context("missing collision snapshot")?;
         cx.for_each_parallel(&self.0, |group, cx| {
             let id = group[0].binding.plate;
-            let mut plate = cx.local(id)?.context("missing spring plate")?;
-            let mut spring = *cx
+            let plate_before = cx.local(id)?.context("missing spring plate")?;
+            let mut plate = plate_before;
+            let spring_before = *cx
                 .component::<Spring>(id, SPRING)?
                 .context("missing spring state")?;
+            let mut spring = spring_before;
             let plate_policy = cx.motion_policy(id, MotionPolicy::DYNAMIC)?;
             let spring_active = plate_policy.physics == PhysicsParticipation::Simulated;
             if spring_active {
@@ -267,18 +277,19 @@ impl SimulationSystem for Integrate {
                 spring.velocity = 0.;
             }
             let predicted_y = plate.w_axis.y;
-            let face = if plate_policy.physics != PhysicsParticipation::Off {
-                let mut face = support(id, plate)?;
-                face.velocity.y = spring.velocity;
-                Some(face)
-            } else {
-                None
+            let shape = query.walkable_shape(id);
+            let plate_face = |transform| {
+                shape.and_then(|s| SupportFace::from_box(id, s.box_transform(transform), 0.65))
             };
+            let mut face = plate_face(plate);
+            if let Some(face) = &mut face {
+                face.velocity.y = spring.velocity;
+            }
             let mut delta_y = 0.;
             let mut delta_v = 0.;
             let mut solved = Vec::with_capacity(group.len());
             for actor in group {
-                let result = solve(actor, cx, dt, face, spring_active)?;
+                let result = solve(actor, cx, dt, face, spring_active, query)?;
                 delta_y += result.plate_height_delta;
                 delta_v += result.plate_velocity_delta;
                 solved.push(result);
@@ -290,7 +301,7 @@ impl SimulationSystem for Integrate {
             let final_face = if plate.w_axis.y == predicted_y {
                 face
             } else {
-                Some(support(id, plate)?)
+                plate_face(plate)
             };
 
             for (s, mut result) in group.iter().zip(solved) {
@@ -314,7 +325,7 @@ impl SimulationSystem for Integrate {
                         (f.velocity, f.angular_velocity) = twist;
                     }
                 }
-                result.body.faces = result.faces.into();
+
                 let simulated = (result.policy.physics == PhysicsParticipation::Simulated)
                     .then_some(result.body.particle.position);
                 let root = result
@@ -323,13 +334,42 @@ impl SimulationSystem for Integrate {
                 if root != result.before {
                     cx.set_pose([(s.actor, root)])?;
                 }
+                let velocity = (root.w_axis.truncate() - result.before.w_axis.truncate()) / dt;
+                let support_velocity = result
+                    .body
+                    .support
+                    .and_then(|id| result.faces.iter().find(|f| f.id == id))
+                    .map_or(Vec3::ZERO, |f| f.velocity_at(root.w_axis.truncate()));
+                cx.set_bound_state(
+                    s.actor,
+                    RESOLVED,
+                    ResolvedMotion {
+                        step: result.step,
+                        root_local: root,
+                        velocity,
+                        gravity: if result.policy.physics == PhysicsParticipation::Simulated {
+                            Vec3::NEG_Y * result.body.gravity
+                        } else {
+                            Vec3::ZERO
+                        },
+                        support: result.body.support,
+                        support_velocity,
+                        blocking_normal: result.blocking_normal,
+                        surfaces: result.faces.into(),
+                    },
+                )?;
                 cx.set_bound_state(s.actor, BODY, result.body)?;
-                cx.set_bound_state(s.actor, SETTING, result.contact)?;
+                if let Some(contact) = result.contact {
+                    cx.set_bound_state(s.actor, SETTING, contact)?;
+                }
             }
-            if spring_active {
+            if spring_active && plate != plate_before {
                 cx.set_pose([(id, plate)])?;
             }
-            cx.set_bound_state(id, SPRING, spring)
+            if spring != spring_before {
+                cx.set_bound_state(id, SPRING, spring)?;
+            }
+            Ok(())
         })
     }
 }
@@ -340,17 +380,26 @@ fn solve(
     dt: f32,
     plate: Option<SupportFace>,
     spring_active: bool,
+    query: &collision::Query,
 ) -> Result<Solved> {
-    let mut c = s.state(cx)?;
+    let c = cx
+        .component::<Contact>(s.actor, SETTING)?
+        .context("missing character state")?;
+    let section = c.section;
+    let mut play = c.play;
+    let mut play_changed = false;
     let mut body = cx
         .component::<Body>(s.actor, BODY)?
         .context("missing character body")?
         .into_owned();
     let before_root = cx.local(s.actor)?.context("missing character root")?;
-    let motion = c
-        .request
-        .take()
-        .context("animation did not publish root motion this substep")?;
+    let motion = *cx
+        .component::<ProposedMotion>(s.actor, PROPOSED)?
+        .context("missing motion proposal")?;
+    motion.validate_after(
+        cx.component::<ResolvedMotion>(s.actor, RESOLVED)?
+            .as_deref(),
+    )?;
     if let Some(velocity) = motion.inherited_velocity {
         body.reset_motion(before_root.w_axis.truncate());
         body.particle.momentum = velocity * body.particle.mass;
@@ -359,48 +408,51 @@ fn solve(
     let policy = cx.motion_policy(s.actor, MotionPolicy::DYNAMIC)?;
     let mut plate_velocity_delta = 0.;
     let mut plate_height_delta = 0.;
-    let mut floors = Vec::with_capacity(s.supports.len());
-    if policy.physics != PhysicsParticipation::Off {
-        for &id in &s.supports {
-            if id == s.binding.plate {
-                floors.extend(plate);
-            } else {
-                let support_policy = cx.motion_policy(id, MotionPolicy::FIXED_COLLIDER)?;
-                if support_policy.physics != PhysicsParticipation::Off {
-                    floors.push(support(id, cx.local(id)?.context("missing support")?)?);
-                }
-            }
-        }
+    let start = before_root.w_axis.truncate();
+    let target = request.target_local().w_axis.truncate();
+    let predicted =
+        start + body.particle.velocity() * dt - Vec3::Y * (0.5 * body.gravity * dt * dt);
+    // Include both feet and the root sweep. During jump matching retain distant landing candidates.
+    let margin = Vec3::new(
+        body.capsule.radius.max(0.75),
+        0.4,
+        body.capsule.radius.max(0.75),
+    );
+    let mut area = Bounds {
+        lo: start.min(target).min(predicted) - margin,
+        hi: start.max(target).max(predicted) + margin + Vec3::Y * body.capsule.height,
+    };
+    if play.is_some_and(|p| p.launched && !p.landed) {
+        let end = start + body.particle.velocity() * 3.;
+        area.lo = area.lo.min(end - Vec3::Y * (4.5 * body.gravity) - margin);
+        area.hi = area.hi.max(end + margin);
     }
-    if body
-        .support
-        .is_some_and(|id| !floors.iter().any(|face| face.id == id))
-    {
+    let mut candidates = if policy.physics != PhysicsParticipation::Off {
+        query.near(s.actor, body.capsule, area)
+    } else {
+        vec![]
+    };
+    // A missing sample after hot rebinding is a discontinuity. Persisted face poses only seed the first snapshot after load.
+    let saved_faces = if query.restore_history {
+        body.previous_faces.as_slice()
+    } else {
+        &[]
+    };
+    let mut floors = support_faces(
+        &candidates,
+        s.binding.plate,
+        plate,
+        spring_active,
+        saved_faces,
+        dt,
+    );
+    if body.support.is_some_and(|id| {
+        !candidates
+            .iter()
+            .any(|c| c.id == id && (c.previous.is_some() || query.restore_history))
+    }) {
         body.support = None;
         body.base_velocity = Vec3::ZERO;
-    }
-
-    for floor in &mut floors {
-        if let Some((_, prior)) = body.previous_faces.iter().find(|(id, _)| *id == floor.id) {
-            let (center, rotation) = prior.pose();
-            floor.set_previous(center, rotation, dt);
-        }
-        if let Some(rate) = cx.component::<f32>(floor.id, TURNTABLE)? {
-            // The drive rotates about parent Y through the object's origin. Its signed
-            // angular velocity is known even when the poses differ by whole turns.
-            let movable = cx
-                .motion_policy(floor.id, MotionPolicy::MOVING_COLLIDER)?
-                .mobility
-                == Mobility::Movable;
-            floor.set_driven_rotation(if movable { *rate } else { 0. });
-        }
-        // The plate has its own vertical degree of freedom.
-        if spring_active
-            && floor.id == s.binding.plate
-            && let Some(plate) = plate
-        {
-            floor.velocity.y = plate.velocity.y;
-        }
     }
     if policy.physics != PhysicsParticipation::Simulated {
         let resolved = request.resolve(policy, before_root, None)?;
@@ -414,11 +466,13 @@ fn solve(
         body.previous_faces
             .extend(floors.iter().map(|f| (f.id, PreviousFace::of(*f))));
         return Ok(Solved {
+            step: motion.step,
+            blocking_normal: None,
             before: before_root,
             request,
             policy,
             body,
-            contact: c,
+            contact: None,
             plate_velocity_delta,
             plate_height_delta,
             faces: floors,
@@ -439,17 +493,19 @@ fn solve(
     let before = body.particle.position;
     let was_grounded = body.support.is_some();
     let mass = body.particle.mass;
-    let launch = c
-        .play
-        .and_then(|p| c.section.launch(p))
+    let launch = play
+        .and_then(|p| section.launch(p))
         .filter(|_| was_grounded);
     let goal = request.target_local().w_axis.truncate();
-    if was_grounded && let Some(play) = &mut c.play {
-        play.ground_offset += base * Vec3::new(1., 0., 1.) * dt;
+    if was_grounded && let Some(play) = &mut play {
+        let offset = play.ground_offset + base * Vec3::new(1., 0., 1.) * dt;
+        play_changed |= offset != play.ground_offset;
+        play.ground_offset = offset;
     }
     if let Some((speed, scale)) = launch {
         // A single push at takeoff. The authored span sets desired forward launch speed.
-        let dv = Vec3::Z * speed - (body.particle.velocity() - base) * Vec3::new(1., 0., 1.);
+        let dv = play.unwrap().forward() * speed
+            - (body.particle.velocity() - base) * Vec3::new(1., 0., 1.);
         let impulse = dv * mass + Vec3::Y * (body.jump_impulse * scale);
         if spring_active && body.support == Some(s.binding.plate) {
             plate_velocity_delta -= impulse.y / PLATE_MASS;
@@ -458,7 +514,8 @@ fn solve(
         body.support = None;
         body.flight_time = 0.;
         body.palm_impulse = 0.;
-        c.play.as_mut().unwrap().launched = true;
+        play.as_mut().unwrap().launched = true;
+        play_changed = true;
     } else if was_grounded {
         let desired = (goal - before) * Vec3::new(1., 0., 1.) / dt;
         let current = (body.particle.velocity() - base) * Vec3::new(1., 0., 1.);
@@ -468,16 +525,33 @@ fn solve(
     }
     let mut acceleration = -body.gravity * Vec3::Y;
     if body.support.is_none()
-        && c.palm_load > 0.
-        && c.hand_ik
-        && c.section == traversal::Section::Rail
+        && let Some(grip) = motion.grip
+        && query.permits_grip(grip.support, body.capsule.mask)
     {
-        // A fraction of body weight is supported by the planted palm during the preceding pose.
-        let lift = 0.35 * body.gravity * c.palm_load;
+        let lift = grip.fraction * body.gravity * grip.load;
         acceleration += Vec3::Y * lift;
         body.palm_impulse += mass * lift * dt;
     }
     body.particle.advance(acceleration, dt);
+    // Carrier impulses and animation takeoff can send the capsule beyond the initial velocity prediction.
+    let end = body.particle.position;
+    let radius = Vec3::new(body.capsule.radius, 0., body.capsule.radius);
+    let swept = Bounds {
+        lo: before.min(end) - radius,
+        hi: before.max(end) + radius + Vec3::Y * body.capsule.height,
+    };
+    if swept.lo.cmplt(area.lo).any() || swept.hi.cmpgt(area.hi).any() {
+        candidates = query.near(s.actor, body.capsule, area.union(swept));
+        floors = support_faces(
+            &candidates,
+            s.binding.plate,
+            plate,
+            spring_active,
+            saved_faces,
+            dt,
+        );
+    }
+    let blocking_normal = collide_solids(&mut body, before, &candidates, dt);
     let end = body.particle.position;
     let grounded = body.support.is_some();
     let mut contact = None;
@@ -503,17 +577,19 @@ fn solve(
         body.flight_time += contact.map_or(dt, |(t, _, _)| dt * t);
     }
     if contact.is_none()
-        && let Some(play) = &mut c.play
+        && let Some(play) = &mut play
         && play.launched
         && !play.landed
-        && c.section == traversal::Section::Gap
+        && section == traversal::Section::Gap
     {
         let remaining = floors
             .iter()
             .filter_map(|f| f.landing_time(end, body.particle.velocity(), body.gravity))
             .min_by(f32::total_cmp);
         if let Some(remaining) = remaining {
-            c.section.sample_flight(play, body.flight_time, remaining);
+            let old = play.frame;
+            section.sample_flight(play, body.flight_time, remaining);
+            play_changed |= play.frame != old;
         }
     }
     if let Some((fraction, surf, at)) = contact {
@@ -543,11 +619,12 @@ fn solve(
         }
         if !grounded {
             body.landing_impulse = impulse.dot(surf.normal);
-            if let Some(play) = &mut c.play
+            if let Some(play) = &mut play
                 && play.launched
                 && !play.landed
             {
-                c.section.land(play, body.particle.position);
+                section.land(play, body.particle.position);
+                play_changed = true;
             }
         }
     }
@@ -567,15 +644,106 @@ fn solve(
     body.previous_faces
         .extend(floors.iter().map(|s| (s.id, PreviousFace::of(*s))));
     Ok(Solved {
+        step: motion.step,
+        blocking_normal,
         before: before_root,
         request,
         policy,
         body,
-        contact: c,
+        contact: play_changed.then(|| {
+            let mut state = c.into_owned();
+            state.play = play;
+            state
+        }),
         plate_velocity_delta,
         plate_height_delta,
         faces: floors,
     })
+}
+
+fn support_faces(
+    candidates: &[collision::Candidate],
+    plate_id: Id,
+    plate: Option<SupportFace>,
+    spring_active: bool,
+    previous_faces: &[(Id, PreviousFace)],
+    dt: f32,
+) -> Vec<SupportFace> {
+    let mut floors = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let id = candidate.id;
+        let mut face = if id == plate_id {
+            let Some(face) = plate else { continue };
+            face
+        } else {
+            candidate.face
+        };
+        let prior = candidate
+            .prior_face
+            .map(|(at, q)| (at, Some(q)))
+            .or_else(|| {
+                previous_faces
+                    .iter()
+                    .find(|(k, _)| *k == id)
+                    .map(|(_, p)| p.pose())
+            });
+        if let Some((center, rotation)) = prior {
+            face.set_previous(center, rotation, dt);
+        }
+        if let Some((rate, pivot, previous)) = candidate.drive {
+            let velocity = previous.map_or(Vec3::ZERO, |old| (pivot - old) / dt);
+            face.set_driven_rotation(rate, pivot, velocity);
+        }
+        if spring_active
+            && id == plate_id
+            && let Some(plate) = plate
+        {
+            face.velocity.y = plate.velocity.y;
+        }
+        floors.push(face);
+    }
+    floors
+}
+
+/// Clip the remaining translation at the first blocking face and continue along it.
+fn collide_solids(
+    body: &mut Body,
+    start: Vec3,
+    boxes: &[collision::Candidate],
+    dt: f32,
+) -> Option<Vec3> {
+    let mut at = start;
+    let mut end = body.particle.position;
+    let mut elapsed = 0.;
+    let mut blocking = None;
+    for _ in 0..4 {
+        let hit = boxes
+            .iter()
+            .filter(|b| b.surface == BoxSurface::Solid)
+            .filter_map(|b| {
+                let delta = b.previous.map_or(Vec3::ZERO, |old| {
+                    (b.transform.w_axis - old.w_axis).truncate()
+                });
+                let (t, n) =
+                    sweep_capsule(body.capsule, at, end, b.transform, delta * (1. - elapsed))?;
+                // Walkable top faces are solved once by the platform/landing impulse below.
+                (n.y < 0.65 || n.dot(b.face.normal) < 0.9999).then_some((t, n, delta))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0));
+        let Some((time, n, delta)) = hit else { break };
+        at = at.lerp(end, time);
+        elapsed += (1. - elapsed) * time;
+        let remaining = end - at;
+        let inward = (remaining - delta * (1. - elapsed)).dot(n).min(0.);
+        end = at + remaining - inward * n;
+        body.particle.contact(n, delta / dt, 0., 0.);
+        blocking = Some(n);
+        if time >= 1. {
+            break;
+        }
+    }
+    body.particle.position = end;
+    blocking
 }
 
 #[cfg(test)]

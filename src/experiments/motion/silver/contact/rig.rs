@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 // Most distal fully weighted index-finger vertex in the Silver Wolf asset,
 // expressed in IndexFinger3_R_069 bind space (mesh "2", vertex 8702).
+#[cfg(test)]
 pub(super) const FINGERTIP: Vec3 = Vec3::new(-0.00573349, 0.01938251, 0.00494587);
 
 pub(super) struct Rig {
@@ -20,6 +21,8 @@ pub(super) struct Rig {
     pub source_slots: Vec<usize>,
     source_for_joint: Vec<Option<usize>>,
     pub fingertip: Vec3,
+    pub palm_offset: Vec3,
+    pub palm_frame: glam::Mat3,
 }
 
 /// Build once when installing a set of characters. Bone names are resolved below the actor's wrist.
@@ -73,33 +76,28 @@ impl Rig {
             }
             Ok(indices[&id])
         };
-        // Semantic slots belong to the retargeted motion bank. Entity names may differ per rig.
-        let hip = joint(state.bones[0])?;
-        let legs = [
-            [
-                joint(state.bones[13])?,
-                joint(state.bones[14])?,
-                joint(state.bones[15])?,
-                joint(state.bones[16])?,
-            ],
-            [
-                joint(state.bones[17])?,
-                joint(state.bones[18])?,
-                joint(state.bones[19])?,
-                joint(state.bones[20])?,
-            ],
-        ];
-        let arm = [
-            joint(state.bones[6])?,
-            joint(state.bones[7])?,
-            joint(state.bones[8])?,
-        ];
-        let wrist = state.bones[8];
+        let semantics = state.rig.as_deref().unwrap_or(&profile::DEFAULT.rig);
+        semantics.validate(state.bones.len())?;
+        let hip = joint(state.bones[semantics.pelvis])?;
+        let mut legs = [[0; 4]; 2];
+        for (chain, slots) in legs
+            .iter_mut()
+            .zip([semantics.right_leg, semantics.left_leg])
+        {
+            for (out, slot) in chain.iter_mut().zip(slots) {
+                *out = joint(state.bones[slot])?;
+            }
+        }
+        let mut arm = [0; 3];
+        for (out, slot) in arm.iter_mut().zip(semantics.reach_arm) {
+            *out = joint(state.bones[slot])?;
+        }
+        let wrist = state.bones[semantics.reach_arm[2]];
         let mut subtree = vec![wrist];
         let mut candidates = Vec::new();
         while let Some(id) = subtree.pop() {
             if marker.as_ref().map_or_else(
-                || w.entities[&id].name == "IndexFinger3_R_069",
+                || w.entities[&id].name == semantics.fingertip_name,
                 |m| id == m.joint,
             ) {
                 candidates.push(id);
@@ -113,7 +111,7 @@ impl Rig {
             "expected one fingertip below actor {actor}'s wrist"
         );
         let finger = joint(candidates[0])?;
-        let fingertip = marker.map_or(FINGERTIP, |m| m.offset);
+        let fingertip = marker.map_or(semantics.fingertip_offset, |m| m.offset);
         ensure!(fingertip.is_finite(), "invalid fingertip offset");
         // The prefix preserves source-pose order in older contact saves.
         let mut corrected = [
@@ -152,6 +150,14 @@ impl Rig {
                 parent = parents[p];
             }
         }
+        for chain in [&legs[0][..], &legs[1][..], &arm[..]] {
+            ensure!(
+                chain
+                    .windows(2)
+                    .all(|pair| descendants[pair[0]].contains(&pair[1])),
+                "semantic limb joints must follow the skeleton hierarchy"
+            );
+        }
         Ok(Self {
             published_joints: crate::scene::PoseLayout::new(corrected.iter().map(|&i| ids[i]))?,
             ids,
@@ -165,6 +171,8 @@ impl Rig {
             source_slots,
             source_for_joint,
             fingertip,
+            palm_offset: semantics.palm.offset,
+            palm_frame: semantics.palm.frame()?,
         })
     }
     pub fn pose(&self, cx: &SystemContext<'_>, source: &[Mat4]) -> Result<Pose<'_>> {
@@ -231,7 +239,7 @@ impl Pose<'_> {
         );
         self.refresh_subtree(i);
     }
-    fn aim(&mut self, i: usize, child: usize, goal: Vec3) {
+    pub(super) fn aim(&mut self, i: usize, child: usize, goal: Vec3) {
         let from = (self.position(child) - self.position(i)).normalize_or_zero();
         let to = (goal - self.position(i)).normalize_or_zero();
         if from != Vec3::ZERO && to != Vec3::ZERO {
@@ -269,6 +277,77 @@ impl Pose<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changed_wrist_bind_axes_preserve_sampled_orientation_and_reach_on_alternate_rig()
+    -> Result<()> {
+        let source = scene()?;
+        let actor = actor(&source).unwrap();
+        let mut alternative = source.clone();
+        let (spacer, marker) = population::alternate_rig(&mut alternative, actor)?;
+        let changed = Rig::bind(&alternative, actor, &children(&alternative))?;
+        let original = Rig::bind(&source, actor, &children(&source))?;
+        let wrist = changed.ids[changed.arm[2]];
+        assert_eq!(changed.ids[changed.finger], marker.joint);
+        let bank = SilverMatcher::load()?;
+        let mut a = player(&source, actor)?.into_owned();
+        let mut b = player(&alternative, actor)?.into_owned();
+        let rotation = alternative.entities[&spacer]
+            .local
+            .to_scale_rotation_translation()
+            .1;
+        assert!(!rotation.abs_diff_eq(Quat::IDENTITY, 1e-3));
+        let slot = a.bones.iter().position(|id| *id == wrist).unwrap();
+        let sample = bank
+            .clips
+            .iter()
+            .find(|(_, name)| name == "walk_41")
+            .unwrap()
+            .0
+            .start
+            + 19;
+        a.sample = sample;
+        b.sample = sample;
+        let (_, left) = bank.sample_pose(&mut a, Mat4::IDENTITY, 0., |_, id| {
+            Ok(source.entities[&id].local)
+        })?;
+        let (_, right) = bank.sample_pose(&mut b, Mat4::IDENTITY, 0., |_, id| {
+            Ok(alternative.entities[&id].local)
+        })?;
+        let expected = left[slot].to_scale_rotation_translation().1;
+        let corrected = right[slot].to_scale_rotation_translation().1;
+        assert!((rotation * corrected).dot(expected).abs() > 0.99999);
+        assert!(corrected.dot(expected).abs() < 0.99);
+        assert_eq!(original.ids.len() + 1, changed.ids.len());
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+        let mut schedule = Schedule::default();
+        install(&alternative, &mut schedule)?;
+        let mut world = Arc::new(alternative);
+        for _ in 0..720 {
+            schedule.tick(&mut world, 1. / 60., &pool)?;
+        }
+        let c = world.typed_component::<Contact>(actor, SETTING)?.unwrap();
+        let transforms = world.transforms()?;
+        let tip = transforms[&marker.joint].transform_point3(marker.offset);
+        let target = target_point(transforms[&c.target]);
+        let miss = tip.distance(target);
+        eprintln!("alternate bind-space fingertip distance: {miss:.7} m");
+        assert!(miss < 0.001 && c.reach > 0.9);
+        Ok(())
+    }
+
+    #[test]
+    fn binding_rejects_disconnected_semantic_limb_chains() -> Result<()> {
+        let mut w = scene()?;
+        let actor = actor(&w).unwrap();
+        let mut player = player(&w, actor)?.into_owned();
+        let mut map = profile::DEFAULT.rig.clone();
+        std::mem::swap(&mut map.right_leg[2], &mut map.left_leg[2]);
+        player.rig = Some(Arc::new(map));
+        w.set_typed_component(actor, PLAYER, player);
+        assert!(Rig::bind(&w, actor, &children(&w)).is_err());
+        Ok(())
+    }
 
     #[test]
     fn limb_updates_match_full_forward_kinematics() -> Result<()> {

@@ -1,15 +1,21 @@
 use super::{Edit, SimulationData, SystemAccess, TransformTargets};
-use crate::scene::{Id, LocalPose, PoseLayout, World};
+use crate::scene::{Id, LocalPose, PoseLayout, Stored, World};
 use anyhow::{Context, Result, ensure};
 use glam::Mat4;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
+
+pub(super) enum ComponentUpdate {
+    Raw(Value),
+    Binding(Arc<dyn Stored>),
+    State(Arc<dyn Stored>),
+}
 
 pub(super) enum Change {
     Pose(LocalPose),
     PublishedPose(Id, PoseLayout, Vec<Mat4>),
-    Component(Id, &'static str, Edit),
+    Component(Id, &'static str, ComponentUpdate),
     Resource(
         &'static str,
         std::sync::Arc<dyn std::any::Any + Send + Sync>,
@@ -18,10 +24,17 @@ pub(super) enum Change {
 }
 
 impl Change {
-    fn capture_undo(&self, world: &World) -> Option<Edit> {
+    fn capture_undo(
+        &self,
+        world: &World,
+        counts: Option<&mut super::CommitCounts>,
+    ) -> Option<Edit> {
         Some(match self {
             Self::Pose(pose) => {
                 let old = pose.previous(world);
+                if let Some(c) = counts {
+                    c.undo_pose_bytes += old.matrix_bytes();
+                }
                 Box::new(move |w| old.apply(w))
             }
             Self::PublishedPose(_, layout, _) => {
@@ -30,16 +43,16 @@ impl Change {
                     .iter()
                     .filter_map(|id| world.entities.get(id).map(|e| (*id, e.local)))
                     .collect();
+                if let Some(c) = counts {
+                    c.undo_pose_bytes += old.len() * size_of::<Mat4>();
+                }
                 Box::new(move |w| {
                     for (id, local) in old {
                         let _ = w.set_local(id, local);
                     }
                 })
             }
-            Self::Component(id, key, _) => {
-                world.entities.get(id)?;
-                Box::new(world.restore_component_on_rollback(*id, key))
-            }
+            Self::Component(id, key, _) => Box::new(world.restore_component_on_rollback(*id, key)?),
             Self::Resource(key, _) => {
                 let key = *key;
                 let old = world.simulation_resources.get(key).cloned();
@@ -59,24 +72,49 @@ impl Change {
         })
     }
     pub(super) fn apply(self, world: &mut World, undo: Option<&mut Vec<Edit>>) {
-        self.apply_timed(world, undo, None);
+        self.apply_timed(world, undo, None, None);
     }
     pub(super) fn apply_timed(
         self,
         world: &mut World,
         undo: Option<&mut Vec<Edit>>,
         capture: Option<&mut std::time::Duration>,
+        mut counts: Option<&mut super::CommitCounts>,
     ) {
-        if let Some(undo) = undo {
-            super::timed(capture, || undo.extend(self.capture_undo(world)));
+        if let Some(c) = counts.as_deref_mut() {
+            c.writes += 1;
+            match &self {
+                Self::Component(..) => c.components += 1,
+                Self::Pose(p) => c.pose_bytes += p.matrix_bytes(),
+                Self::PublishedPose(_, _, locals) => c.pose_bytes += size_of_val(locals.as_slice()),
+                _ => {}
+            }
+        }
+        if let Some(undo) = undo
+            && let Some(edit) =
+                super::timed(capture, || self.capture_undo(world, counts.as_deref_mut()))
+        {
+            undo.push(edit);
+            if let Some(c) = counts {
+                c.undo_records += 1;
+            }
         }
         match self {
             Self::Pose(pose) => pose.apply(world),
             Self::PublishedPose(owner, layout, locals) => {
                 world.entities.publish_pose(owner, layout, locals)
             }
-            Self::Component(id, _, edit) if world.entities.contains_key(&id) => edit(world),
-            Self::Component(..) => (),
+            Self::Component(id, key, update) => match update {
+                ComponentUpdate::Raw(value) => {
+                    world.set_setting_if_present(id, key, value);
+                }
+                ComponentUpdate::Binding(value) => {
+                    world.set_stored_if_present(id, key, value, true);
+                }
+                ComponentUpdate::State(value) => {
+                    world.set_stored_if_present(id, key, value, false);
+                }
+            },
             Self::Resource(key, value) => {
                 world.simulation_resources.insert(key, value);
             }
@@ -165,6 +203,11 @@ impl<'w> SystemContext<'w> {
         self.access.require(SimulationData::Component(key), false)?;
         Ok(self.world.entities.component_owners(key))
     }
+    /// Monotonic revision of authored state for an explicitly declared component.
+    pub(crate) fn component_binding_version(&self, key: &'static str) -> Result<u64> {
+        self.access.require(SimulationData::Component(key), false)?;
+        Ok(self.world.binding_version(key))
+    }
     pub fn first_raw_component(&self, key: &'static str) -> Result<Option<(Id, &'w Value)>> {
         self.access.require(SimulationData::Component(key), false)?;
         Ok(self.world.first_raw_component(key))
@@ -244,13 +287,8 @@ impl<'w> SystemContext<'w> {
     }
     pub fn set_component(&mut self, id: Id, key: &'static str, value: Value) -> Result<()> {
         self.check_component_target(id, key)?;
-        self.changes.push(Change::Component(
-            id,
-            key,
-            Box::new(move |world| {
-                world.set_setting_if_present(id, key, value);
-            }),
-        ));
+        self.changes
+            .push(Change::Component(id, key, ComponentUpdate::Raw(value)));
         Ok(())
     }
     pub fn set_typed_component<T: Serialize + Send + Sync + 'static>(
@@ -263,9 +301,7 @@ impl<'w> SystemContext<'w> {
         self.changes.push(Change::Component(
             id,
             key,
-            Box::new(move |world| {
-                world.set_typed_component(id, key, value);
-            }),
+            ComponentUpdate::Binding(Arc::new(value)),
         ));
         Ok(())
     }
@@ -280,7 +316,7 @@ impl<'w> SystemContext<'w> {
         self.changes.push(Change::Component(
             id,
             key,
-            Box::new(move |world| world.set_bound_state(id, key, value)),
+            ComponentUpdate::State(Arc::new(value)),
         ));
         Ok(())
     }

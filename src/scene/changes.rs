@@ -11,6 +11,9 @@ const RETAINED_EPOCHS: usize = 8;
 /// Local transforms prepared against a simulation snapshot before any edit commits.
 pub struct LocalPose(Vec<(Id, Mat4)>);
 impl LocalPose {
+    pub(crate) fn matrix_bytes(&self) -> usize {
+        self.0.len() * size_of::<Mat4>()
+    }
     pub fn prepare(
         world: &World,
         transforms: impl IntoIterator<Item = (Id, Mat4)>,
@@ -58,6 +61,7 @@ pub(crate) enum Write {
     GeometryBinding,
     Component(&'static str),
     TypedValue(&'static str),
+    TypedMembership(&'static str),
 }
 
 pub(crate) struct Cursor {
@@ -321,15 +325,36 @@ impl Entities {
     }
     pub(super) fn edit(&mut self, id: Id, kind: Write) -> Option<&mut Entity> {
         let row = self.rows.get_mut(&id)?;
-        let kind = match kind {
-            Write::TypedValue(key) | Write::Component(key) if !row.components.contains_key(key) => {
-                self.owners.take();
-                Write::Component(key)
-            }
-            _ => kind,
-        };
+        if let Write::Component(key) = kind
+            && !row.components.contains_key(key)
+        {
+            self.owners.take();
+        }
         self.journal.write(id, kind);
         Some(row)
+    }
+    /// Keep steady-state typed updates allocation-free in the serialized membership map.
+    pub(super) fn mark_typed_value(&mut self, id: Id, key: &'static str) -> bool {
+        let Some(row) = self.rows.get_mut(&id) else {
+            return false;
+        };
+        let write = if row.components.contains_key(key) {
+            Write::TypedValue(key)
+        } else {
+            row.components.insert(key.into(), Value::Null);
+            self.owners.take();
+            Write::TypedMembership(key)
+        };
+        self.journal.write(id, write);
+        true
+    }
+    pub(super) fn remove_extension(&mut self, id: Id, key: &'static str) {
+        if let Some(e) = self.rows.get_mut(&id)
+            && e.components.remove(key).is_some()
+        {
+            self.owners.take();
+            self.journal.write(id, Write::Component(key));
+        }
     }
     pub(crate) fn plain_leaf(e: &Entity) -> bool {
         (e.instance.is_some() || e.light.is_some())
@@ -476,11 +501,6 @@ impl World {
             .components
             .insert(key.into(), value);
         Some(())
-    }
-    pub(super) fn mark_component(&mut self, id: Id, key: &'static str) -> &mut Entity {
-        self.entities
-            .edit(id, Write::TypedValue(key))
-            .expect("missing component entity")
     }
 }
 

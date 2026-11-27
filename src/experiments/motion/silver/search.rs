@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 pub(super) type Feature = [f32; 24];
@@ -14,21 +14,12 @@ pub(super) enum Mode {
     Scan,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub(super) enum Candidate {
     Idle,
     Transition,
     Steady,
-}
-
-impl Candidate {
-    pub fn of(clip: &str) -> Self {
-        match clip.split('_').next() {
-            Some("idle") => Self::Idle,
-            Some("start" | "stop") => Self::Transition,
-            _ => Self::Steady,
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -152,9 +143,17 @@ impl Index {
         index.samples = raw.iter().map(|row| index.normalize(row)).collect();
         index.candidates = vec![Candidate::Transition; raw.len()];
         for (span, name) in clips {
-            index.candidates[span.clone()].fill(Candidate::of(name));
+            index.candidates[span.clone()].fill(
+                *super::profile::DEFAULT
+                    .clips
+                    .get(name)
+                    .with_context(|| format!("missing animation category for clip {name}"))?,
+            );
         }
         Ok(index)
+    }
+    pub fn candidate(&self, sample: usize) -> Candidate {
+        self.candidates[sample]
     }
     fn normalize(&self, raw: &Feature) -> Feature {
         std::array::from_fn(|i| (raw[i] - self.mean[i]) * self.gain[i])

@@ -73,13 +73,8 @@ impl Studio {
             previous + delta
         });
         self.motion_anchor = Some((id, followed));
-        let saved_motion = new_actor
-            && self
-                .engine
-                .movement
-                .active(&self.engine.world, id)
-                .unwrap_or(false);
-        if (keys != self.motion_keys || saved_motion || (new_actor && keys != [0; 2]))
+        // An idle keyboard leaves a restored or scripted analog command in control.
+        if (keys != self.motion_keys || (new_actor && keys != [0; 2]))
             && let Err(e) = self.engine.movement.apply(
                 Arc::make_mut(&mut self.engine.world),
                 id,

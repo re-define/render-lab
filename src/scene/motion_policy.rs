@@ -112,11 +112,28 @@ impl World {
             .entities
             .get(&id)
             .context("motion entity does not exist")?;
-        if !entity.components.contains_key(MOTION_POLICY)
-            || self.motion_policy(id, policy)? != policy
-        {
-            self.set_typed_component(id, MOTION_POLICY, policy);
+        if entity.components.contains_key(MOTION_POLICY) {
+            let previous = self.motion_policy(id, policy)?;
+            if previous == policy {
+                return Ok(());
+            }
+            // Transfer the live parent-space velocity between the two movable linear solvers.
+            // Initial authoring and a static interval preserve the explicitly authored command.
+            if previous.mobility == Mobility::Movable
+                && policy.mobility == Mobility::Movable
+                && (previous.physics == PhysicsParticipation::Simulated)
+                    != (policy.physics == PhysicsParticipation::Simulated)
+                && let Some(mut body) = self.linear_body(id)?
+            {
+                if policy.physics == PhysicsParticipation::Simulated {
+                    body.momentum = body.target_velocity * body.mass;
+                } else {
+                    body.target_velocity = body.momentum / body.mass;
+                }
+                self.set_linear_body(id, body)?;
+            }
         }
+        self.set_typed_component(id, MOTION_POLICY, policy);
         Ok(())
     }
 }

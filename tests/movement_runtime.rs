@@ -100,3 +100,79 @@ fn absent_policy_preserves_legacy_provider_defaults() -> Result<()> {
     assert!(w.motion_policy(u64::MAX, MotionPolicy::STATIC).is_err());
     Ok(())
 }
+
+#[test]
+fn movable_linear_modes_transfer_velocity_and_keep_vertical_momentum() -> Result<()> {
+    let mut w = movement_lab::scene()?;
+    let id = w.entities.component_owners(linear::CONTROL)[0];
+    let inputs = render_lab::movement::MovementControls::new(Some(linear::DRIVER));
+    inputs.apply_analog(
+        &mut w,
+        id,
+        render_lab::movement::AnalogMove {
+            side: 0.5,
+            forward: 0.0,
+        },
+    )?;
+    let kinematic = w.linear_body(id)?.unwrap();
+    w.set_motion_policy(id, MotionPolicy::DYNAMIC)?;
+    assert_eq!(
+        w.linear_body(id)?.unwrap().momentum,
+        kinematic.target_velocity * kinematic.mass
+    );
+    let mut w = Arc::new(w);
+    advance(&mut w, 12, 1. / 60., 1)?;
+    let before = w.linear_body(id)?.unwrap().momentum;
+    inputs.apply_analog(
+        Arc::make_mut(&mut w),
+        id,
+        render_lab::movement::AnalogMove {
+            side: 0.0,
+            forward: 0.25,
+        },
+    )?;
+    let body = w.linear_body(id)?.unwrap();
+    assert!(before.y < 0.);
+    assert_eq!(body.momentum.y, before.y);
+    Arc::make_mut(&mut w).set_motion_policy(id, MotionPolicy::KINEMATIC)?;
+    let at = w.entities[&id].local.w_axis.truncate();
+    advance(&mut w, 1, 1. / 60., 16)?;
+    assert!(
+        w.entities[&id]
+            .local
+            .w_axis
+            .truncate()
+            .abs_diff_eq(at + body.momentum / (body.mass * 60.), 1e-6)
+    );
+    Ok(())
+}
+
+#[test]
+fn deleting_the_selected_actor_releases_control_across_id_reuse_and_save() -> Result<()> {
+    let mut world = movement_lab::scene()?;
+    let initial = world.entities.component_owners(linear::CONTROL)[0];
+    let mut controls = render_lab::movement::MovementControls::new(Some(linear::DRIVER));
+    let add = |w: &mut World| -> Result<_> {
+        let id = w.spawn(Default::default());
+        w.set_linear_body(id, LinearBody::default())?;
+        w.enable_linear_control(id, 1.)?;
+        Ok(id)
+    };
+    assert_eq!(controls.target(&world), Some(initial));
+    let selected = add(&mut world)?;
+    controls.select(&mut world, selected)?;
+    assert_eq!(controls.target(&world), Some(selected));
+    world.entities.remove(&selected);
+    assert_eq!(controls.target(&world), None);
+    let replacement = add(&mut world)?;
+    assert_eq!(replacement, selected);
+    assert_eq!(controls.target(&world), None);
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("selection.json");
+    world.save(&path)?;
+    assert_eq!(controls.target(&World::load(&path)?), None);
+    controls.select(&mut world, replacement)?;
+    world.save(&path)?;
+    assert_eq!(controls.target(&World::load(&path)?), Some(replacement));
+    Ok(())
+}

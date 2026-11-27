@@ -11,6 +11,7 @@ mod changes;
 pub(crate) use changes::{Cursor as ChangeCursor, PublishedPose, Write as EntityWrite};
 pub use changes::{Entities, LocalPose, PoseLayout};
 mod components;
+pub(crate) use components::Stored;
 mod geometry_assets;
 pub use geometry_assets::{GeometryAssets, LocalBounds};
 mod gi;
@@ -261,11 +262,32 @@ impl Default for Entity {
         }
     }
 }
+/// Semantic IDs survive an archive. Within a running world a reused ID denotes a new entity.
+#[derive(Clone, Copy, Default)]
+enum ControlTarget {
+    #[default]
+    Automatic,
+    Released,
+    Entity {
+        id: Id,
+        incarnation: u64,
+    },
+}
+
+impl<'de> Deserialize<'de> for ControlTarget {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Ok(Option::<Id>::deserialize(d)?
+            .map_or(Self::Released, |id| Self::Entity { id, incarnation: 0 }))
+    }
+}
+
 #[derive(Clone, Deserialize)]
 pub struct World {
     version: u32,
     #[serde(default)]
     pub(crate) clocks: BTreeMap<String, ClockCheckpoint>,
+    #[serde(default)]
+    control_target: ControlTarget,
     /// Root providers installed by the application while restoring or configuring a scene.
     #[serde(skip)]
     pub(crate) motion_writers: &'static [RootWriter],
@@ -281,6 +303,7 @@ impl Default for World {
             version: 1,
             motion_writers: &[],
             clocks: Default::default(),
+            control_target: ControlTarget::Automatic,
             entities: Entities::default(),
             runtime: Default::default(),
             simulation_resources: Default::default(),
@@ -288,6 +311,23 @@ impl Default for World {
     }
 }
 impl World {
+    /// Absent selects the default driver. Explicit null keeps input released, including in archives.
+    pub(crate) fn control_selection(&self) -> Option<Option<Id>> {
+        match self.control_target {
+            ControlTarget::Automatic => None,
+            ControlTarget::Released => Some(None),
+            ControlTarget::Entity { id, incarnation } => Some(
+                (self.entities.contains_key(&id) && self.entities.incarnation(id) == incarnation)
+                    .then_some(id),
+            ),
+        }
+    }
+    pub(crate) fn select_control_target(&mut self, id: Option<Id>) {
+        self.control_target = id.map_or(ControlTarget::Released, |id| ControlTarget::Entity {
+            id,
+            incarnation: self.entities.incarnation(id),
+        });
+    }
     pub fn spawn(&mut self, e: Entity) -> Id {
         let id = self
             .entities
@@ -308,6 +348,7 @@ impl World {
             clock.validate()?;
         }
         self.validate_motion_components()?;
+        self.validate_physics_components()?;
         let transforms = self.transforms()?;
         for (&id, e) in &self.entities {
             if let Some(light) = e.light {

@@ -26,6 +26,15 @@ pub(super) fn command(engine: &mut Engine, args: &str) -> Result<String> {
         MotionPolicy::STATIC
     });
     let policy = engine.world.motion_policy(id, fallback)?;
+    if tail == ["drive", "off"] {
+        Arc::make_mut(&mut engine.world).disable_linear_control(id)?;
+        return Ok(format!("Entity {id} linear control released"));
+    }
+    if let ["drive", speed] = tail {
+        let speed = speed.parse()?;
+        Arc::make_mut(&mut engine.world).enable_linear_control(id, speed)?;
+        return Ok(format!("Entity {id} linear control speed {speed} m/s"));
+    }
     let mut next_body = None;
     let next_policy = match tail {
         [] => {
@@ -86,6 +95,7 @@ pub(super) fn command(engine: &mut Engine, args: &str) -> Result<String> {
         );
         if engine.schedule.fixed_seconds(linear::CLOCK).is_none() {
             linear::register(&mut engine.schedule)?;
+            engine.movement.register(linear::DRIVER)?;
         }
     }
     // The ID, existing policy, next body and root ownership were checked above.

@@ -38,7 +38,7 @@ fn plain_and_contact_characters_follow_their_own_clocks_after_membership_changes
         caps: Default::default(),
         materials: Default::default(),
         schedule: Default::default(),
-        movement: None,
+        movement: Default::default(),
         camera: None,
         technique: None,
         visibility: Default::default(),
@@ -286,7 +286,7 @@ fn walks_loads_plate_and_touches_with_the_skinned_vertex() -> Result<()> {
                         }
                     }
                     if (13.5..=17.5).contains(&play.frame) {
-                        let palm = m[&rig.ids[rig.arm[2]]].transform_point3(traversal::PALM);
+                        let palm = m[&rig.ids[rig.arm[2]]].transform_point3(rig.palm_offset);
                         let top = m[&course.rail].transform_point3(Vec3::new(-0.18, 0.5, 0.34));
                         palm_error = palm_error.max(palm.distance(top));
                         let hand = m[&rig.ids[rig.arm[2]]];
@@ -781,7 +781,7 @@ fn replacing_a_live_rig_discards_stale_sources_and_restores_after_save() -> Resu
         .into_owned();
     let rig = Rig::bind(w, id, &rig::children(w))?;
     // These finite but incorrect previous transforms make unwanted scale reuse observable.
-    contact.source.fill(Mat4::from_scale(Vec3::splat(7.)));
+    Arc::make_mut(&mut contact.source).fill(Mat4::from_scale(Vec3::splat(7.)));
     let old_head = p.bones[4];
     let expected_scale = w.entities[&old_head]
         .local
@@ -909,7 +909,13 @@ fn fixed_kinematic_and_dynamic_roots_pass_actual_contacts_to_ik() -> Result<()> 
     let body = w
         .typed_component::<dynamics::Body>(id, dynamics::BODY)?
         .unwrap();
-    assert!(body.faces.is_empty() && body.support.is_none());
+    assert!(
+        w.typed_component::<ResolvedMotion>(id, RESOLVED)?
+            .unwrap()
+            .surfaces
+            .is_empty()
+            && body.support.is_none()
+    );
     assert_eq!(
         body.particle.position,
         w.entities[&id].local.w_axis.truncate()
@@ -932,16 +938,24 @@ fn fixed_kinematic_and_dynamic_roots_pass_actual_contacts_to_ik() -> Result<()> 
         .typed_component::<dynamics::Body>(id, dynamics::BODY)?
         .unwrap();
     assert!(body.support.is_none() && body.particle.position.y < from);
-    assert!(body.faces.iter().all(|face| face.id != floor));
+    assert!(
+        w.typed_component::<ResolvedMotion>(id, RESOLVED)?
+            .unwrap()
+            .surfaces
+            .iter()
+            .all(|face| face.id != floor)
+    );
     assert_eq!(
         body.particle.position,
         w.entities[&id].local.w_axis.truncate()
     );
-    assert!(
-        w.typed_component::<Contact>(id, SETTING)?
+    assert_eq!(
+        w.typed_component::<ProposedMotion>(id, PROPOSED)?
             .unwrap()
-            .request
-            .is_none()
+            .step,
+        w.typed_component::<ResolvedMotion>(id, RESOLVED)?
+            .unwrap()
+            .step
     );
     let dir = tempfile::tempdir()?;
     let file = dir.path().join("modes.json");
@@ -1014,11 +1028,11 @@ fn rotating_deck_restores_a_low_frequency_clock_without_reversing_its_drive() ->
     let initial = loaded.entities[&floor].local;
     resumed.tick(&mut loaded, 0.25, &pool)?;
     assert_ne!(initial, loaded.entities[&floor].local);
-    let body = loaded
-        .typed_component::<dynamics::Body>(actor, dynamics::BODY)?
+    let resolved = loaded
+        .typed_component::<ResolvedMotion>(actor, RESOLVED)?
         .unwrap();
-    let face = body
-        .faces
+    let face = resolved
+        .surfaces
         .iter()
         .find(|f| f.id == floor)
         .context("missing driven support")?;

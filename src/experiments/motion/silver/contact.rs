@@ -1,12 +1,17 @@
 //! Silver Wolf traverses a maintenance course and operates a contact station.
+mod collision;
 mod commands;
+mod modes;
 pub use commands::command;
 mod course;
 #[cfg(test)]
 mod crowd_profile;
 mod dynamics;
 pub(crate) use dynamics::{SPRING, TURNTABLE};
-mod events;
+#[cfg(test)]
+mod exchange_tests;
+mod fixture;
+mod physical_pose;
 mod population;
 mod rig;
 mod stage;
@@ -15,7 +20,11 @@ mod tests;
 mod traversal;
 
 use super::*;
-use crate::{engine::Schedule, render::Camera};
+use crate::{
+    engine::Schedule,
+    movement::character::{GripSupport, PROPOSED, ProposedMotion, RESOLVED, ResolvedMotion},
+    render::Camera,
+};
 #[cfg(test)]
 use rig::FINGERTIP;
 use rig::Rig;
@@ -63,6 +72,15 @@ fn hydrate_contact(w: &mut World) -> Result<()> {
         let c = w
             .typed_component::<Contact>(actor, SETTING)?
             .context("missing saved rig")?;
+        if c.collider_schema == 0 {
+            let mut c = c.into_owned();
+            install_course_shapes(w, c.floor, c.plate, c.course)?;
+            c.collider_schema = 1;
+            w.set_typed_component(actor, SETTING, c);
+        }
+        let c = w
+            .typed_component::<Contact>(actor, SETTING)?
+            .context("missing migrated contact")?;
         let plate = c.plate;
         let plate_entity = w.entities.get(&plate).context("missing contact plate")?;
         let legacy_spring =
@@ -123,6 +141,8 @@ struct FingerMarker {
 struct PoseBinding {
     bones: Vec<Id>,
     hip_origin: Vec3,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rig: Option<Arc<profile::RigMap>>,
     hierarchy: Vec<(Id, Option<Id>)>,
     finger: Option<FingerMarker>,
     floor: Id,
@@ -134,6 +154,7 @@ struct PoseBinding {
 impl PoseBinding {
     fn matches(&self, player: &State, contact: &Contact) -> bool {
         self.bones == player.bones
+            && self.rig == player.rig
             && self.hip_origin == player.hip_origin
             && self.finger == contact.finger
             && self.floor == contact.floor
@@ -145,15 +166,16 @@ impl PoseBinding {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Contact {
-    /// Scratch produced before dynamics in the same character-clock transaction.
-    #[serde(skip)]
-    request: Option<ContactMotion>,
+    #[serde(default)]
+    collider_schema: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_binding: Option<Arc<PoseBinding>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     finger: Option<FingerMarker>,
     #[serde(default)]
     course: Option<course::Fixtures>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    actions: Option<Arc<profile::Actions>>,
     #[serde(default)]
     section: traversal::Section,
     #[serde(default)]
@@ -168,19 +190,22 @@ struct Contact {
     feet: [Foot; 2],
     #[serde(default)]
     palm_load: f32,
+    /// Fraction of body weight supported by the rail at full physical contact.
+    #[serde(default = "default_grip_fraction")]
+    grip_fraction: f32,
     pelvis: f32,
     reach: f32,
     auto_walk: bool,
     foot_ik: bool,
     hand_ik: bool,
-    source: Vec<Mat4>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    physical_pose: Option<Arc<physical_pose::PhysicalPose>>,
+    source: Arc<Vec<Mat4>>,
     error_m: f32,
 }
 
-#[derive(Clone, Copy)]
-struct ContactMotion {
-    root: RootMotionRequest,
-    inherited_velocity: Option<Vec3>,
+fn default_grip_fraction() -> f32 {
+    0.35
 }
 
 struct Stage {
@@ -188,7 +213,8 @@ struct Stage {
     actor: Id,
     rig: Rig,
     action_rig: Option<traversal::ActionRig>,
-    supports: Vec<Id>,
+    target: fixture::Fixture,
+    rail: Option<fixture::Fixture>,
 }
 
 /// Character motion, contacts and pose feedback advance on this clock. Additional
@@ -208,6 +234,7 @@ pub(super) fn register(w: &World, schedule: &mut Schedule, bank: Arc<SilverMatch
     let mut systems = CharacterSystems::default();
     stage::register_motion(&mut systems, bank);
     dynamics::register(&mut systems, schedule)?;
+    collision::register(w, schedule)?;
     stage::register_ik(&mut systems);
     let cached = std::sync::Mutex::new((None::<(Arc<()>, u64)>, Actors::new()));
     systems.install(schedule, character_clock(), w, SETTING, move |w| {
@@ -216,16 +243,23 @@ pub(super) fn register(w: &World, schedule: &mut Schedule, bank: Arc<SilverMatch
         let mut actors = Actors::new();
         let children = std::cell::OnceCell::new();
         for &actor in w.entities.component_owners(SETTING) {
+            let contact = w
+                .typed_component::<Contact>(actor, SETTING)?
+                .context("missing contact")?;
             if prior.0.as_ref().is_some_and(|(source, rev)| {
                 *rev == topology && Arc::ptr_eq(source, w.entities.hierarchy_source())
             }) && let Some(stage) = prior.1.get(&actor)
-                && stage.binding.matches(
-                    player(w, actor)?.as_ref(),
-                    w.typed_component::<Contact>(actor, SETTING)?
-                        .context("missing contact")?
-                        .as_ref(),
-                )
+                && stage
+                    .binding
+                    .matches(player(w, actor)?.as_ref(), contact.as_ref())
             {
+                // An edit to future action windows need not discard the current skeleton binding.
+                traversal::validate_actions(
+                    contact
+                        .actions
+                        .as_deref()
+                        .unwrap_or(&profile::DEFAULT.actions),
+                )?;
                 actors.insert(actor, stage.clone());
                 continue;
             }
@@ -262,24 +296,25 @@ fn bind_actor(w: &World, actor: Id, children: &BTreeMap<Id, Vec<Id>>) -> Result<
     w.typed_component::<dynamics::Body>(actor, dynamics::BODY)?
         .context("missing character body")?
         .validate()?;
-    let mut supports = vec![c.floor, c.plate];
-    if let Some(f) = c.course {
-        supports.extend([f.landing, f.station, f.ramp]);
-        supports.extend(f.service);
+    if let Some(layer) = &c.physical_pose {
+        layer.validate()?;
     }
-    for id in supports
-        .iter()
-        .copied()
-        .chain([c.target])
-        .chain(c.course.into_iter().flat_map(|f| [f.rail, f.gate]))
-    {
-        ensure!(
-            w.entities
-                .get(&id)
-                .is_some_and(|e| e.parent == w.entities[&actor].parent),
-            "invalid contact fixture {id}"
-        );
-    }
+    ensure!(
+        (0.0..=1.0).contains(&c.grip_fraction),
+        "invalid grip weight fraction"
+    );
+    ensure!(
+        w.entities
+            .get(&c.plate)
+            .is_some_and(|p| p.parent == w.entities[&actor].parent),
+        "reactive spring plate and character need a common parent frame"
+    );
+    let target = fixture::Fixture::bind(w, actor, c.target)?;
+    let rail = c
+        .course
+        .map(|f| fixture::Fixture::bind(w, actor, f.rail))
+        .transpose()?;
+    traversal::validate_actions(c.actions.as_deref().unwrap_or(&profile::DEFAULT.actions))?;
     let rig = Rig::bind(w, actor, children)?;
     let action_rig = c
         .course
@@ -295,6 +330,7 @@ fn bind_actor(w: &World, actor: Id, children: &BTreeMap<Id, Vec<Id>>) -> Result<
     let binding = Arc::new(PoseBinding {
         bones: state.bones.clone(),
         hip_origin: state.hip_origin,
+        rig: state.rig.clone(),
         hierarchy: rig
             .ids
             .iter()
@@ -311,7 +347,8 @@ fn bind_actor(w: &World, actor: Id, children: &BTreeMap<Id, Vec<Id>>) -> Result<
         actor,
         rig,
         action_rig,
-        supports,
+        target,
+        rail,
     })
 }
 
@@ -335,6 +372,7 @@ pub fn scene() -> Result<World> {
         dynamics::Body::new(w.entities[&actor].local.w_axis.truncate()),
     );
     let (floor, plate, target, fixtures) = course::build(&mut w);
+    install_course_shapes(&mut w, floor, plate, Some(fixtures))?;
     w.set_motion_policy(actor, MotionPolicy::DYNAMIC)?;
     w.set_motion_policy(plate, MotionPolicy::DYNAMIC)?;
     w.set_motion_policy(floor, MotionPolicy::MOVING_COLLIDER)?;
@@ -356,25 +394,28 @@ pub fn scene() -> Result<World> {
         actor,
         SETTING,
         Contact {
-            request: None,
+            collider_schema: 1,
             source_binding: None,
             finger: None,
             floor,
             plate,
             target,
             course: Some(fixtures),
+            actions: Some(Arc::new(profile::DEFAULT.actions.clone())),
             section: Default::default(),
             play: None,
             rest_y: 0.10,
             velocity: 0.,
             feet: Default::default(),
             palm_load: 0.,
+            grip_fraction: default_grip_fraction(),
             pelvis: 0.,
             reach: 0.,
             auto_walk: true,
             foot_ik: true,
             hand_ik: true,
-            source: vec![],
+            physical_pose: None,
+            source: Default::default(),
             error_m: 0.,
         },
     );
@@ -384,4 +425,41 @@ pub fn scene() -> Result<World> {
 
 fn target_point(model: Mat4) -> Vec3 {
     model.transform_point3(Vec3::NEG_Z * 0.5)
+}
+
+fn install_course_shapes(
+    w: &mut World,
+    floor: Id,
+    plate: Id,
+    course: Option<course::Fixtures>,
+) -> Result<()> {
+    use crate::physics::{BoxCollider, BoxSurface, COLLIDER};
+    let mut set = |id, surface| -> Result<()> {
+        if !w
+            .entities
+            .get(&id)
+            .context("missing course collider")?
+            .components
+            .contains_key(COLLIDER)
+        {
+            w.set_box_collider(
+                id,
+                BoxCollider {
+                    surface,
+                    ..Default::default()
+                },
+            )?;
+        }
+        Ok(())
+    };
+    for id in [floor, plate] {
+        set(id, BoxSurface::Platform)?;
+    }
+    if let Some(f) = course {
+        for id in [f.landing, f.station, f.ramp].into_iter().chain(f.service) {
+            set(id, BoxSurface::Platform)?;
+        }
+        set(f.rail, BoxSurface::Anchor)?;
+    }
+    Ok(())
 }

@@ -1,8 +1,9 @@
 //! Per-entity control input and the handoff from proposed to resolved root motion.
+pub mod character;
 pub mod linear;
 use crate::scene::{Id, Mobility, MotionPolicy, PhysicsParticipation, World};
 use anyhow::{Context, Result, ensure};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Quat, Vec3};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MoveIntent {
@@ -10,94 +11,143 @@ pub struct MoveIntent {
     pub forward: i8,
 }
 
+/// Normalized local input axes supplied by replay, gamepad, AI, or the keyboard adapter.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AnalogMove {
+    pub side: f32,
+    pub forward: f32,
+}
+impl From<MoveIntent> for AnalogMove {
+    fn from(keys: MoveIntent) -> Self {
+        Self {
+            side: f32::from(keys.side),
+            forward: f32::from(keys.forward),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct MovementDriver {
     pub component: &'static str,
     pub camera_follows: fn(&World, Id) -> bool,
     pub active: fn(&World, Id) -> Result<bool>,
-    pub apply: fn(&mut World, Id, MoveIntent) -> Result<()>,
+    pub apply: fn(&mut World, Id, AnalogMove) -> Result<()>,
 }
 
 #[derive(Default)]
 pub struct MovementControls {
-    driver: Option<MovementDriver>,
-    target: Option<Id>,
+    drivers: Vec<MovementDriver>,
 }
 impl MovementControls {
     pub fn new(driver: Option<MovementDriver>) -> Self {
         Self {
-            driver,
-            target: None,
+            drivers: driver.into_iter().collect(),
         }
     }
-    pub(crate) fn rebind(&mut self, driver: Option<MovementDriver>) {
-        if self.driver.map(|d| d.component) != driver.map(|d| d.component) {
-            self.target = None;
-        }
-        self.driver = driver;
-    }
-    pub fn target(&self, world: &World) -> Option<Id> {
-        let owners = self.candidates(world);
-        match self.target {
-            Some(id) => owners.binary_search(&id).ok().map(|_| id),
-            None => owners.first().copied(),
-        }
-    }
-    pub fn candidates<'w>(&self, world: &'w World) -> &'w [Id] {
-        self.driver
-            .map_or(&[], |d| world.entities.component_owners(d.component))
-    }
-
-    pub fn select(&mut self, world: &mut World, id: Id) -> Result<()> {
-        let driver = self.driver.context("scene has no movement driver")?;
+    pub fn register(&mut self, driver: MovementDriver) -> Result<()> {
         ensure!(
-            world
-                .entities
-                .component_owners(driver.component)
-                .binary_search(&id)
-                .is_ok(),
-            "entity {id} has no {} controller",
+            !self
+                .drivers
+                .iter()
+                .any(|other| other.component == driver.component),
+            "duplicate movement driver for {}",
             driver.component
         );
+        self.drivers.push(driver);
+        Ok(())
+    }
+    pub fn target(&self, world: &World) -> Option<Id> {
+        if let Some(target) = world.control_selection() {
+            return target.filter(|&id| self.driver(world, id).is_ok());
+        }
+        self.drivers
+            .iter()
+            .filter_map(|d| {
+                world
+                    .entities
+                    .component_owners(d.component)
+                    .first()
+                    .copied()
+            })
+            .min()
+    }
+    pub fn candidates(&self, world: &World) -> Vec<Id> {
+        let mut ids: Vec<_> = self
+            .drivers
+            .iter()
+            .flat_map(|d| world.entities.component_owners(d.component).iter().copied())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+    pub(crate) fn validate(&self, world: &World) -> Result<()> {
+        if self.drivers.len() > 1 {
+            for id in self.candidates(world) {
+                self.driver(world, id)?;
+            }
+        }
+        Ok(())
+    }
+    fn driver(&self, world: &World, id: Id) -> Result<&MovementDriver> {
+        let e = world
+            .entities
+            .get(&id)
+            .context("missing controlled entity")?;
+        let mut matching = self
+            .drivers
+            .iter()
+            .filter(|d| e.components.contains_key(d.component));
+        let driver = matching
+            .next()
+            .with_context(|| format!("entity {id} has no registered movement driver"))?;
+        ensure!(
+            matching.next().is_none(),
+            "entity {id} has ambiguous movement drivers"
+        );
+        Ok(driver)
+    }
+    pub fn select(&mut self, world: &mut World, id: Id) -> Result<()> {
+        self.driver(world, id)?;
         if let Some(old) = self.target(world)
             && old != id
-            && (driver.active)(world, old)?
+            && self.active(world, old)?
         {
-            (driver.apply)(world, old, MoveIntent::default())?;
+            self.apply_analog(world, old, AnalogMove::default())?;
         }
-        self.target = Some(id);
+        world.select_control_target(Some(id));
         Ok(())
     }
     pub fn camera_follows(&self, world: &World, id: Id) -> bool {
-        self.driver.is_some_and(|d| (d.camera_follows)(world, id))
+        self.driver(world, id)
+            .is_ok_and(|d| (d.camera_follows)(world, id))
     }
     pub fn active(&self, world: &World, id: Id) -> Result<bool> {
-        (self.driver.context("scene has no movement driver")?.active)(world, id)
+        (self.driver(world, id)?.active)(world, id)
     }
-    /// Used by window input, replay, and headless tools. A deleted target is rejected.
-    pub fn apply(&self, world: &mut World, id: Id, intent: MoveIntent) -> Result<()> {
-        let driver = self.driver.context("scene has no movement driver")?;
+    pub fn apply(&self, world: &mut World, id: Id, keys: MoveIntent) -> Result<()> {
+        self.apply_analog(world, id, keys.into())
+    }
+    pub fn apply_analog(&self, world: &mut World, id: Id, intent: AnalogMove) -> Result<()> {
         ensure!(
-            world
-                .entities
-                .component_owners(driver.component)
-                .binary_search(&id)
-                .is_ok(),
-            "entity {id} has no {} controller",
-            driver.component
+            (-1.0..=1.0).contains(&intent.side) && (-1.0..=1.0).contains(&intent.forward),
+            "movement axes must be finite and in -1..=1"
         );
-        ensure!(
-            (-1..=1).contains(&intent.side) && (-1..=1).contains(&intent.forward),
-            "movement axes must be in -1..=1"
-        );
-        (driver.apply)(world, id, intent)
+        (self.driver(world, id)?.apply)(world, id, intent)
     }
 }
 
 /// Desired end-of-substep transform in the parent frame (metres). Producers do not write
 /// the entity transform. A simulated translation must come from that substep's solver.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct RootMotionRequest(Mat4);
+
+/// Physical translation in parent space and optional rotation from an angular solver.
+#[derive(Clone, Copy)]
+pub struct SolvedRoot {
+    pub position: Vec3,
+    pub rotation: Option<Quat>,
+}
 
 impl RootMotionRequest {
     pub fn new(target_local: Mat4) -> Result<Self> {
@@ -115,18 +165,53 @@ impl RootMotionRequest {
         current_local: Mat4,
         simulated_position: Option<Vec3>,
     ) -> Result<Mat4> {
+        self.resolve_body(
+            policy,
+            current_local,
+            simulated_position.map(|position| SolvedRoot {
+                position,
+                rotation: None,
+            }),
+        )
+    }
+    pub fn resolve_body(
+        self,
+        policy: MotionPolicy,
+        current_local: Mat4,
+        solved: Option<SolvedRoot>,
+    ) -> Result<Mat4> {
         ensure!(current_local.is_finite(), "non-finite current root");
         policy.validate()?;
         if policy.physics == PhysicsParticipation::Simulated {
-            let position =
-                simulated_position.context("simulated root motion requires a physics solver")?;
-            ensure!(position.is_finite(), "non-finite simulated root position");
+            let solved = solved.context("simulated root motion requires a physics solver")?;
+            ensure!(
+                solved.position.is_finite(),
+                "non-finite simulated root position"
+            );
+            if let Some(rotation) = solved.rotation {
+                ensure!(
+                    rotation.is_finite() && rotation.is_normalized(),
+                    "invalid simulated root rotation"
+                );
+                let determinant = self.0.determinant();
+                ensure!(
+                    determinant.is_finite() && determinant != 0.,
+                    "singular rigid root transform"
+                );
+                let (scale, _, _) = self.0.to_scale_rotation_translation();
+                ensure!(scale.is_finite(), "invalid rigid root scale");
+                return Ok(Mat4::from_scale_rotation_translation(
+                    scale,
+                    rotation,
+                    solved.position,
+                ));
+            }
             let mut resolved = self.0;
-            resolved.w_axis = position.extend(1.);
+            resolved.w_axis = solved.position.extend(1.);
             Ok(resolved)
         } else {
             ensure!(
-                simulated_position.is_none(),
+                solved.is_none(),
                 "physics cannot submit a translation for a nonsimulated root"
             );
             Ok(if policy.mobility == Mobility::Static {

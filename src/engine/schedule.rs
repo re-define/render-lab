@@ -274,9 +274,20 @@ impl Entry {
     }
 }
 
+/// Counts committed commands and known matrix payloads. Opaque edits have no byte estimate.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct CommitCounts {
+    pub writes: usize,
+    pub components: usize,
+    pub pose_bytes: usize,
+    pub undo_records: usize,
+    pub undo_pose_bytes: usize,
+}
+
 /// Wall-clock intervals in the most recent tick, summed across its fixed substeps.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct TickProfile {
+    pub counts: CommitCounts,
     pub binding: Duration,
     pub evaluate: Duration,
     /// Exclusive of rollback preparation.
@@ -647,7 +658,12 @@ impl Schedule {
                 timed(enabled.then_some(&mut profile.commit), || {
                     for (phase, changes) in phases.iter_mut().zip(edits) {
                         for change in changes {
-                            change.apply(Arc::make_mut(world), None);
+                            change.apply_timed(
+                                Arc::make_mut(world),
+                                None,
+                                None,
+                                enabled.then_some(&mut profile.counts),
+                            );
                         }
                         phase.completed += 1;
                     }
@@ -724,6 +740,7 @@ fn run_substep(
                             Arc::make_mut(world),
                             more.then_some(&mut undo),
                             enabled.then_some(&mut capture),
+                            enabled.then_some(&mut profile.counts),
                         );
                     }
                 });

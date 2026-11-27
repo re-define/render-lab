@@ -144,6 +144,19 @@ pub(super) fn populated_world(
             .unwrap()
             .into_owned();
         b.remap_supports(map);
+        if let Some(old) = seed.typed_component::<ResolvedMotion>(actor, RESOLVED)? {
+            let mut resolved = old.into_owned();
+            resolved.support = resolved.support.map(map);
+            resolved.surfaces = Arc::default();
+            w.set_typed_component(map(actor), RESOLVED, resolved);
+        }
+        if let Some(old) = seed.typed_component::<ProposedMotion>(actor, PROPOSED)? {
+            let mut proposed = *old;
+            if let Some(grip) = &mut proposed.grip {
+                grip.support = map(grip.support);
+            }
+            w.set_typed_component(map(actor), PROPOSED, proposed);
+        }
         c.finger.iter_mut().for_each(|m| m.joint = map(m.joint));
         let spring = seed
             .typed_component::<dynamics::Spring>(prototype.plate, dynamics::SPRING)?
@@ -207,19 +220,35 @@ pub(super) fn alternate_rig(w: &mut World, id: Id) -> Result<(Id, FingerMarker)>
     // forearm and wrist and a different arm length. Exercise traversal by ID, not by name.
     let wrist = alternate.ids[alternate.arm[2]];
     let parent = w.entities[&wrist].parent.unwrap();
+    let correction = Quat::from_rotation_y(0.43);
     let spacer = w.spawn(Entity {
         name: "Wrist adapter".into(),
         parent: Some(parent),
-        local: Mat4::from_translation(Vec3::new(0.01, 0., 0.)),
+        local: Mat4::from_rotation_translation(correction, Vec3::new(0.01, 0., 0.)),
         ..Default::default()
     });
-    w.entities.get_mut(&wrist).unwrap().parent = Some(spacer);
+    let entity = w.entities.get_mut(&wrist).unwrap();
+    entity.parent = Some(spacer);
+    entity.local = Mat4::from_quat(correction.conjugate()) * entity.local;
+    let mut player = player(w, id)?.into_owned();
+    let mut semantics = player
+        .rig
+        .as_deref()
+        .unwrap_or(&profile::DEFAULT.rig)
+        .clone();
+    semantics
+        .basis
+        .resize(player.bones.len(), Default::default());
+    semantics.basis[semantics.reach_arm[2]].parent = correction.conjugate();
+    player.rig = Some(Arc::new(semantics));
+    player.transition = None;
+    w.set_typed_component(id, PLAYER, player);
     for &joint in &alternate.ids {
         w.entities.get_mut(&joint).unwrap().name = format!("alternative rig joint {joint}");
     }
     let marker = FingerMarker {
         joint: fingertip,
-        offset: rig::FINGERTIP,
+        offset: profile::DEFAULT.rig.fingertip_offset,
     };
     let mut contact = w
         .typed_component::<Contact>(id, SETTING)?

@@ -8,6 +8,15 @@ pub fn command(engine: &mut Engine, arg: &str) -> Result<String> {
         .target(&engine.world)
         .or_else(|| engine.world.first_raw_component(SETTING).map(|(id, _)| id))
         .context("open the silver-contact experiment first")?;
+    if let Some(mode) = arg.strip_prefix("mode ") {
+        let active = match mode.trim() {
+            "free" => false,
+            "contact" => true,
+            _ => anyhow::bail!("contact mode free|contact"),
+        };
+        modes::switch(Arc::make_mut(&mut engine.world), id, active)?;
+        return Ok(format!("Character {id} mode {}", mode.trim()));
+    }
     let c = engine
         .world
         .typed_component::<Contact>(id, SETTING)?
@@ -93,7 +102,7 @@ pub fn command(engine: &mut Engine, arg: &str) -> Result<String> {
             let at = Vec3::new(x.parse()?, y.parse()?, z.parse()?);
             ensure!(at.is_finite(), "expected finite target coordinates");
             let target = c.target;
-            move_target(Arc::make_mut(&mut engine.world), target, at)?;
+            move_target(Arc::make_mut(&mut engine.world), id, target, at)?;
             return Ok(format!("Contact {arg}"));
         }
         ["view", name] => {
@@ -130,6 +139,17 @@ fn edit_controller(engine: &mut Engine, id: Id, mut c: Contact, words: &[&str]) 
             set_actor_goal(Arc::make_mut(&mut engine.world), id, 0, 0)?;
         }
         ["hand", v @ ("on" | "off")] => c.hand_ik = *v == "on",
+        ["limbs", value] => physical_pose::PhysicalPose::configure(&mut c.physical_pose, value)?,
+        ["grip", "off"] => c.grip_fraction = 0.,
+        ["grip", "on"] => c.grip_fraction = default_grip_fraction(),
+        ["grip", v] => {
+            let fraction = v.parse::<f32>()?;
+            ensure!(
+                (0.0..=1.0).contains(&fraction),
+                "grip requires a weight fraction in 0..=1"
+            );
+            c.grip_fraction = fraction;
+        }
         ["feet", v @ ("on" | "off")] => c.foot_ik = *v == "on",
         ["action", name] => {
             let section = match *name {
@@ -143,14 +163,21 @@ fn edit_controller(engine: &mut Engine, id: Id, mut c: Contact, words: &[&str]) 
             engine.post.reset();
         }
         _ => anyhow::bail!(
-            "contact status/physics/auto/manual · spin DEG/S · gravity M/S² · impulse N·s · action jump/vault/duck · hand on/off · feet on/off · target X Y Z · view wide/jump/vault/duck/finish/hand"
+            "contact status/physics/auto/manual · spin DEG/S · gravity M/S² · impulse N·s · action jump/vault/duck · hand on/off · grip on/off/FRACTION · limbs on/off/WEIGHT · feet on/off · target X Y Z · view wide/jump/vault/duck/finish/hand"
         ),
     }
     Arc::make_mut(&mut engine.world).set_typed_component(id, SETTING, c);
     Ok(())
 }
 
-fn move_target(world: &mut World, target: Id, point: Vec3) -> Result<()> {
+fn move_target(world: &mut World, actor: Id, target: Id, point: Vec3) -> Result<()> {
+    let frame = fixture::Fixture::bind(world, actor, target)?
+        .parent_to_actor(|id| Ok(world.entities[&id].local))?;
+    ensure!(
+        frame.determinant().abs() > 1e-12,
+        "singular interaction target parent"
+    );
+    let point = frame.inverse().transform_point3(point);
     let mut local = world
         .entities
         .get(&target)
@@ -168,11 +195,12 @@ mod tests {
     #[test]
     fn moving_the_touch_marker_only_invalidates_its_local_transform() -> Result<()> {
         let mut world = World::default();
+        let actor = world.spawn(Entity::default());
         let target = world.spawn(Entity::default());
         let epoch = world.entities.cursor();
         let hierarchy = world.entities.hierarchy_revision();
         let point = Vec3::new(1., 2., 3.);
-        move_target(&mut world, target, point)?;
+        move_target(&mut world, actor, target, point)?;
         assert!(target_point(world.entities[&target].local).abs_diff_eq(point, 1e-5));
         let edits = world.entities.changes(&epoch).unwrap();
         assert!(

@@ -1,0 +1,109 @@
+{
+  "clips": {
+    "backward_41": "steady",
+    "backward_42": "steady",
+    "backward_43": "steady",
+    "idle_41": "idle",
+    "idle_42": "idle",
+    "idle_43": "idle",
+    "jog-left_41": "steady",
+    "jog-left_42": "steady",
+    "jog-left_43": "steady",
+    "jog-right_41": "steady",
+    "jog-right_42": "steady",
+    "jog-right_43": "steady",
+    "run_41": "steady",
+    "run_42": "steady",
+    "run_43": "steady",
+    "slow-walk_41": "steady",
+    "slow-walk_42": "steady",
+    "slow-walk_43": "steady",
+    "start_41": "transition",
+    "start_42": "transition",
+    "start_43": "transition",
+    "stop_41": "transition",
+    "stop_42": "transition",
+    "stop_43": "transition",
+    "strafe-left_41": "steady",
+    "strafe-left_42": "steady",
+    "strafe-left_43": "steady",
+    "strafe-right_41": "steady",
+    "strafe-right_42": "steady",
+    "strafe-right_43": "steady",
+    "walk-left_41": "steady",
+    "walk-left_42": "steady",
+    "walk-left_43": "steady",
+    "walk-right_41": "steady",
+    "walk-right_42": "steady",
+    "walk-right_43": "steady",
+    "walk_41": "steady",
+    "walk_42": "steady",
+    "walk_43": "steady"
+  },
+  "rig": {
+    "pelvis": 0,
+    "right_leg": [
+      13,
+      14,
+      15,
+      16
+    ],
+    "left_leg": [
+      17,
+      18,
+      19,
+      20
+    ],
+    "reach_arm": [
+      6,
+      7,
+      8
+    ],
+    "fingertip_name": "IndexFinger3_R_069",
+    "fingertip_offset": [
+      -0.00573349,
+      0.01938251,
+      0.00494587
+    ],
+    "palm": {
+      "offset": [
+        0.02223109,
+        0.02361779,
+        -0.01044704
+      ],
+      "fingers": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "normal": [
+        0.51,
+        0.0,
+        -0.86
+      ]
+    }
+  },
+  "actions": {
+    "jump": {
+      "flight": {
+        "takeoff": 10.5,
+        "landing": 28,
+        "impulse_scale": 1
+      }
+    },
+    "vault": {
+      "flight": {
+        "takeoff": 9.5,
+        "landing": 31,
+        "impulse_scale": 1.16
+      },
+      "palm": [
+        9,
+        13.5,
+        17.5,
+        22
+      ]
+    },
+    "duck": {}
+  }
+}

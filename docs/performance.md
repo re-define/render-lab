@@ -49,6 +49,36 @@ Remove-Item Env:RENDER_LAB_REFERENCE_DRAWS
 Remove-Item Env:RENDER_LAB_NPCS
 ```
 
+## 角色反馈和共享碰撞的开销
+
+对照使用 `8ad4259` 和本次实现，各自独立编译。两端均使用上面的 500 人工作量和无限额姿态提取，默认局部物理动画关闭。顺序为旧、新、新、旧。每一行是一次独立运行，单位为毫秒。分别按排序后的 96 个样本取最接近 `q × (N − 1)` 的样本。每个采样窗口计六个子步和一次场景提取，不包含窗口绘制。
+
+| 版本及局部物理动画 | 六子步模拟 P50 / P95 | 随后提取 P50 / P95 |
+| --- | ---: | ---: |
+| 基线，第 1 次 | 20.98 / 24.51 | 6.93 / 8.29 |
+| 当前，关闭，第 1 次 | 22.84 / 25.32 | 7.15 / 7.84 |
+| 当前，关闭，第 2 次 | 22.89 / 29.34 | 7.06 / 9.39 |
+| 基线，第 2 次 | 20.82 / 22.15 | 6.86 / 7.43 |
+| 当前，500 人全部开启，第 1 次 | 23.99 / 28.52 | 7.01 / 8.52 |
+| 当前，500 人全部开启，第 2 次 | 24.09 / 30.08 | 7.19 / 9.37 |
+
+新版本在同一范围内额外求解陌生碰撞体、移动父节点、胶囊侧壁和顶部接触，并把实际位移、支撑点速度、阻挡法线写回动作查询。默认三条局部物理骨链均关闭；打开后建立每人的三条关节约束链。两种配置都逐实例与独立冷提取比对。单轮分段诊断只用于判断工作发生在哪里，记录提交与撤销需要额外计时。
+
+首个采样 tick 提交 25,206 项写入，其中组件 18,600 项，姿态矩阵载荷 4,262,400 字节。为支持失败后的子步回滚准备了 19,206 条记录，其中矩阵 230,400 字节。诊断模式下六个子步的 worker 求值、提交、撤销准备 P50 分别为 9.81、8.18、3.63 ms，计时互相排除；没有实际回滚。默认路径的两次模拟 P50 比同机基线高约 2 ms。两轮 P95 波动更大，可看出完整人群这次仍有额外 CPU 成本。
+
+另测 3,000 个盒碰撞体，其中 300 个每步移动，500 次胶囊扫掠，每次平均进入窄相位 1.00 个候选。每项的 P50 / P95 依次为共享快照固定步骤 0.437 / 0.556 ms、查询与支撑面组装 0.139 / 0.277 ms、轴对齐盒精确求交 0.016 / 0.019 ms。该组使用两个 worker，测量 96 次。
+
+```powershell
+$env:RENDER_LAB_NPCS = '500'
+cargo test --release --locked --lib silver_crowd_extraction_profile -- --ignored --nocapture
+$env:RENDER_LAB_PHYSICAL_LIMBS = '1'
+cargo test --release --locked --lib silver_crowd_extraction_profile -- --ignored --nocapture
+Remove-Item Env:RENDER_LAB_PHYSICAL_LIMBS, Env:RENDER_LAB_NPCS
+cargo test --release --locked --lib profile_dynamic_collision_snapshot -- --ignored --nocapture
+```
+
+[子步交换、开关和视频](character-motion.md) · [障碍场的动作精度对照](animation-physics.md) · [人群基准](../src/experiments/motion/silver/contact/crowd_profile.rs)
+
 ## 岩柱森林的物理队列
 
 相同的 420 帧相机路径，原生 1080p、TAA、ReSTIR、硬件直接光阴影和多跳间接光。剔除开头 48 帧，统计 372 帧。两个在途槽，队列数在设备创建时确定。[相机轨迹和逐帧 CSV](../examples/forest_shadows/zoom.rs)
