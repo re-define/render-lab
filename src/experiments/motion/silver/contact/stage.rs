@@ -4,7 +4,7 @@ use glam::Vec3Swizzles;
 
 pub(super) fn register_motion(systems: &mut CharacterSystems, bank: Arc<SilverMatcher>) {
     systems.register(move |actors| Prepare {
-        actors: actors.clone(),
+        actors: actors.values().cloned().collect(),
         bank: bank.clone(),
     });
 }
@@ -14,7 +14,7 @@ pub(super) fn register_ik(systems: &mut CharacterSystems) {
 }
 
 struct Prepare {
-    actors: Actors,
+    actors: Vec<Arc<Stage>>,
     bank: Arc<SilverMatcher>,
 }
 struct Feedback(Vec<Arc<Stage>>);
@@ -41,71 +41,79 @@ impl SimulationSystem for Prepare {
     fn access(&self) -> SystemAccess {
         SystemAccess {
             name: "Locomotion and traversal intent",
-            reads: &[Component(SETTING), Component(PLAYER), LocalTransformsById],
-            writes: &[Component(SETTING), Component(PLAYER), LocalTransformsById],
+            reads: &[
+                Component(SETTING),
+                Component(PLAYER),
+                Component(MOTION_POLICY),
+                LocalTransformsById,
+            ],
+            writes: &[Component(SETTING), Component(PLAYER)],
         }
     }
-    fn transform_targets(&self, bindings: &TransformBindings<'_>) -> Result<TransformTargets> {
+    fn bound_transforms(&self) -> Option<TransformTargets> {
         let mut targets = TransformTargets::default();
-        for &id in bindings.component_owners(PLAYER)? {
-            let p = bindings
-                .component::<State>(id, PLAYER)?
-                .context("missing player")?;
-            targets.reads.push(id);
-            targets.reads.extend_from_slice(&p.bones);
-            targets.writes.push(id);
-            if let Some(s) = self.actors.get(&id) {
-                targets.reads.push(s.target);
-            } else {
-                targets.writes.extend_from_slice(&p.bones);
-            }
+        for stage in &self.actors {
+            targets.reads.extend([stage.actor, stage.target]);
+            targets.reads.extend_from_slice(&stage.binding.bones);
         }
-        Ok(targets)
+        Some(targets)
     }
     fn run(&self, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
-        cx.for_each_parallel(cx.component_owners(PLAYER)?, |&id, cx| {
+        cx.for_each_parallel(&self.actors, |s, cx| {
+            let id = s.actor;
             let mut p = cx
                 .component::<State>(id, PLAYER)?
                 .context("missing motion controller")?
                 .into_owned();
-            if let Some(s) = self.actors.get(&id) {
-                let mut c = s.state(cx)?;
-                if let Some(old) = &c.source_binding
-                    && !Arc::ptr_eq(old, &s.binding)
-                    && **old != *s.binding
-                {
-                    c.source.clear();
-                    c.feet = Default::default();
-                    (c.pelvis, c.reach, c.palm_load) = (0., 0., 0.);
-                    p.transition = None;
-                    p.search_in = 0;
-                }
-                c.source_binding = Some(s.binding.clone());
-                let root = local(cx, id)?;
-                if c.auto_walk || c.play.is_some() {
-                    traversal::steer(
-                        &mut c,
-                        &mut p,
-                        root.w_axis.truncate(),
-                        target_point(local(cx, s.target)?),
-                        dt,
-                    );
-                }
-                let (root, base) = self.bank.sample_pose(&mut p, root, dt, |i, bone| {
-                    match c.source.get(s.rig.source_slots[i]) {
-                        Some(previous) => Ok(*previous),
-                        None => local(cx, bone),
-                    }
-                })?;
-                c.source.resize(base.len(), Mat4::IDENTITY);
-                for (&slot, joint) in s.rig.source_slots.iter().zip(base) {
-                    c.source[slot] = joint;
-                }
-                cx.set_pose([(id, root)])?;
-                cx.set_typed_component(id, SETTING, c)?;
-            } else {
-                self.bank.publish_locomotion(id, &mut p, cx, dt)?;
+            let mut c = s.state(cx)?;
+            let inherited_velocity = p.standalone_velocity.take();
+            if inherited_velocity.is_some() {
+                c.play = None;
             }
+            if inherited_velocity.is_some()
+                || c.source_binding
+                    .as_ref()
+                    .is_some_and(|old| !Arc::ptr_eq(old, &s.binding) && **old != *s.binding)
+            {
+                c.source.clear();
+                c.feet = Default::default();
+                (c.pelvis, c.reach, c.palm_load) = (0., 0., 0.);
+                p.transition = None;
+                p.search_in = 0;
+            }
+            c.source_binding = Some(s.binding.clone());
+            let root = local(cx, id)?;
+            let policy = cx.motion_policy(id, MotionPolicy::DYNAMIC)?;
+            if policy.physics != PhysicsParticipation::Simulated {
+                // Traversal waits for physical take-off and landing; free locomotion still samples the pose.
+                c.play = None;
+            } else if c.auto_walk || c.play.is_some() {
+                traversal::steer(
+                    &mut c,
+                    &mut p,
+                    root.w_axis.truncate(),
+                    target_point(local(cx, s.target)?),
+                    dt,
+                );
+            }
+            let (mut root, base) = self.bank.sample_pose(&mut p, root, dt, |i, bone| {
+                match c.source.get(s.rig.source_slots[i]) {
+                    Some(previous) => Ok(*previous),
+                    None => local(cx, bone),
+                }
+            })?;
+            c.source.resize(base.len(), Mat4::IDENTITY);
+            for (&slot, joint) in s.rig.source_slots.iter().zip(base) {
+                c.source[slot] = joint;
+            }
+            if let Some(play) = c.play {
+                root.w_axis = c.section.ground_goal(play).extend(1.);
+            }
+            c.request = Some(ContactMotion {
+                root: RootMotionRequest::new(root)?,
+                inherited_velocity,
+            });
+            cx.set_typed_component(id, SETTING, c)?;
             cx.set_typed_component(id, PLAYER, p)
         })
     }
@@ -190,10 +198,10 @@ fn feedback(s: &Stage, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
             foot.weight = 0.;
         }
         if let Some((owner, p)) = foot.anchor {
-            let support = boxes
-                .iter()
-                .find(|s| s.id == owner)
-                .context("missing planted support")?;
+            let Some(support) = boxes.iter().find(|s| s.id == owner) else {
+                *foot = Foot::default();
+                continue;
+            };
             let lock = support.world.transform_point3(p);
             foot.releasing |=
                 owner != hit.id || clearance > 0.052 || lock.xz().distance(ball.xz()) > 0.085;
@@ -273,4 +281,39 @@ fn feedback(s: &Stage, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
         r.corrected.iter().map(|&i| pose.local[i]).collect(),
     )?;
     cx.set_typed_component(s.actor, SETTING, c)
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[test]
+    fn sampling_only_publishes_a_request_until_the_solver_commits() -> Result<()> {
+        let mut world = scene()?;
+        let id = actor(&world).unwrap();
+        let mut c = world
+            .typed_component::<Contact>(id, SETTING)?
+            .unwrap()
+            .into_owned();
+        c.auto_walk = false;
+        world.set_typed_component(id, SETTING, c);
+        set_actor_goal(&mut world, id, 0, 1)?;
+        let before = world.entities[&id].local;
+        let stage = Arc::new(bind_actor(&world, id, &rig::children(&world))?);
+        let mut schedule = Schedule::default();
+        schedule.add_fixed_system(
+            character_clock(),
+            Arc::new(Prepare {
+                actors: vec![stage],
+                bank: Arc::new(SilverMatcher::load()?),
+            }),
+        )?;
+        let mut world = Arc::new(world);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build()?;
+        schedule.tick(&mut world, 1. / 60., &pool)?;
+        let c = world.typed_component::<Contact>(id, SETTING)?.unwrap();
+        assert_eq!(before, world.entities[&id].local);
+        assert!(c.request.unwrap().root.target_local().w_axis.z > before.w_axis.z);
+        Ok(())
+    }
 }

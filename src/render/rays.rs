@@ -8,6 +8,8 @@ pub(crate) use scene::{NativeScene, RayScene, Traversal};
 #[derive(Clone, Copy, Debug)]
 pub struct Surface {
     pub geometry: SurfaceBuffers,
+    /// Rigid local-space approximation used only by occlusion queries.
+    pub(crate) shadow_proxy: Option<SurfaceBuffers>,
     /// Immutable source identifying the triangle indices, independent of vertex pose.
     pub(crate) topology: Resource,
     pub color: [f32; 4],
@@ -15,6 +17,17 @@ pub struct Surface {
     pub material_slot: u32,
 }
 impl Surface {
+    pub(crate) fn occluder(self) -> Self {
+        match self.shadow_proxy {
+            Some(proxy) => Self {
+                geometry: proxy,
+                topology: proxy.faces,
+                shadow_proxy: None,
+                ..self
+            },
+            None => self,
+        }
+    }
     pub fn new(
         geometry: SurfaceBuffers,
         mut color: [f32; 4],
@@ -24,6 +37,7 @@ impl Surface {
     ) -> Self {
         color[3] = metallic;
         Self {
+            shadow_proxy: None,
             topology: geometry.faces,
             geometry,
             color,
@@ -79,12 +93,21 @@ pub(crate) fn dispatch(
     );
 }
 pub(crate) fn software(g: &mut FrameGraph, dynamic_only: bool) -> Result<Software> {
+    software_geometry(g, dynamic_only, false)
+}
+
+pub(crate) fn software_geometry(
+    g: &mut FrameGraph,
+    dynamic_only: bool,
+    occlusion: bool,
+) -> Result<Software> {
     let surfaces: Vec<_> = g
         .products
         .ray_surfaces
         .iter()
         .copied()
         .filter(|s| !dynamic_only || s.dynamic)
+        .map(|s| if occlusion { s.occluder() } else { s })
         .collect();
     let count = surfaces
         .iter()
@@ -189,49 +212,55 @@ pub(crate) fn native_scene(
     cluster: Option<Resource>,
     hits: RayHits,
 ) -> Result<(Resource, Vec<Resource>, u32)> {
-    let mut meshes = BTreeMap::new();
+    let mut meshes = std::collections::BTreeSet::new();
     let mut instances = Vec::new();
     let mut first = 0u32;
     for source in surfaces {
         let surface = source.geometry;
-        let key = (surface.vertices, surface.faces, surface.count);
-        let blas = match meshes.entry(key) {
-            std::collections::btree_map::Entry::Occupied(e) => *e.get(),
-            std::collections::btree_map::Entry::Vacant(e) => {
-                let Storage::Buffer { bytes, .. } = g.resources[surface.vertices.0].1 else {
-                    anyhow::bail!("ray surface needs vertex buffer")
-                };
-                let indices = buffer(g, "Packed native ray indices", surface.count as usize * 12);
-                dispatch(
-                    g,
-                    "Pack native ray indices",
-                    include_bytes!(concat!(env!("OUT_DIR"), "/ray_indices.comp.spv")),
-                    vec![
-                        (surface.faces, Access::ComputeRead),
-                        (indices, Access::ComputeWrite),
-                    ],
-                    surface.count.to_ne_bytes().to_vec(),
-                    surface.count,
-                );
-                let blas = g.resource(
-                    "Mesh BLAS",
-                    Storage::Acceleration(AccelerationShape::Triangles {
-                        count: surface.count,
-                        vertices: (bytes / 32).try_into()?,
-                    }),
-                );
-                g.pass(
-                    "Build triangle BLAS",
-                    Op::BuildBlas {
-                        vertices: surface.vertices,
-                        indices,
-                        topology: source.topology,
-                        output: blas,
-                    },
-                );
-                *e.insert(blas)
-            }
+        let key = (
+            surface.vertices,
+            surface.faces,
+            source.topology,
+            surface.count,
+        );
+        let blas = if let Some(&blas) = g.products.ray_meshes.get(&key) {
+            blas
+        } else {
+            let Storage::Buffer { bytes, .. } = g.resources[surface.vertices.0].1 else {
+                anyhow::bail!("ray surface needs vertex buffer")
+            };
+            let indices = buffer(g, "Packed native ray indices", surface.count as usize * 12);
+            dispatch(
+                g,
+                "Pack native ray indices",
+                include_bytes!(concat!(env!("OUT_DIR"), "/ray_indices.comp.spv")),
+                vec![
+                    (surface.faces, Access::ComputeRead),
+                    (indices, Access::ComputeWrite),
+                ],
+                surface.count.to_ne_bytes().to_vec(),
+                surface.count,
+            );
+            let blas = g.resource(
+                "Mesh BLAS",
+                Storage::Acceleration(AccelerationShape::Triangles {
+                    count: surface.count,
+                    vertices: (bytes / 32).try_into()?,
+                }),
+            );
+            g.pass(
+                "Build triangle BLAS",
+                Op::BuildBlas {
+                    vertices: surface.vertices,
+                    indices,
+                    topology: source.topology,
+                    output: blas,
+                },
+            );
+            g.products.ray_meshes.insert(key, blas);
+            blas
         };
+        meshes.insert(blas);
         let transform = surface.model.transpose().to_cols_array()[..12].try_into()?;
         let first_triangle = match hits {
             RayHits::InstanceGeometry => 0,
@@ -253,7 +282,7 @@ pub(crate) fn native_scene(
             first_triangle,
         });
     }
-    let mut blases: Vec<_> = meshes.into_values().collect();
+    let mut blases: Vec<_> = meshes.into_iter().collect();
     if let Some(blas) = cluster {
         instances.push(RayInstance {
             blas,

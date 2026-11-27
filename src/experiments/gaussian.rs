@@ -1,6 +1,7 @@
 //! Indexed random access to exported 2DGaussian texture fields.
 use crate::experiments::assembly::{Primary, Registration as SceneModule};
 pub(super) const MODULE: SceneModule = SceneModule {
+    root_writers: &[],
     key: SETTING,
     primary: Primary::Exclusive,
     restore: None,

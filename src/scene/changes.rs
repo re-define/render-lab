@@ -53,6 +53,8 @@ pub(crate) enum Write {
     Material,
     Texture,
     Light,
+    GeometryAssets,
+    GeometryBinding,
     Component(&'static str),
     TypedValue(&'static str),
 }
@@ -298,13 +300,14 @@ impl Entities {
     }
     pub(crate) fn inspectable(e: &Entity) -> bool {
         e.mesh.is_none()
+            && e.geometry_assets.is_none()
             && e.skin.is_none()
             && e.skin_binding.is_none()
             && e.light.is_none()
             && e.texture.is_none()
             && e.components.is_empty()
     }
-    fn edit(&mut self, id: Id, kind: Write) -> Option<&mut Entity> {
+    pub(super) fn edit(&mut self, id: Id, kind: Write) -> Option<&mut Entity> {
         let row = self.rows.get_mut(&id)?;
         let kind = match kind {
             Write::TypedValue(key) | Write::Component(key) if !row.components.contains_key(key) => {

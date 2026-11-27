@@ -16,12 +16,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod movement;
-pub use movement::{MoveIntent, MovementControls, MovementDriver};
+pub use crate::movement::{MoveIntent, MovementControls, MovementDriver};
 mod schedule;
 pub use schedule::{
     BindingCheck, BoundSystems, Edit, FixedDomain, Schedule, SimulationData, SimulationSystem,
-    System, SystemAccess, SystemContext, SystemOrder, TransformBindings, TransformTargets,
+    System, SystemAccess, SystemContext, SystemOrder, TickRate, TransformBindings,
+    TransformTargets,
 };
 
 pub type FrameResult = Result<Frame, String>;
@@ -326,6 +326,12 @@ impl Engine {
             extraction: SceneExtractor::default(),
         })
     }
+    /// Save committed component state and the clock phase needed to resume at the next substep.
+    pub fn save_scene(&self, path: &std::path::Path) -> Result<()> {
+        self.world
+            .save_with_clocks(path, &self.schedule.checkpoints(&self.world))
+    }
+
     pub fn dlss_unavailable(&self) -> Option<&str> {
         self.dlss_unavailable.as_deref()
     }

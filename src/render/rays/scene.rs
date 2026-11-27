@@ -32,6 +32,43 @@ impl RayScene {
         hit_attributes: bool,
         rigid: Option<[Arc<[u8]>; 2]>,
     ) -> Result<Self> {
+        Self::build_geometry(g, traversal, hit_attributes, rigid, false)
+    }
+
+    /// Purely rigid proxies leave the GPU-deformed geometry identical for both ray purposes.
+    pub(crate) fn into_material_hits(
+        self,
+        g: &mut FrameGraph,
+        traversal: Traversal,
+        rigid: Option<[Arc<[u8]>; 2]>,
+    ) -> Result<Self> {
+        if let Self::Software { deformed, .. } = self {
+            let [nodes, triangles] = rigid.unwrap_or_default();
+            Ok(Self::Software {
+                nodes: g.resident_input("GI visual BVH", nodes),
+                triangles: g.resident_input("GI visual triangles", triangles),
+                deformed,
+            })
+        } else {
+            Self::build(g, traversal, true, rigid)
+        }
+    }
+
+    pub(crate) fn occluders(
+        g: &mut FrameGraph,
+        traversal: Traversal,
+        rigid: Option<[Arc<[u8]>; 2]>,
+    ) -> Result<Self> {
+        Self::build_geometry(g, traversal, false, rigid, true)
+    }
+
+    fn build_geometry(
+        g: &mut FrameGraph,
+        traversal: Traversal,
+        hit_attributes: bool,
+        rigid: Option<[Arc<[u8]>; 2]>,
+        occlusion: bool,
+    ) -> Result<Self> {
         if traversal != Traversal::Software {
             let cluster = g.products.cluster_shadow;
             let surfaces: Vec<_> = g
@@ -43,7 +80,7 @@ impl RayScene {
                     s.geometry.count > 0
                         && !cluster.is_some_and(|c| (c.proxy_start..c.proxy_end).contains(i))
                 })
-                .map(|(_, s)| *s)
+                .map(|(_, s)| if occlusion { s.occluder() } else { *s })
                 .collect();
             if !surfaces.is_empty() || cluster.is_some() {
                 let (tlas, blases, _) = native_scene(

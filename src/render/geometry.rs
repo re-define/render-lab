@@ -31,6 +31,32 @@ fn packed_vertex(mesh: &Mesh, vertex: usize, position: Vec3, normal: Vec3) -> [f
     ]
 }
 
+pub(crate) fn rigid_triangles<'a>(
+    mesh: &'a Mesh,
+    model: Mat4,
+    selected: Option<&'a [u32]>,
+) -> impl Iterator<Item = [[f32; 8]; 3]> + 'a {
+    let normal = Mat3::from_mat4(model).inverse().transpose();
+    let vertices: Vec<_> = mesh
+        .positions
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| {
+            let n = mesh
+                .normals
+                .get(i)
+                .map(|&n| (normal * Vec3::from(n)).normalize_or_zero())
+                .unwrap_or_default();
+            packed_vertex(mesh, i, model.transform_point3(p.into()), n)
+        })
+        .collect();
+    let count = selected.map_or(mesh.indices.len() / 3, <[u32]>::len);
+    (0..count).map(move |i| {
+        let start = 3 * selected.map_or(i, |faces| faces[i] as usize);
+        std::array::from_fn(|j| vertices[mesh.indices[start + j] as usize])
+    })
+}
+
 impl MeshSource {
     fn new(mesh: &Arc<Mesh>) -> Self {
         let vertices: Vec<_> = mesh
@@ -270,33 +296,6 @@ impl SurfaceGeometry<'_> {
 
     /// Cached rigid triangles for static software lighting and shadow casters.
     /// The visibility renderer consumes the GPU streams from draw().
-    pub(crate) fn triangles(&self) -> Result<impl Iterator<Item = [[f32; 8]; 3]> + '_> {
-        ensure!(
-            self.palette.is_none(),
-            "deformed ray geometry must use GPU surface streams"
-        );
-        let rigid_normal = Mat3::from_mat4(self.model).inverse().transpose();
-        let vertices: Vec<_> = self
-            .mesh
-            .positions
-            .iter()
-            .enumerate()
-            .map(|(index, &position)| {
-                let position = self.model.transform_point3(position.into());
-                let normal = self
-                    .mesh
-                    .normals
-                    .get(index)
-                    .map(|&normal| (rigid_normal * Vec3::from(normal)).normalize_or_zero())
-                    .unwrap_or_default();
-                Ok(packed_vertex(self.mesh, index, position, normal))
-            })
-            .collect::<Result<_>>()?;
-        Ok(self
-            .selected()
-            .map(move |face| self.indices(face).map(|vertex| vertices[vertex as usize])))
-    }
-
     fn current(&self, g: &mut FrameGraph, inputs: MeshInputs) -> Result<(Resource, Mat4)> {
         Ok(if let Some(palette) = self.palette {
             ensure!(
@@ -385,7 +384,7 @@ impl SurfaceGeometry<'_> {
             model,
         };
         if !instance.emitter {
-            g.products.ray_surfaces.push(rays::Surface::new(
+            let mut ray = rays::Surface::new(
                 SurfaceBuffers {
                     faces: if self.selected.is_none() {
                         inputs.faces
@@ -400,12 +399,33 @@ impl SurfaceGeometry<'_> {
                 instance
                     .material
                     .map_or(0, |m| s.scene.routes.material_slots[&m] as u32),
-            ));
+            );
+            if let Some(proxy) = s
+                .scene
+                .products_for(instance)
+                .and_then(|a| a.occlusion_override())
+            {
+                let id = MeshId(proxy);
+                let mesh = &s.scene.meshes[&id].mesh;
+                let source = *t
+                    .meshes
+                    .entry(id)
+                    .or_insert_with(|| s.scene.mesh_cache.import(id, mesh, g));
+                ray.shadow_proxy = Some(SurfaceBuffers {
+                    vertices: source.vertices,
+                    faces: source.faces,
+                    count: (mesh.indices.len() / 3).try_into()?,
+                    model: instance.model,
+                });
+            }
+            g.products.ray_surfaces.push(ray);
         }
         draws.push(
             surface,
             item,
-            s.scene.meshes[&self.mesh_id].ordinary_draw_template(),
+            &s.scene.meshes[&self.mesh_id].ordinary_draw_template(
+                s.scene.products_for(instance).and_then(|a| a.local_bounds),
+            ),
             self.palette.is_some(),
         );
         Ok(surface)

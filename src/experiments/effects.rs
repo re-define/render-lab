@@ -2,6 +2,10 @@
 use crate::experiments::assembly::{Primary, Registration as SceneModule};
 use crate::render::material_code;
 pub(super) const MODULE: SceneModule = SceneModule {
+    root_writers: &[crate::scene::RootWriter::new(
+        SHARD,
+        crate::scene::MotionPolicy::KINEMATIC,
+    )],
     key: SETTING,
     primary: Primary::Visibility,
     restore: None,
@@ -39,6 +43,7 @@ pub(super) const MODULE: SceneModule = SceneModule {
 };
 use crate::render::FrameGraph;
 mod fracture;
+pub(crate) use fracture::SHARD;
 pub(in crate::experiments) mod river;
 #[cfg(test)]
 mod tests;
@@ -171,7 +176,11 @@ impl SimulationSystem for Playback {
             reads: if self.pieces.is_empty() {
                 &[Component(SETTING)]
             } else {
-                &[Component(SETTING), LocalTransformsById]
+                &[
+                    Component(SETTING),
+                    Component(crate::scene::MOTION_POLICY),
+                    LocalTransformsById,
+                ]
             },
             writes: if self.pieces.is_empty() {
                 &[Component(SETTING)]
@@ -200,7 +209,13 @@ impl SimulationSystem for Playback {
             let mut transforms = Vec::with_capacity(self.pieces.len());
             for piece in &self.pieces {
                 let (joint, local) = piece.pose(s.time);
-                if cx.local(joint)?.is_some() {
+                let policy = cx.motion_policy(joint, crate::scene::MotionPolicy::KINEMATIC)?;
+                anyhow::ensure!(
+                    policy.physics != crate::scene::PhysicsParticipation::Simulated,
+                    "shard {joint} belongs to procedural playback"
+                );
+                if policy.mobility == crate::scene::Mobility::Movable && cx.local(joint)?.is_some()
+                {
                     transforms.push((joint, local));
                 }
             }
@@ -223,7 +238,19 @@ pub fn command(engine: &mut Engine, args: &str) -> Result<String> {
     let world = Arc::make_mut(&mut engine.world);
     if s.kind == Kind::Destruction {
         let pieces = fracture::pieces(world)?;
-        LocalPose::prepare(world, pieces.iter().map(|p| p.pose(s.time)))?.apply(world);
+        let mut transforms = Vec::new();
+        for piece in pieces {
+            let policy = world.motion_policy(piece.id, crate::scene::MotionPolicy::KINEMATIC)?;
+            anyhow::ensure!(
+                policy.physics != crate::scene::PhysicsParticipation::Simulated,
+                "shard {} belongs to procedural playback",
+                piece.id
+            );
+            if policy.mobility == crate::scene::Mobility::Movable {
+                transforms.push(piece.pose(s.time));
+            }
+        }
+        LocalPose::prepare(world, transforms)?.apply(world);
     }
     world.set_setting(id, SETTING, serde_json::to_value(s)?);
     engine.post.reset();
@@ -271,7 +298,7 @@ pub(super) fn configure(
         Vec::new()
     };
     if active {
-        schedule.add_system(Arc::new(Playback { pieces }));
+        schedule.add_frame_system("effects", Arc::new(Playback { pieces }))?;
     }
     Ok(camera)
 }

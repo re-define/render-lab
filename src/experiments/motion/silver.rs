@@ -1,6 +1,10 @@
 //! Motion matching on poses retargeted from Kimodo to the imported Silver Wolf rig.
 use crate::experiments::assembly::{Primary, Registration as SceneModule};
 pub(in crate::experiments) const MODULE: SceneModule = SceneModule {
+    root_writers: &[
+        crate::scene::RootWriter::new(PLAYER, crate::scene::MotionPolicy::KINEMATIC)
+            .delegates_to(contact::SETTING),
+    ],
     key: PLAYER,
     primary: Primary::Simulation,
     restore: Some(hydrate),
@@ -8,22 +12,32 @@ pub(in crate::experiments) const MODULE: SceneModule = SceneModule {
         if !crate::experiments::composition::enabled(world, "actor") {
             return Ok(());
         }
-        a.movement = Some(MOVEMENT);
-        if world.first_raw_component(contact::SETTING).is_none() {
-            a.schedule
-                .add_system(std::sync::Arc::new(SilverMatcher::load()?));
+        for &id in world.entities.component_owners(PLAYER) {
+            if !world.entities[&id]
+                .components
+                .contains_key(contact::SETTING)
+            {
+                ensure!(
+                    world.motion_policy(id, MotionPolicy::KINEMATIC)?.physics
+                        != PhysicsParticipation::Simulated,
+                    "Silver Wolf entity {id} requires a physics solver for simulated root motion; attach its contact body"
+                );
+            }
         }
-        Ok(())
+        a.movement = Some(MOVEMENT);
+        install(world, &mut a.schedule)
     },
 };
 use super::*;
+use crate::movement::{MovementDriver, RootMotionRequest};
+use crate::scene::{MOTION_POLICY, Mobility, MotionPolicy, PhysicsParticipation};
 pub mod contact;
 mod locomotion;
 mod search;
 mod trajectory_view;
 use crate::experiments::cartoon;
 pub(in crate::experiments) use trajectory_view::OVERLAY;
-pub(super) const MOVEMENT: crate::engine::MovementDriver = crate::engine::MovementDriver {
+pub(super) const MOVEMENT: MovementDriver = MovementDriver {
     component: PLAYER,
     camera_follows: |world, id| {
         !world.entities[&id]
@@ -37,6 +51,27 @@ pub const PLAYER: &str = "lab.silver_wolf.motion";
 const INDEX: &str = include_str!("../../../assets/motion/bank.json");
 const DATA: &[u8] = include_bytes!("../../../assets/motion/poses.bin");
 const LOOKAHEAD: usize = 23;
+
+fn install(world: &World, schedule: &mut crate::engine::Schedule) -> Result<()> {
+    let bank = Arc::new(SilverMatcher::load()?);
+    schedule.add_frame_system("silver-motion", bank.clone())?;
+    contact::register(world, schedule, bank)
+}
+
+/// Component-owner indexes are sorted. The two common homogeneous scenes need no allocation.
+fn standalone_actors<'a>(players: &'a [Id], contacts: &[Id]) -> std::borrow::Cow<'a, [Id]> {
+    if contacts.is_empty() {
+        return players.into();
+    }
+    if players == contacts {
+        return (&[][..]).into();
+    }
+    players
+        .iter()
+        .copied()
+        .filter(|id| contacts.binary_search(id).is_err())
+        .collect()
+}
 
 #[derive(Deserialize)]
 struct Entry {
@@ -59,6 +94,9 @@ struct State {
     bones: Vec<Id>,
     #[serde(skip)]
     layout: Option<crate::scene::PoseLayout>,
+    /// Actual parent-space velocity to hand off if contact dynamics takes the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    standalone_velocity: Option<Vec3>,
     hip_origin: Vec3,
     speed: f32,
     turn: f32,
@@ -292,7 +330,7 @@ impl SilverMatcher {
         dt: f32,
     ) -> Result<()> {
         let root = cx.local(id)?.context("missing motion root")?;
-        let (root, joints) = self.sample_pose(p, root, dt, |_, id| {
+        let (requested, joints) = self.sample_pose(p, root, dt, |_, id| {
             cx.local(id)?.context("missing motion joint")
         })?;
         if p.layout
@@ -301,7 +339,12 @@ impl SilverMatcher {
         {
             p.layout = Some(crate::scene::PoseLayout::new(p.bones.iter().copied())?);
         }
-        cx.set_pose([(id, root)])?;
+        let policy = cx.motion_policy(id, MotionPolicy::KINEMATIC)?;
+        let resolved = RootMotionRequest::new(requested)?.resolve(policy, root, None)?;
+        p.standalone_velocity = Some((resolved.w_axis - root.w_axis).truncate() / dt);
+        if resolved != root {
+            cx.set_pose([(id, resolved)])?;
+        }
         cx.publish_pose(id, p.layout.as_ref().unwrap().clone(), joints)
     }
 
@@ -318,6 +361,7 @@ impl SilverMatcher {
             "invalid motion binding"
         );
         let time = dt.min(0.25);
+        let scale = root.to_scale_rotation_translation().0;
         let mut root = root.w_axis.truncate();
         if p.move_root {
             let travel = p.advance(time);
@@ -418,29 +462,32 @@ impl SilverMatcher {
             p.transition = Some(blend);
         }
         Ok((
-            Mat4::from_rotation_translation(Quat::from_rotation_y(p.yaw), root),
+            Mat4::from_scale_rotation_translation(scale, Quat::from_rotation_y(p.yaw), root),
             joints,
         ))
     }
 }
 impl SimulationSystem for SilverMatcher {
-    fn order(&self) -> SystemOrder {
-        SystemOrder {
-            key: Some(PLAYER),
-            after: &[],
-        }
-    }
     fn access(&self) -> SystemAccess {
         use SimulationData::{Component, LocalTransformsById};
         SystemAccess {
             name: "Silver Wolf motion matcher",
-            reads: &[Component(PLAYER), LocalTransformsById],
+            reads: &[
+                Component(PLAYER),
+                Component(contact::SETTING),
+                Component(MOTION_POLICY),
+                LocalTransformsById,
+            ],
             writes: &[Component(PLAYER), LocalTransformsById],
         }
     }
     fn transform_targets(&self, bindings: &TransformBindings<'_>) -> Result<TransformTargets> {
         let mut joints = Vec::new();
-        for &id in bindings.component_owners(PLAYER)? {
+        let actors = standalone_actors(
+            bindings.component_owners(PLAYER)?,
+            bindings.component_owners(contact::SETTING)?,
+        );
+        for &id in actors.iter() {
             let player = bindings
                 .component::<State>(id, PLAYER)?
                 .context("missing Silver Wolf motion player")?;
@@ -457,7 +504,11 @@ impl SimulationSystem for SilverMatcher {
         if dt == 0. {
             return Ok(());
         }
-        cx.for_each_parallel(cx.component_owners(PLAYER)?, |&id, cx| {
+        let actors = standalone_actors(
+            cx.component_owners(PLAYER)?,
+            cx.component_owners(contact::SETTING)?,
+        );
+        cx.for_each_parallel(&actors, |&id, cx| {
             let mut p: State = cx
                 .component::<State>(id, PLAYER)?
                 .context("missing Silver Wolf motion player")?
@@ -558,6 +609,7 @@ pub fn scene() -> Result<World> {
         evaluated: 0,
         bones,
         layout: None,
+        standalone_velocity: None,
         hip_origin,
         speed: 0.,
         turn: 0.,
@@ -579,6 +631,7 @@ pub fn scene() -> Result<World> {
         ..Default::default()
     });
     w.set_typed_component(actor, PLAYER, state);
+    w.set_motion_policy(actor, MotionPolicy::KINEMATIC)?;
     w.entities.get_mut(&root).unwrap().parent = Some(actor);
     w.validate()?;
     Ok(w)
@@ -589,6 +642,28 @@ mod tests {
     use super::*;
     use crate::engine::System;
 
+    #[test]
+    fn standalone_motion_preserves_fixed_root_and_rejects_unowned_dynamic_authority() -> Result<()>
+    {
+        let mut world = scene()?;
+        let id = actor(&world).unwrap();
+        let before = world.entities[&id].local;
+        set_actor_goal(&mut world, id, 0, 1)?;
+        world.set_motion_policy(id, MotionPolicy::STATIC)?;
+        let mut sched = crate::engine::Schedule::default();
+        sched.add_system(Arc::new(SilverMatcher::load()?));
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build()?;
+        let mut w = Arc::new(world);
+        sched.tick(&mut w, 1. / 30., &pool)?;
+        assert_eq!(w.entities[&id].local, before);
+        Arc::make_mut(&mut w).set_motion_policy(id, MotionPolicy::DYNAMIC)?;
+        let stamp = player(&w, id)?.sample;
+        let error = sched.tick(&mut w, 1. / 30., &pool).unwrap_err();
+        assert!(format!("{error:#}").contains("requires a physics solver"));
+        assert_eq!(stamp, player(&w, id)?.sample);
+        assert_eq!(w.entities[&id].local, before);
+        Ok(())
+    }
     #[test]
     fn silver_joints_and_fracture_pieces_share_a_batch_until_rebound() -> Result<()> {
         use crate::{engine::Schedule, experiments::effects, render::MaterialPrograms};
@@ -860,6 +935,7 @@ mod tests {
             evaluated: 0,
             bones: vec![],
             layout: None,
+            standalone_velocity: None,
             hip_origin: Vec3::ZERO,
             speed: 0.,
             turn: 0.,

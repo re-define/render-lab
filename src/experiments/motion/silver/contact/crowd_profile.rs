@@ -14,7 +14,7 @@ fn population(n: usize, pool: &rayon::ThreadPool) -> Result<(Arc<World>, Schedul
 
 #[test]
 fn movement_intent_selects_one_character_and_releases_the_previous_owner() -> Result<()> {
-    use crate::engine::{MoveIntent, MovementControls};
+    use crate::movement::{MoveIntent, MovementControls};
     let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build()?;
     let mut w = duo_scene()?;
     let mut schedule = Schedule::default();
@@ -103,6 +103,8 @@ fn shared_platform_reduces_occupants_once_and_keeps_skeletons_independent() -> R
         .unwrap()
         .components
         .remove(SETTING);
+    // This comparison keeps the other actor animated after detaching its solver.
+    single.set_motion_policy(ids[1], MotionPolicy::KINEMATIC)?;
     let mut single_schedule = Schedule::default();
     install(&single, &mut single_schedule)?;
     let mut single = Arc::new(single);
@@ -167,6 +169,7 @@ fn shared_platform_reduces_occupants_once_and_keeps_skeletons_independent() -> R
         .unwrap()
         .components
         .remove(SETTING);
+    Arc::make_mut(&mut w).set_motion_policy(id, MotionPolicy::KINEMATIC)?;
     let prior = w
         .typed_component::<dynamics::Body>(id, dynamics::BODY)?
         .unwrap()
@@ -181,6 +184,7 @@ fn shared_platform_reduces_occupants_once_and_keeps_skeletons_independent() -> R
         prior
     );
     contact.source.clear();
+    Arc::make_mut(&mut w).set_motion_policy(id, MotionPolicy::DYNAMIC)?;
     Arc::make_mut(&mut w).set_typed_component(id, SETTING, contact);
     schedule.tick(&mut w, 1. / 60., &four_workers)?;
     assert_eq!(

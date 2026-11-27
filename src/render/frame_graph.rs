@@ -12,6 +12,9 @@ pub struct FrameProducts {
     pub motion: Option<Resource>,
     /// Final posed triangle inputs, in draw order, before optional acceleration builds.
     pub ray_surfaces: Vec<super::RaySurface>,
+    /// Visual and occlusion TLAS may reference the same BLAS within a frame.
+    pub(crate) ray_meshes:
+        std::collections::BTreeMap<(Resource, Resource, Resource, u32), Resource>,
     pub(crate) request_ray_proxies: bool,
     pub(crate) cluster_shadow: Option<rays::ClusterShadow>,
     pub(crate) material_atlas: Option<Resource>,

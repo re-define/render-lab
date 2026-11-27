@@ -2,6 +2,7 @@
 use crate::experiments::assembly::{Primary, Registration as SceneModule};
 use crate::render::material_code;
 pub(super) const MODULE: SceneModule = SceneModule {
+    root_writers: &[],
     key: SETTING,
     primary: Primary::Visibility,
     restore: None,
@@ -19,12 +20,14 @@ pub(super) const MODULE: SceneModule = SceneModule {
     },
 };
 pub(super) const WIND_SYSTEM: SceneModule = SceneModule {
+    root_writers: &[],
     key: SETTING,
     primary: Primary::Simulation,
     restore: None,
     install: |world, a| {
         if super::composition::enabled(world, "forest") {
-            a.schedule.add_system(std::sync::Arc::new(Wind));
+            a.schedule
+                .add_frame_system("wind", std::sync::Arc::new(Wind))?;
         }
         Ok(())
     },

@@ -29,7 +29,8 @@ impl RenderScene {
         ) {
             (Some(index), Some(instance)) => {
                 let old = &self.instances[index];
-                old.mesh == MeshId(instance.mesh)
+                old.geometry_assets == instance.geometry_assets
+                    && old.mesh == MeshId(instance.mesh)
                     && old.material == instance.material.map(MaterialId)
                     && old.outline == instance.outline
             }
@@ -102,6 +103,7 @@ impl SceneExtractor {
         }
         let mut dirty_components = BTreeSet::new();
         let mut dirty_lights = BTreeSet::new();
+        let mut rebound = Vec::new();
         for (id, kind) in edits {
             let entity = &world.entities[&id];
             visited.insert(id);
@@ -138,6 +140,26 @@ impl SceneExtractor {
                         _ => return Ok(None),
                     }
                 }
+                EntityWrite::GeometryAssets => {
+                    let products = entity
+                        .geometry_assets
+                        .as_ref()
+                        .context("missing geometry assets")?;
+                    Arc::make_mut(&mut scene.geometry_assets).insert(id, products.clone());
+                    scene.geometry_revision = next_geometry_revision();
+                }
+                EntityWrite::GeometryBinding => {
+                    if let Some(index) = scene.instance_index(id) {
+                        let row = Arc::make_mut(&mut scene.instances).edit(index);
+                        Arc::make_mut(row).geometry_assets = entity
+                            .instance
+                            .as_ref()
+                            .context("missing render instance")?
+                            .geometry_assets;
+                        scene.geometry_revision = next_geometry_revision();
+                        rebound.push(index);
+                    }
+                }
                 EntityWrite::Light => {
                     dirty_lights.insert(id);
                 }
@@ -167,6 +189,7 @@ impl SceneExtractor {
             &mut visited,
             &mut scene,
             &mut dirty_lights,
+            &rebound,
         )?;
         for (&key, owner) in &mut self.dependencies.components {
             if dirty_components.contains(key) || owner.changed(&self.transforms) {
@@ -191,6 +214,7 @@ impl SceneExtractor {
         visited: &mut Visits,
         scene: &mut RenderScene,
         dirty_lights: &mut BTreeSet<Id>,
+        rebound: &[usize],
     ) -> Result<()> {
         // Descendants occupy a contiguous range. Install every final local pose before
         // evaluating ranges so a changed child sees its parent's final world transform.
@@ -204,7 +228,7 @@ impl SceneExtractor {
             *cached = local;
             true
         });
-        let mut changed_instances = BTreeMap::new();
+        let mut changed_instances: BTreeMap<_, _> = rebound.iter().map(|&i| (i, None)).collect();
         let mut dirty_skins = Vec::new();
         if !moved.is_empty() {
             dirty_skins.resize_with(self.dependencies.skin_layouts.len(), DirtyJoints::default);

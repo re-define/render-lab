@@ -16,10 +16,11 @@ use anyhow::{Context, Result, bail, ensure};
 use std::{path::Path, sync::Arc};
 mod lights;
 mod memory;
+mod object;
 
 const HELP: &str = concat!(
     "fit · pause · rdg · timeline FILE.json · hud on/off · post off/taa/dlss/dlaa/reset/status",
-    " · post view motion/reprojection/off · stats · schedule · memory idle/alloc/driver [NAME or #OWNER]",
+    " · post view motion/reprojection/off · stats · schedule · tick [MODULE HZ/frame/default] · memory idle/alloc/driver [NAME or #OWNER]",
     " · light list/point/sun/move/aim/power/color/enable/angular-radius · import/save/load PATH · lod PIXELS",
     " · lodview on/off · vegetation auto/triangles/voxels/pixels/wind/time/view/camera",
     " · control [ENTITY] · motion SPEED TURN [STRAFE] · motionsearch kd/scan · record PATH · stoprecord",
@@ -27,7 +28,7 @@ const HELP: &str = concat!(
     " · toon outline/width/light/threshold/sdf/view · texture neural/original/stats",
     " · gaussian tile/bvh/compact-tile/compact-bvh/scan/original/stats",
     " · gi off/ssgi/probes/ray/view/camera · shadow hard/pcf/pcss/ray/size/bias/view/camera",
-    " · rt view/camera",
+    " · object [ID [static|movable off|query|simulated] | velocity X Y Z] · rt view/camera",
     " · restir uniform/ris/reuse/reference/denoise/source/lights/candidates/samples/ev/camera/history-stats",
     " · ibl ev/yaw/view/sky · effect restart/time SECONDS",
     " · rays hardware/software/normals/distance/off",
@@ -67,6 +68,7 @@ impl Console {
                 crate::rhi::timeline::export(passes, Path::new(arg))?;
                 return Ok(format!("GPU timeline saved to {arg}"));
             }
+            "object" => return object::command(engine, arg),
             "memory" => return memory::describe(engine.last_memory().as_ref(), arg),
             "control" => {
                 if !arg.is_empty() {
@@ -81,6 +83,25 @@ impl Console {
                 ));
             }
             "contact" => return motion::silver::contact::command(engine, arg),
+            "tick" => {
+                let mut words = arg.split_whitespace();
+                if let Some(name) = words.next() {
+                    let value = words.next().context("tick MODULE HZ/frame/default")?;
+                    ensure!(words.next().is_none(), "tick MODULE HZ/frame/default");
+                    use crate::engine::TickRate;
+                    let rate = match value {
+                        "default" => TickRate::Default,
+                        "frame" => TickRate::Frame,
+                        _ => TickRate::Hertz(
+                            value
+                                .parse()
+                                .context("expected integer tick frequency in Hz")?,
+                        ),
+                    };
+                    engine.schedule.set_tick_rate(name, rate)?;
+                }
+                return Ok(engine.schedule.describe_clocks());
+            }
             "schedule" => {
                 ensure!(arg.is_empty(), "schedule takes no arguments");
                 return Ok(engine.schedule.describe());
@@ -154,7 +175,7 @@ impl Console {
                     passes.len()
                 ));
             }
-            "save" => engine.world.save(Path::new(arg))?,
+            "save" => engine.save_scene(Path::new(arg))?,
             "load" => {
                 let world = World::load(Path::new(arg))?;
                 experiments::replace(engine, world)?;

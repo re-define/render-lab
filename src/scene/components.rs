@@ -71,15 +71,24 @@ impl World {
         let Some(raw) = self.entities.get(&id).and_then(|e| e.components.get(key)) else {
             return Ok(None);
         };
+        self.component_value(id, key, raw).map(Some)
+    }
+
+    pub(super) fn component_value<T: Clone + DeserializeOwned + 'static>(
+        &self,
+        id: Id,
+        key: &'static str,
+        raw: &Value,
+    ) -> Result<Cow<'_, T>> {
         if let Some(value) = self.runtime.0.get(&(id, key)) {
-            return Ok(Some(Cow::Borrowed(
+            return Ok(Cow::Borrowed(
                 value
                     .value()
                     .downcast_ref::<T>()
                     .context("component type mismatch")?,
-            )));
+            ));
         }
-        Ok(Some(Cow::Owned(serde_json::from_value(raw.clone())?)))
+        Ok(Cow::Owned(serde_json::from_value(raw.clone())?))
     }
 
     pub(crate) fn set_typed_component<T: Serialize + Send + Sync + 'static>(
@@ -103,15 +112,13 @@ impl World {
     ) -> Result<()> {
         let decoded = self
             .entities
+            .component_owners(key)
             .iter()
-            .filter_map(|(&id, entity)| {
-                if self.runtime.0.contains_key(&(id, key)) {
-                    return None;
-                }
-                entity
-                    .components
-                    .get(key)
-                    .map(|raw| serde_json::from_value::<T>(raw.clone()).map(|v| (id, v)))
+            .copied()
+            .filter(|id| !self.runtime.0.contains_key(&(*id, key)))
+            .map(|id| {
+                serde_json::from_value::<T>(self.entities[&id].components[key].clone())
+                    .map(|value| (id, value))
             })
             .collect::<serde_json::Result<Vec<_>>>()?;
         for (id, value) in decoded {
@@ -123,9 +130,20 @@ impl World {
 
 impl Serialize for World {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        self.serialize_with_clocks(&self.clocks, serializer)
+    }
+}
+impl World {
+    pub(super) fn serialize_with_clocks<S: Serializer>(
+        &self,
+        clocks: &BTreeMap<String, super::ClockCheckpoint>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         #[derive(Serialize)]
         struct Document<'a> {
             version: u32,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            clocks: &'a BTreeMap<String, super::ClockCheckpoint>,
             entities: &'a BTreeMap<Id, Entity>,
         }
         let owned;
@@ -148,6 +166,7 @@ impl Serialize for World {
         };
         Document {
             version: self.version,
+            clocks,
             entities,
         }
         .serialize(serializer)

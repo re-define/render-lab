@@ -10,6 +10,7 @@ use assembly::SceneConfiguration;
 pub mod lighting;
 pub mod mixed;
 pub mod motion;
+pub mod movement_lab;
 pub mod restir;
 pub mod texture;
 pub mod vegetation;
@@ -71,7 +72,12 @@ pub(crate) fn snapshot_components() -> impl Iterator<Item = SnapshotComponent> {
 
 /// Saved experiment settings restore all scene-bound systems and render programs.
 pub fn configure(engine: &mut Engine) -> Result<()> {
-    SceneConfiguration::prepare(&engine.world, &engine.tasks, engine.ray_caps)?.apply(engine);
+    let mut candidate = (*engine.world).clone();
+    candidate.clocks = engine.schedule.checkpoints(&candidate);
+    candidate.install_motion_providers(&assembly::ROOT_PROVIDERS)?;
+    let prepared = SceneConfiguration::prepare(&candidate, &engine.tasks, engine.ray_caps)?;
+    engine.world = Arc::new(candidate);
+    prepared.apply(engine);
     Ok(())
 }
 
@@ -88,6 +94,6 @@ pub fn replace(engine: &mut Engine, mut world: World) -> Result<()> {
 pub fn open(mut world: World) -> Result<Engine> {
     SceneConfiguration::restore(&mut world)?;
     let mut engine = Engine::start_workers(world, Arc::new(Forward::default()))?;
-    configure(&mut engine)?;
+    SceneConfiguration::prepare(&engine.world, &engine.tasks, engine.ray_caps)?.apply(&mut engine);
     Ok(engine)
 }

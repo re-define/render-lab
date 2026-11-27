@@ -185,10 +185,21 @@ pub(super) fn raster_frame(
                 "Lighting and experiment settings",
                 bytemuck::bytes_of(&Light::new(cfg)).to_vec(),
             );
+            let (shadow_triangles, shadow_nodes, shadow_count) = if g
+                .products
+                .ray_surfaces
+                .iter()
+                .any(|s| s.shadow_proxy.is_some())
+            {
+                let occlusion = crate::render::rays::software_geometry(g, false, true)?;
+                (occlusion.triangles, occlusion.nodes, occlusion.count)
+            } else {
+                (triangles, nodes, count)
+            };
             let map = if matches!(cfg.shadow, Shadow::Ray) {
                 depth
             } else {
-                shadow_map(g, triangles, light, count)
+                shadow_map(g, shadow_triangles, light, shadow_count)
             };
             let direct = output(g, "Direct light and visible surface data", 48);
             let mode = match cfg.shadow {
@@ -204,11 +215,11 @@ pub(super) fn raster_frame(
                 vec![
                     (ids, S),
                     (objects, R),
-                    (nodes, R),
+                    (shadow_nodes, R),
                     (addresses, R),
                     (camera, R),
                     (light, R),
-                    (triangles, R),
+                    (shadow_triangles, R),
                     (direct, W),
                     (map, S),
                 ],

@@ -119,7 +119,19 @@ pub(super) fn populated_world(
             {
                 row.instance = None;
             }
+            // Runtime-typed components keep a null marker on the serialized entity.
+            let policy = row
+                .components
+                .contains_key(MOTION_POLICY)
+                .then(|| seed.motion_policy(k, MotionPolicy::STATIC))
+                .transpose()?;
+            if policy.is_some() {
+                row.components.remove(MOTION_POLICY);
+            }
             w.entities.insert(map(k), row);
+            if let Some(policy) = policy {
+                w.set_motion_policy(map(k), policy)?;
+            }
         }
         let mut p = player(seed, actor)?.into_owned();
         p.bones.iter_mut().for_each(|b| *b = map(*b));

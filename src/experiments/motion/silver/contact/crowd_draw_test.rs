@@ -248,45 +248,74 @@ fn coplanar_draws_preserve_order_and_offscreen_shadow_geometry() -> Result<()> {
         "depth ties changed owners"
     );
 
-    let mut g = tech.build(&view)?;
-    let args = g
-        .passes
-        .iter()
-        .find_map(|pass| {
-            if pass.name == "Build ordered ordinary mesh work" {
-                return pass
-                    .op
-                    .program()
-                    .and_then(|op| op.bindings.last())
-                    .map(|(r, _)| *r);
-            }
-            None
-        })
-        .context("missing indirect command")?;
-    let out = g.resource(
-        "Read indirect work",
-        Storage::Buffer {
-            bytes: 12,
-            initial: None,
-        },
-    );
-    g.pass(
-        "Copy argument slots",
-        Op::Compute {
-            program: Dispatch {
-                shader: Shader::Compute(include_bytes!(concat!(
-                    env!("OUT_DIR"),
-                    "/surface_tail.comp.spv"
-                ))),
-                bindings: vec![(args, Access::ComputeRead), (out, Access::ComputeWrite)],
-                push: bytemuck::bytes_of(&[0u32, 3]).to_vec(),
+    let groups = |view: &Snapshot, gpu: &mut Backend| -> Result<Vec<u8>> {
+        let mut g = tech.build(view)?;
+        let args = g
+            .passes
+            .iter()
+            .find_map(|pass| {
+                if pass.name == "Build ordered ordinary mesh work" {
+                    return pass
+                        .op
+                        .program()
+                        .and_then(|op| op.bindings.last())
+                        .map(|(r, _)| *r);
+                }
+                None
+            })
+            .context("missing indirect command")?;
+        let out = g.resource(
+            "Read indirect work",
+            Storage::Buffer {
+                bytes: 12,
+                initial: None,
             },
-            groups: [1; 3],
-        },
+        );
+        g.pass(
+            "Copy argument slots",
+            Op::Compute {
+                program: Dispatch {
+                    shader: Shader::Compute(include_bytes!(concat!(
+                        env!("OUT_DIR"),
+                        "/surface_tail.comp.spv"
+                    ))),
+                    bindings: vec![(args, Access::ComputeRead), (out, Access::ComputeWrite)],
+                    push: bytemuck::bytes_of(&[0u32, 3]).to_vec(),
+                },
+                groups: [1; 3],
+            },
+        );
+        g.display_extent = Some([3, 1]);
+        g.set_output(out);
+        Ok(gpu.execute(g.compile()?, &pool)?.pixels)
+    };
+    assert_eq!(
+        &groups(&view, &mut gpu)?[..],
+        bytemuck::bytes_of(&[20u32, 1, 1])
     );
-    g.display_extent = Some([3, 1]);
-    g.set_output(out);
-    let frame = gpu.execute(g.compile()?, &pool)?;
-    assert_eq!(&frame.pixels[..], bytemuck::bytes_of(&[20u32, 1, 1]));
+    let offscreen = *world
+        .entities
+        .iter()
+        .find(|(_, e)| e.local.w_axis.x > 999.)
+        .unwrap()
+        .0;
+    let baked = world.spawn(Entity {
+        geometry_assets: Some(Arc::new(crate::scene::GeometryAssets {
+            source_mesh: mesh,
+            shadow_mesh: None,
+            local_bounds: Some(crate::scene::LocalBounds {
+                min: [-1001., -1., 0.],
+                max: [1., 1., 0.],
+            }),
+        })),
+        ..Default::default()
+    });
+    world.bind_geometry_assets(offscreen, Some(baked))?;
+    let with_bound = Snapshot::new(&world, view.camera, extent, Default::default())?;
+    assert_eq!(
+        &groups(&with_bound, &mut gpu)?[..],
+        bytemuck::bytes_of(&[21u32, 1, 1])
+    );
+    assert_eq!(ids(tech.build(&with_bound)?, &mut gpu)?, reference);
     Ok(())
 }

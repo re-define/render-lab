@@ -43,6 +43,10 @@ impl Source {
 }
 
 impl Cache {
+    pub(in crate::experiments) fn clear(&self) {
+        self.0.lock().unwrap().take();
+    }
+
     pub fn get(
         &self,
         scene: &RenderScene,
@@ -59,13 +63,24 @@ impl Cache {
                     .filter(|_| packing != Packing::Shadow);
                 let mut color = material.map_or(Material::default().base_color, |m| m.base_color);
                 color[3] = material.map_or(0., |m| m.metallic);
+                let proxy = (packing == Packing::Shadow)
+                    .then(|| scene.products_for(instance))
+                    .flatten()
+                    .and_then(|a| a.occlusion_override())
+                    .map(|id| &scene.meshes[&crate::render::MeshId(id)].mesh);
                 Source {
                     material_slot: instance
                         .material
                         .map_or(0, |id| scene.routes.material_slots[&id] as u32),
-                    mesh: surface.geometry.mesh.clone(),
+                    mesh: proxy
+                        .cloned()
+                        .unwrap_or_else(|| surface.geometry.mesh.clone()),
                     model: instance.model,
-                    selected: surface.geometry.selected.clone(),
+                    selected: if proxy.is_some() {
+                        None
+                    } else {
+                        surface.geometry.selected.clone()
+                    },
                     color,
                 }
             })
@@ -108,8 +123,16 @@ impl Cache {
             return Ok(entry.packed.clone());
         }
         let mut triangles = vec![];
-        for (owner, (surface, source)) in surfaces.iter().zip(&sources).enumerate() {
-            for vertices in surface.geometry.triangles()? {
+        for (owner, source) in sources.iter().enumerate() {
+            ensure!(
+                surfaces[owner].instance.palette.is_none(),
+                "deformed ray geometry requires GPU streams"
+            );
+            for vertices in crate::render::rigid_triangles(
+                &source.mesh,
+                source.model,
+                source.selected.as_deref(),
+            ) {
                 triangles.push((
                     Triangle {
                         positions: vertices.map(|v| [v[0], v[1], v[2], v[3]]),

@@ -2,6 +2,7 @@ pub mod console;
 pub mod engine;
 pub mod experiments;
 pub mod import;
+pub mod movement;
 pub mod physics;
 pub mod rdg;
 pub mod recording;

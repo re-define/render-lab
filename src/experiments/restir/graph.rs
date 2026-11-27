@@ -71,18 +71,55 @@ pub(super) fn build(s: &Snapshot, technique: &Restir, cfg: Settings) -> Result<F
 #[derive(Default)]
 pub(in crate::experiments) struct ShadowCache {
     rigid: geometry::Cache,
+    visual: geometry::Cache,
+}
+
+#[derive(Default)]
+pub(super) struct RigidInputs {
+    occlusion: Option<Arc<geometry::Packed>>,
+    visual: Option<Arc<geometry::Packed>>,
 }
 
 impl ShadowCache {
-    pub(in crate::experiments) fn get(
+    pub(super) fn get(
         &self,
         scene: &crate::render::RenderScene,
         surfaces: &[crate::render::PosedSurface<'_>],
-    ) -> Result<Arc<geometry::Packed>> {
+        indirect: bool,
+    ) -> Result<RigidInputs> {
         let rigid = geometry::shadow_casters(surfaces)
             .filter(|s| s.instance.palette.is_none())
             .collect::<Vec<_>>();
-        self.rigid.get(scene, &rigid, geometry::Packing::Shadow)
+        let custom = rigid.iter().any(|s| {
+            scene
+                .products_for(s.instance)
+                .is_some_and(|a| a.occlusion_override().is_some())
+        });
+        if !custom {
+            self.rigid.clear();
+            // Keep one set of rigid triangle bytes when GI is toggled on and off.
+            let scene = self
+                .visual
+                .get(scene, &rigid, geometry::Packing::SoftwareLighting)?;
+            return Ok(RigidInputs {
+                occlusion: Some(scene.clone()),
+                visual: indirect.then_some(scene),
+            });
+        }
+        let occlusion = self.rigid.get(scene, &rigid, geometry::Packing::Shadow)?;
+        let visual = if indirect {
+            Some(
+                self.visual
+                    .get(scene, &rigid, geometry::Packing::SoftwareLighting)?,
+            )
+        } else {
+            self.visual.clear();
+            None
+        };
+        Ok(RigidInputs {
+            occlusion: Some(occlusion),
+            visual,
+        })
     }
 }
 
@@ -100,7 +137,7 @@ pub(super) fn add_light(
         depth,
         motion,
     }: ResolveInputs,
-    rigid: Option<&geometry::Packed>,
+    rigid: RigidInputs,
 ) -> Result<(Resource, Resource, Resource)> {
     let [w, h] = s.extent;
     let authored = cfg.scene_lights(s);
@@ -116,12 +153,18 @@ pub(super) fn add_light(
     let normalization = if authored { 1. } else { 1. / amount as f32 };
     let motion = motion.filter(|_| cfg.uses_history());
     let jitter = s.temporal.as_ref().map_or([0.; 2], |f| f.jitter_delta);
-    let scene = RayScene::build(
-        g,
-        backend,
-        cfg.indirect(),
-        rigid.map(|p| [p.acceleration.clone(), p.triangles.clone()]),
-    )?;
+    let packed =
+        |p: Option<Arc<geometry::Packed>>| p.map(|p| [p.acceleration.clone(), p.triangles.clone()]);
+    let separate = g
+        .products
+        .ray_surfaces
+        .iter()
+        .any(|surface| surface.shadow_proxy.is_some());
+    let scene = if separate {
+        RayScene::occluders(g, backend, packed(rigid.occlusion))?
+    } else {
+        RayScene::build(g, backend, cfg.indirect(), packed(rigid.occlusion))?
+    };
     let config = Uniform {
         reprojection: [jitter[0], jitter[1], 0., 0.],
         options: [
@@ -174,7 +217,7 @@ pub(super) fn add_light(
     );
     let mut key = DefaultHasher::new();
     (
-        technique.generation,
+        (technique.generation, s.scene.geometry_revision),
         motion.and(s.temporal.as_ref()).map(|f| f.generation_key()),
         cfg.sampling as u32,
         g.products.cluster_shadow.is_some(),
@@ -420,6 +463,11 @@ pub(super) fn add_light(
     let indirect = if cfg.gi == DiffuseGi::Direct {
         g.input("Disabled indirect diffuse", vec![0; 16])
     } else {
+        let scene = if separate {
+            scene.into_material_hits(g, backend, packed(rigid.visual))?
+        } else {
+            scene
+        };
         diffuse_gi::build(
             g,
             s,

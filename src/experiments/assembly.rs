@@ -10,6 +10,7 @@ pub(super) enum Primary {
 }
 pub(super) struct Registration {
     pub key: &'static str,
+    pub root_writers: &'static [crate::scene::RootWriter],
     pub primary: Primary,
     pub restore: Option<fn(&mut World) -> Result<()>>,
     pub install: fn(&World, &mut Assembly) -> Result<()>,
@@ -25,7 +26,15 @@ pub(super) struct Assembly {
     pub visibility: composition::GeometryModules,
 }
 
+pub(super) static ROOT_PROVIDERS: std::sync::LazyLock<Vec<crate::scene::RootWriter>> =
+    std::sync::LazyLock::new(|| {
+        MODULES
+            .iter()
+            .flat_map(|m| m.root_writers.iter().copied())
+            .collect()
+    });
 const MODULES: &[Registration] = &[
+    super::movement_lab::MODULE,
     clusters::MODULE,
     vegetation::MODULE,
     effects::MODULE,
@@ -48,6 +57,7 @@ pub(super) struct SceneConfiguration {
 }
 impl SceneConfiguration {
     pub fn restore(world: &mut World) -> Result<()> {
+        world.install_motion_providers(&ROOT_PROVIDERS)?;
         for m in MODULES {
             if let Some(restore) = m.restore
                 && world.first_raw_component(m.key).is_some()
@@ -114,6 +124,7 @@ impl SceneConfiguration {
         for m in active {
             (m.install)(world, &mut a)?;
         }
+        a.schedule.restore_clocks(world)?;
         a.schedule.bind_transforms(world)?;
         let (technique, camera) = match a.technique {
             Some(technique) => (
@@ -154,6 +165,95 @@ impl SceneConfiguration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn simulation_roles_are_resolved_before_workers_start() -> Result<()> {
+        use crate::{
+            movement::linear::LinearBody,
+            scene::{Entity, MotionPolicy},
+        };
+        let mut world = World::default();
+        let free = world.spawn(Entity::default());
+        world.set_motion_policy(free, MotionPolicy::DYNAMIC)?;
+        SceneConfiguration::restore(&mut world)?;
+        assert!(world.linear_body(free)?.is_some());
+
+        let animated = world.spawn(Entity {
+            components: [(motion::silver::PLAYER.into(), serde_json::Value::Null)].into(),
+            ..Default::default()
+        });
+        assert!(
+            world
+                .set_linear_body(animated, LinearBody::default())
+                .is_err()
+        );
+        world.set_motion_policy(animated, MotionPolicy::DYNAMIC)?;
+        assert!(
+            world
+                .install_motion_providers(&ROOT_PROVIDERS)
+                .unwrap_err()
+                .to_string()
+                .contains("physics solver")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn two_simulation_providers_cannot_claim_the_same_root() {
+        let mut world = World::default();
+        world.spawn(crate::scene::Entity {
+            components: [
+                (effects::SHARD.into(), serde_json::Value::Null),
+                (
+                    motion::silver::contact::TURNTABLE.into(),
+                    serde_json::Value::Null,
+                ),
+            ]
+            .into(),
+            ..Default::default()
+        });
+        let error = SceneConfiguration::restore(&mut world)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("conflicting root motion providers"));
+        assert!(
+            error.contains(effects::SHARD) && error.contains(motion::silver::contact::TURNTABLE)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan device"]
+    fn failed_configuration_keeps_the_live_world_and_schedule() -> Result<()> {
+        use crate::scene::{Entity, MotionPolicy};
+        let mut engine = crate::experiments::open(movement_lab::scene()?)?;
+        engine.schedule.set_tick_rate(
+            crate::movement::linear::CLOCK,
+            crate::scene::TickRate::Hertz(30),
+        )?;
+        engine
+            .schedule
+            .tick(&mut engine.world, 0.01, &engine.tasks)?;
+        let previous = engine.schedule.describe_clocks();
+        crate::experiments::configure(&mut engine)?;
+        assert_eq!(engine.schedule.describe_clocks(), previous);
+        let live = Arc::make_mut(&mut engine.world);
+        let id = live.spawn(Entity::default());
+        live.set_motion_policy(id, MotionPolicy::DYNAMIC)?;
+        let mut incompatible = Entity::default();
+        for key in [texture::SETTING, gaussian::SETTING] {
+            incompatible
+                .components
+                .insert(key.into(), serde_json::json!({}));
+        }
+        live.spawn(incompatible);
+        let before = engine.world.clone();
+        let clocks = engine.schedule.describe();
+        assert!(crate::experiments::configure(&mut engine).is_err());
+        assert!(Arc::ptr_eq(&before, &engine.world));
+        assert!(engine.world.linear_body(id)?.is_none());
+        assert_eq!(clocks, engine.schedule.describe());
+        Ok(())
+    }
+
     #[test]
     fn incompatible_primary_modules_are_rejected_before_assets_are_opened() {
         let mut world = World::default();

@@ -1,6 +1,6 @@
 # 实验与操作
 
-引擎提供 22 个具名预设。可用 `--list-experiments` 列出名称。从仓库根运行 `cargo run --release --locked -- --experiment 名称`。省略预设时打开默认演示。窗口控制台和 `--command` 共用命令分派。保存和加载使用 `save PATH`、`load PATH`。不同的主渲染技术由装配器校验兼容性。[完整预设](../src/presets.rs) · [调试命令](../src/console.rs)
+引擎提供 23 个具名预设。可用 `--list-experiments` 列出名称。从仓库根运行 `cargo run --release --locked -- --experiment 名称`。省略预设时打开默认演示。窗口控制台和 `--command` 共用命令分派。保存和加载使用 `save PATH`、`load PATH`。不同的主渲染技术由装配器校验兼容性。[完整预设](../src/presets.rs) · [调试命令](../src/console.rs)
 
 | 预设 | 输入、执行内容和观察方法 |
 | --- | --- |
@@ -8,6 +8,7 @@
 | `vegetation`、`vegetation-scale` | 程序化树、草、风动与混合表示 DAG；近景检查轮廓，大规模布局检查剔除。比较 `vegetation triangles`、`vegetation voxels` 和 `vegetation auto`。 |
 | `river-forest`、`forest-karst` | 密林与河流，岩柱版本增加岩石布景和光照研究配置。适合固定机位比较投影几何、运动向量、间接光与后处理。 |
 | `confluence` | 同场组合森林、流水、银狼、IBL 与 ReSTIR。用 `feature water off` 等命令独立切换贡献层。 |
+| `movement` | 左侧物体固定，中间物体按指定速度运动，右侧物体按重力自由落下。三个物体共享网格。用 `object` 查看对象、`tick` 查看时钟。 |
 | `water` | 计算着色器推进台阶上的水体状态，渲染随水面变化的表面。用 `effect restart` 重置。 |
 | `destruction` | 物体破碎和消融，观察碎片局部变换、可见性及材料随时间变化。 |
 | `motion` | 轨迹预测驱动银狼的 Motion Matching；IJKL 控制移动，`motionsearch kd` 与 `motionsearch scan` 可对照检索。 |

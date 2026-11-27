@@ -3,6 +3,7 @@ mod course;
 #[cfg(test)]
 mod crowd_profile;
 mod dynamics;
+pub(crate) use dynamics::{SPRING, TURNTABLE};
 mod events;
 mod population;
 mod rig;
@@ -23,12 +24,21 @@ use std::{collections::BTreeMap, time::Duration};
 
 pub const SETTING: &str = "lab.silver_wolf.contact";
 pub(in crate::experiments) const MODULE: SceneModule = SceneModule {
+    root_writers: &[
+        crate::scene::RootWriter::new(SETTING, MotionPolicy::DYNAMIC),
+        crate::scene::RootWriter::new(SPRING, MotionPolicy::DYNAMIC),
+        crate::scene::RootWriter::new(TURNTABLE, MotionPolicy::MOVING_COLLIDER),
+    ],
     key: SETTING,
     primary: Primary::Simulation,
     restore: Some(hydrate_contact),
     install: |w, a| {
-        if crate::experiments::composition::enabled(w, "actor") {
-            install(w, &mut a.schedule)?;
+        let players = w.entities.component_owners(PLAYER);
+        for id in w.entities.component_owners(SETTING) {
+            ensure!(
+                players.binary_search(id).is_ok(),
+                "contact entity {id} needs a Silver Wolf motion player"
+            );
         }
         let (id, _) = w
             .first_raw_component(SETTING)
@@ -141,6 +151,9 @@ impl PoseBinding {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Contact {
+    /// Scratch produced before dynamics in the same character-clock transaction.
+    #[serde(skip)]
+    request: Option<ContactMotion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_binding: Option<Arc<PoseBinding>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -170,6 +183,12 @@ struct Contact {
     error_m: f32,
 }
 
+#[derive(Clone, Copy)]
+struct ContactMotion {
+    root: RootMotionRequest,
+    inherited_velocity: Option<Vec3>,
+}
+
 struct Stage {
     binding: Arc<PoseBinding>,
     actor: Id,
@@ -194,16 +213,19 @@ pub fn character_clock() -> crate::engine::FixedDomain {
 type Actors = BTreeMap<Id, Arc<Stage>>;
 type CharacterSystems = crate::engine::BoundSystems<Actors>;
 
-fn install(w: &World, schedule: &mut Schedule) -> Result<()> {
+pub(super) fn register(w: &World, schedule: &mut Schedule, bank: Arc<SilverMatcher>) -> Result<()> {
     let mut systems = CharacterSystems::default();
-    stage::register_motion(&mut systems, Arc::new(SilverMatcher::load()?));
+    stage::register_motion(&mut systems, bank);
     dynamics::register(&mut systems, schedule)?;
     stage::register_ik(&mut systems);
     systems.install(schedule, character_clock(), w, SETTING, |w| {
-        let children = rig::children(w);
         let mut actors = BTreeMap::new();
-        for &actor in w.entities.component_owners(SETTING) {
-            actors.insert(actor, Arc::new(bind_actor(w, actor, &children)?));
+        let members = w.entities.component_owners(SETTING);
+        if !members.is_empty() {
+            let children = rig::children(w);
+            for &actor in members {
+                actors.insert(actor, Arc::new(bind_actor(w, actor, &children)?));
+            }
         }
         let bindings: Vec<_> = actors
             .values()
@@ -313,6 +335,15 @@ pub fn scene() -> Result<World> {
         dynamics::Body::new(w.entities[&actor].local.w_axis.truncate()),
     );
     let (floor, plate, target, fixtures) = course::build(&mut w);
+    w.set_motion_policy(actor, MotionPolicy::DYNAMIC)?;
+    w.set_motion_policy(plate, MotionPolicy::DYNAMIC)?;
+    w.set_motion_policy(floor, MotionPolicy::MOVING_COLLIDER)?;
+    for id in [fixtures.landing, fixtures.station, fixtures.ramp]
+        .into_iter()
+        .chain(fixtures.service)
+    {
+        w.set_motion_policy(id, MotionPolicy::FIXED_COLLIDER)?;
+    }
     w.set_typed_component(
         plate,
         dynamics::SPRING,
@@ -325,6 +356,7 @@ pub fn scene() -> Result<World> {
         actor,
         SETTING,
         Contact {
+            request: None,
             source_binding: None,
             finger: None,
             floor,
@@ -424,11 +456,16 @@ pub fn command(engine: &mut Engine, arg: &str) -> Result<String> {
         }
         ["spin", speed] => {
             let rate = speed.parse::<f32>()?.to_radians();
+            let policy = engine
+                .world
+                .motion_policy(c.floor, MotionPolicy::MOVING_COLLIDER)?;
             ensure!(
-                rate.is_finite()
-                    && rate.abs() * character_clock().step.as_secs_f32() < std::f32::consts::PI,
-                "invalid turntable speed"
+                rate == 0.
+                    || (policy.mobility == Mobility::Movable
+                        && policy.physics != PhysicsParticipation::Simulated),
+                "spinning the deck requires a movable, nonsimulated support"
             );
+            ensure!(rate.is_finite(), "invalid turntable speed");
             Arc::make_mut(&mut engine.world).set_typed_component(
                 c.floor,
                 dynamics::TURNTABLE,

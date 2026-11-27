@@ -47,6 +47,18 @@ pub fn scene() -> Result<World> {
     let mut world = World::default();
     let box_mesh = mesh(&mut world, "Hall boxes", cube());
     let sphere_mesh = mesh(&mut world, "Test sphere", sphere(20, 10));
+    let shadow = mesh(&mut world, "Sphere shadow hull", sphere(8, 4));
+    let bounds =
+        crate::scene::LocalBounds::from_mesh(world.entities[&sphere_mesh].mesh.as_ref().unwrap())?;
+    let sphere_products = world.spawn(Entity {
+        name: "Sphere derived geometry".into(),
+        geometry_assets: Some(Arc::new(crate::scene::GeometryAssets {
+            source_mesh: sphere_mesh,
+            local_bounds: Some(bounds),
+            shadow_mesh: Some(shadow),
+        })),
+        ..Default::default()
+    });
     let concrete = material(&mut world, "Concrete", [0.61, 0.65, 0.73]);
     let pale = material(&mut world, "Ivory", [0.78, 0.79, 0.72]);
     let red = material(&mut world, "Iron oxide", [0.64, 0.24, 0.12]);
@@ -106,7 +118,7 @@ pub fn scene() -> Result<World> {
         (teal, [-2.16, 0.71, -5.69], 1.42),
         (red, [2.6, 0.64, -10.96], 1.28),
     ] {
-        object(
+        let id = object(
             &mut world,
             sphere_mesh,
             mat,
@@ -114,6 +126,7 @@ pub fn scene() -> Result<World> {
             position,
             [diameter; 3],
         );
+        world.bind_geometry_assets(id, Some(sphere_products))?;
     }
     for (x, tint) in [
         (-2.2, [1., 0.27, 0.055]),

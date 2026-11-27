@@ -1,5 +1,106 @@
 use super::*;
 
+#[test]
+fn plain_and_contact_characters_follow_their_own_clocks_after_membership_changes() -> Result<()> {
+    use crate::{experiments::assembly::Assembly, scene::TickRate};
+
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+    let mut world = population::populated_world(2, &pool, false)?;
+    let [a, b]: [Id; 2] = world.entities.component_owners(PLAYER).try_into().unwrap();
+    let detach = |w: &mut World, id| -> Result<Contact> {
+        let saved = w
+            .typed_component::<Contact>(id, SETTING)?
+            .unwrap()
+            .into_owned();
+        w.entities.get_mut(&id).unwrap().components.remove(SETTING);
+        w.set_motion_policy(id, MotionPolicy::KINEMATIC)?;
+        Ok(saved)
+    };
+    let attach = |w: &mut World, id, c| -> Result<()> {
+        w.set_typed_component(id, SETTING, c);
+        w.set_motion_policy(id, MotionPolicy::DYNAMIC)
+    };
+    let stamp = |w: &World, id| -> Result<_> {
+        let p = player(w, id)?;
+        Ok((
+            p.sample,
+            p.fraction,
+            p.bones
+                .iter()
+                .map(|id| w.entities[id].local)
+                .collect::<Vec<_>>(),
+        ))
+    };
+    let saved_a = detach(&mut world, a)?;
+    let saved_b = detach(&mut world, b)?;
+    set_actor_goal(&mut world, b, 0, 1)?;
+    let mut assembly = Assembly {
+        caps: Default::default(),
+        materials: Default::default(),
+        schedule: Default::default(),
+        movement: None,
+        camera: None,
+        technique: None,
+        visibility: Default::default(),
+    };
+    // Install through the module registry with no initial contact actors, then attach the first one live.
+    (super::super::MODULE.install)(&world, &mut assembly)?;
+    let mut schedule = assembly.schedule;
+    let mut world = Arc::new(world);
+    attach(Arc::make_mut(&mut world), a, saved_a)?;
+    schedule.set_tick_rate("silver-motion", TickRate::Hertz(1))?;
+    let (a0, b0) = (stamp(&world, a)?, stamp(&world, b)?);
+    schedule.tick(&mut world, 1. / 30., &pool)?;
+    assert_ne!(stamp(&world, a)?, a0);
+    assert_eq!(stamp(&world, b)?, b0);
+
+    // With the opposite cadence only the plain actor may publish a pose.
+    schedule.set_tick_rate("silver-motion", TickRate::Default)?;
+    schedule.set_tick_rate("character", TickRate::Hertz(1))?;
+    let a1 = stamp(&world, a)?;
+    for _ in 0..12 {
+        schedule.tick(&mut world, 1. / 30., &pool)?;
+    }
+    assert_eq!(stamp(&world, a)?, a1);
+    assert_ne!(stamp(&world, b)?, b0);
+
+    let b1 = stamp(&world, b)?;
+    detach(Arc::make_mut(&mut world), a)?;
+    attach(Arc::make_mut(&mut world), b, saved_b)?;
+    schedule.tick(&mut world, 1. / 30., &pool)?;
+    assert_ne!(stamp(&world, a)?, a1);
+    assert_eq!(stamp(&world, b)?, b1);
+
+    // A save can land between reattaching the component and its first physics tick.
+    let at = world.entities[&b].local.w_axis.truncate();
+    let old_body = world
+        .typed_component::<dynamics::Body>(b, dynamics::BODY)?
+        .unwrap();
+    assert!(at.distance(old_body.particle.position) > 0.15);
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("handoff.json");
+    world.save(&path)?;
+    let mut loaded = World::load(&path)?;
+    crate::experiments::SceneConfiguration::restore(&mut loaded)?;
+    let mut schedule = Schedule::default();
+    install(&loaded, &mut schedule)?;
+    let mut loaded = Arc::new(loaded);
+    schedule.tick(&mut loaded, 1. / 60., &pool)?;
+    let body = loaded
+        .typed_component::<dynamics::Body>(b, dynamics::BODY)?
+        .unwrap();
+    assert_eq!(
+        body.particle.position,
+        loaded.entities[&b].local.w_axis.truncate()
+    );
+    let dz = body.particle.position.z - at.z;
+    assert!(
+        (0.0..0.05).contains(&dz) && dz > 0.,
+        "first contact step moved {dz} m"
+    );
+    Ok(())
+}
+
 fn tip_vertex(w: &World, finger: Id) -> Result<Vec3> {
     let mut last: Option<Vec3> = None;
     for e in w.entities.values() {
@@ -757,5 +858,179 @@ fn replacing_a_live_rig_discards_stale_sources_and_restores_after_save() -> Resu
             .offset,
         offset
     );
+    Ok(())
+}
+
+#[test]
+fn fixed_kinematic_and_dynamic_roots_pass_actual_contacts_to_ik() -> Result<()> {
+    let mut world = scene()?;
+    let id = actor(&world).unwrap();
+    let mut c = world
+        .typed_component::<Contact>(id, SETTING)?
+        .unwrap()
+        .into_owned();
+    c.auto_walk = false;
+    let (floor, plate) = (c.floor, c.plate);
+    world.set_typed_component(id, SETTING, c);
+    set_actor_goal(&mut world, id, 0, 1)?;
+    world.set_motion_policy(id, MotionPolicy::FIXED_COLLIDER)?;
+    world.set_motion_policy(plate, MotionPolicy::FIXED_COLLIDER)?;
+    world.set_motion_policy(floor, MotionPolicy::FIXED_COLLIDER)?;
+    world.set_typed_component(floor, dynamics::TURNTABLE, 1_f32);
+    let (actor_start, plate_start, floor_start) = (
+        world.entities[&id].local,
+        world.entities[&plate].local,
+        world.entities[&floor].local,
+    );
+    let hip = player(&world, id)?.bones[0];
+    let hip_bind = world.entities[&hip].local;
+    let mut schedule = Schedule::default();
+    install(&world, &mut schedule)?;
+    let workers = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+    let mut w = Arc::new(world);
+    for _ in 0..24 {
+        schedule.tick(&mut w, 1. / 60., &workers)?;
+    }
+    assert_eq!(w.entities[&id].local, actor_start);
+    assert_ne!(w.entities[&hip].local, hip_bind);
+    assert_eq!(w.entities[&floor].local, floor_start);
+    assert_eq!(w.entities[&plate].local, plate_start);
+    assert_eq!(
+        w.typed_component::<dynamics::Body>(id, dynamics::BODY)?
+            .unwrap()
+            .support,
+        Some(floor)
+    );
+    Arc::make_mut(&mut w).set_motion_policy(id, MotionPolicy::KINEMATIC)?;
+    for _ in 0..24 {
+        schedule.tick(&mut w, 1. / 60., &workers)?;
+    }
+    assert!(w.entities[&id].local.w_axis.z > actor_start.w_axis.z + 0.1);
+    let body = w
+        .typed_component::<dynamics::Body>(id, dynamics::BODY)?
+        .unwrap();
+    assert!(body.faces.is_empty() && body.support.is_none());
+    assert_eq!(
+        body.particle.position,
+        w.entities[&id].local.w_axis.truncate()
+    );
+    Arc::make_mut(&mut w).set_motion_policy(id, MotionPolicy::MOVING_COLLIDER)?;
+    schedule.tick(&mut w, 1. / 60., &workers)?;
+    assert_eq!(
+        w.typed_component::<dynamics::Body>(id, dynamics::BODY)?
+            .unwrap()
+            .support,
+        Some(floor)
+    );
+    Arc::make_mut(&mut w).set_motion_policy(id, MotionPolicy::DYNAMIC)?;
+    Arc::make_mut(&mut w).set_motion_policy(floor, MotionPolicy::STATIC)?;
+    let from = w.entities[&id].local.w_axis.y;
+    for _ in 0..4 {
+        schedule.tick(&mut w, 1. / 60., &workers)?;
+    }
+    let body = w
+        .typed_component::<dynamics::Body>(id, dynamics::BODY)?
+        .unwrap();
+    assert!(body.support.is_none() && body.particle.position.y < from);
+    assert!(body.faces.iter().all(|face| face.id != floor));
+    assert_eq!(
+        body.particle.position,
+        w.entities[&id].local.w_axis.truncate()
+    );
+    assert!(
+        w.typed_component::<Contact>(id, SETTING)?
+            .unwrap()
+            .request
+            .is_none()
+    );
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("modes.json");
+    w.save(&file)?;
+    let restored = World::load(&file)?;
+    assert_eq!(
+        restored.motion_policy(id, MotionPolicy::STATIC)?,
+        MotionPolicy::DYNAMIC
+    );
+    assert_eq!(
+        restored.motion_policy(floor, MotionPolicy::FIXED_COLLIDER)?,
+        MotionPolicy::STATIC
+    );
+    // A pre-policy save has no policy on any root or fixture, and regenerates the request.
+    let mut legacy = restored;
+    for owned in legacy.entities.component_owners(MOTION_POLICY).to_vec() {
+        legacy
+            .entities
+            .get_mut(&owned)
+            .unwrap()
+            .components
+            .remove(MOTION_POLICY);
+    }
+    legacy.save(&file)?;
+    let mut legacy = World::load(&file)?;
+    hydrate_contact(&mut legacy)?;
+    let mut replay = Schedule::default();
+    install(&legacy, &mut replay)?;
+    let mut legacy = Arc::new(legacy);
+    let y = legacy.entities[&id].local.w_axis.y;
+    replay.tick(&mut legacy, 1. / 60., &workers)?;
+    let b = legacy
+        .typed_component::<dynamics::Body>(id, dynamics::BODY)?
+        .unwrap();
+    assert!(b.particle.position.y < y);
+    assert_eq!(
+        b.particle.position,
+        legacy.entities[&id].local.w_axis.truncate()
+    );
+    Ok(())
+}
+
+#[test]
+fn rotating_deck_restores_a_low_frequency_clock_without_reversing_its_drive() -> Result<()> {
+    use crate::engine::TickRate;
+    let mut world = scene()?;
+    let actor = actor(&world).unwrap();
+    let floor = world
+        .typed_component::<Contact>(actor, SETTING)?
+        .unwrap()
+        .floor;
+    let speed = -1.75 * std::f32::consts::TAU;
+    world.set_typed_component(floor, dynamics::TURNTABLE, speed);
+    let mut original = Schedule::default();
+    install(&world, &mut original)?;
+    original.set_tick_rate(character_clock().name, TickRate::Hertz(1))?;
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build()?;
+    let mut world = Arc::new(world);
+    original.tick(&mut world, 0.75, &pool)?;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("low-frequency.json");
+    world.save_with_clocks(&path, &original.checkpoints(&world))?;
+    let mut loaded = World::load(&path)?;
+    crate::experiments::SceneConfiguration::restore(&mut loaded)?;
+    let mut resumed = Schedule::default();
+    install(&loaded, &mut resumed)?;
+    resumed.restore_clocks(&loaded)?;
+    assert_eq!(resumed.fixed_seconds(character_clock().name), Some(1.));
+    let mut loaded = Arc::new(loaded);
+    let initial = loaded.entities[&floor].local;
+    resumed.tick(&mut loaded, 0.25, &pool)?;
+    assert_ne!(initial, loaded.entities[&floor].local);
+    let body = loaded
+        .typed_component::<dynamics::Body>(actor, dynamics::BODY)?
+        .unwrap();
+    let face = body
+        .faces
+        .iter()
+        .find(|f| f.id == floor)
+        .context("missing driven support")?;
+    assert_eq!(face.angular_velocity, Vec3::Y * speed);
+    let before = loaded.entities[&floor].local;
+    Arc::make_mut(&mut loaded).set_typed_component(floor, dynamics::TURNTABLE, f32::INFINITY);
+    assert!(resumed.tick(&mut loaded, 1., &pool).is_err());
+    assert_eq!(loaded.entities[&floor].local, before);
+    Arc::make_mut(&mut loaded).set_typed_component(floor, dynamics::TURNTABLE, 0_f32);
+    resumed.tick(&mut loaded, 0., &pool)?;
+    let clock = resumed.checkpoints(&loaded)[character_clock().name];
+    assert_eq!(clock.completed, 2);
+    assert_eq!(clock.pending_seconds, 0.);
     Ok(())
 }

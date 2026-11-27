@@ -45,9 +45,18 @@ fn same_arc<T: ?Sized>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
 }
 
 impl MeshAsset {
-    pub(super) fn ordinary_draw_template(&self) -> &super::draw_list::MeshTemplate {
-        self.draw_template
-            .get_or_init(|| super::draw_list::MeshTemplate::new(&self.mesh))
+    pub(super) fn ordinary_draw_template(
+        &self,
+        bounds: Option<LocalBounds>,
+    ) -> super::draw_list::MeshTemplate {
+        match bounds {
+            Some(bounds) => {
+                super::draw_list::MeshTemplate::authored(self.mesh.positions.len(), bounds)
+            }
+            None => *self
+                .draw_template
+                .get_or_init(|| super::draw_list::MeshTemplate::new(&self.mesh)),
+        }
     }
 
     pub(super) fn same_motion_geometry(&self, previous: &Self) -> bool {
@@ -100,6 +109,7 @@ pub struct RenderInstance {
     pub mesh: MeshId,
     pub material: Option<MaterialId>,
     pub model: Mat4,
+    pub geometry_assets: Option<Id>,
     pub outline: bool,
     pub palette: Option<Arc<[Mat4]>>,
     pub(crate) emitter: bool,
@@ -150,6 +160,8 @@ pub struct RenderScene {
     pub(crate) routes: Arc<GeometryRoutes>,
     pub(crate) models: crate::rdg::rows::Rows,
     pub(crate) meshes: Arc<BTreeMap<MeshId, Arc<MeshAsset>>>,
+    geometry_assets: Arc<BTreeMap<Id, Arc<GeometryAssets>>>,
+    pub(crate) geometry_revision: u64,
     pub(crate) materials: Arc<BTreeMap<MaterialId, Arc<Material>>>,
     pub(crate) textures: Arc<BTreeMap<Id, Arc<Texture>>>,
     pub(crate) mesh_cache: Arc<MeshCache>,
@@ -159,7 +171,18 @@ pub struct RenderScene {
     components: Arc<ComponentOutputs>,
 }
 
+fn next_geometry_revision() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REVISION: AtomicU64 = AtomicU64::new(1);
+    REVISION.fetch_add(1, Ordering::Relaxed)
+}
+
 impl RenderScene {
+    pub fn products_for(&self, instance: &RenderInstance) -> Option<&GeometryAssets> {
+        self.geometry_assets
+            .get(&instance.geometry_assets?)
+            .map(AsRef::as_ref)
+    }
     pub fn instances(&self) -> &[Arc<RenderInstance>] {
         self.instances.flat()
     }
@@ -237,6 +260,7 @@ impl SceneExtractor {
             ..Default::default()
         };
         let mut meshes = BTreeMap::new();
+        let mut geometry_assets = BTreeMap::new();
         let mut render_materials = BTreeMap::new();
         let mut textures = BTreeMap::new();
         let mut active_palettes = BTreeSet::new();
@@ -257,6 +281,10 @@ impl SceneExtractor {
                 if let Some(render_light) = self.light(id, light)? {
                     lights.push(render_light);
                 }
+            }
+            if let Some(products) = &entity.geometry_assets {
+                products.validate(world)?;
+                geometry_assets.insert(id, products.clone());
             }
             if let Some(mesh) = &entity.mesh {
                 let key = MeshId(id);
@@ -336,7 +364,9 @@ impl SceneExtractor {
                 };
             let transform = self.transforms.row_mut(id);
             transform.instance = Some(instances.len());
+            world.validate_geometry_binding(entity, instance.geometry_assets)?;
             let next = RenderInstance {
+                geometry_assets: instance.geometry_assets,
                 id,
                 mesh: MeshId(instance.mesh),
                 material: instance.material.map(MaterialId),
@@ -356,7 +386,8 @@ impl SceneExtractor {
             let match_prior = prior_instances
                 .next_if(|prior| prior.id == id)
                 .filter(|prior| {
-                    prior.mesh == next.mesh
+                    prior.geometry_assets == next.geometry_assets
+                        && prior.mesh == next.mesh
                         && prior.material == next.material
                         && prior.transform_version == next.transform_version
                         && prior.outline == next.outline
@@ -390,6 +421,12 @@ impl SceneExtractor {
         let scene = Arc::new(RenderScene {
             routes,
             models,
+            geometry_revision: if geometry_assets.is_empty() {
+                0
+            } else {
+                next_geometry_revision()
+            },
+            geometry_assets: Arc::new(geometry_assets),
             meshes: Arc::new(meshes),
             materials: Arc::new(render_materials),
             textures: Arc::new(textures),

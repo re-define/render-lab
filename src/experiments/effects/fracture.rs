@@ -2,7 +2,7 @@ use super::*;
 use glam::Quat;
 use std::f32::consts::TAU;
 
-const SHARD: &str = "lab.fracture.shard";
+pub(crate) const SHARD: &str = "lab.fracture.shard";
 const LEFT: Vec3 = Vec3::new(-2.02, 0.12, 0.);
 const RIGHT: Vec3 = Vec3::new(2.02, 0.12, 0.);
 const PERIOD: f64 = 5.4;

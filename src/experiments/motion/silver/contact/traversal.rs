@@ -34,12 +34,17 @@ impl Section {
             c.course.is_some(),
             "action practice requires the obstacle course"
         );
+        ensure!(
+            w.motion_policy(id, MotionPolicy::DYNAMIC)?.physics == PhysicsParticipation::Simulated,
+            "course action practice requires a simulated character"
+        );
         let clip = self.clip().context("expected jump, vault or duck")?;
         let mut p = player(w, id)?.into_owned();
         p.yaw = 0.;
         p.turn = 0.;
         p.yaw_rate = 0.;
         p.velocity = Vec2::ZERO;
+        p.standalone_velocity = None;
         p.acceleration = Vec2::ZERO;
         p.speed = 0.;
         p.side = 0.;

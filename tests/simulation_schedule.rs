@@ -965,3 +965,80 @@ fn immutable_transform_sets_are_built_once_per_system_binding() -> Result<()> {
     assert_eq!(w.entities[&next].local.w_axis.y, 1.);
     Ok(())
 }
+
+#[test]
+fn independent_named_clocks_keep_frame_parallelism_and_can_run_at_different_rates() -> Result<()> {
+    use render_lab::engine::TickRate;
+    use std::sync::{Condvar, Mutex};
+    let gate = Arc::new((Mutex::new(0), Condvar::new()));
+    let mut schedule = Schedule::default();
+    for (name, component) in [("wind", "wind phase"), ("effects", "effect phase")] {
+        let gate = gate.clone();
+        schedule.add_frame_system(
+            name,
+            task(name, &[], &[], &[], move |_, dt| {
+                if dt == 0.0 {
+                    let (lock, ready) = &*gate;
+                    let mut reached = lock.lock().unwrap();
+                    *reached += 1;
+                    ready.notify_all();
+                    let (reached, _) = ready
+                        .wait_timeout_while(reached, Duration::from_secs(2), |n| *n < 2)
+                        .unwrap();
+                    anyhow::ensure!(*reached == 2, "{component} did not overlap");
+                }
+                Ok(())
+            }),
+        )?;
+    }
+    let pool = ThreadPoolBuilder::new().num_threads(2).build()?;
+    let mut world = Arc::new(World::default());
+    schedule.tick(&mut world, 0., &pool)?;
+    schedule.set_tick_rate("wind", TickRate::Hertz(15))?;
+    schedule.set_tick_rate("effects", TickRate::Hertz(30))?;
+    for _ in 0..60 {
+        schedule.tick(&mut world, 1. / 60., &pool)?;
+    }
+    assert_eq!(
+        schedule.stages().map(|(_, n)| n).collect::<Vec<_>>(),
+        [16, 31]
+    );
+    assert!(
+        schedule
+            .set_tick_rate("missing", TickRate::Default)
+            .is_err()
+    );
+    assert!(schedule.set_tick_rate("wind", TickRate::Hertz(0)).is_err());
+    schedule.set_tick_rate("wind", TickRate::Default)?;
+    assert_eq!(schedule.fixed_seconds("wind"), None);
+    assert!(schedule.describe_clocks().contains("effects · 30.00 Hz"));
+    Ok(())
+}
+
+#[test]
+fn following_clock_keeps_its_time_when_an_earlier_domain_fails() -> Result<()> {
+    use render_lab::engine::FixedDomain;
+    let mut world = Arc::new(World::default());
+    let first = FixedDomain {
+        name: "actor",
+        step: Duration::from_millis(125),
+        max_steps: 8,
+    };
+    let mut schedule = Schedule::default();
+    schedule.add_fixed_system(first, Arc::new(FailSecond(AtomicUsize::new(0))))?;
+    schedule.add_fixed_system(
+        FixedDomain {
+            name: "wind",
+            ..first
+        },
+        task("wind", &[], &[], &[], |_, _| Ok(())),
+    )?;
+    let pool = ThreadPoolBuilder::new().num_threads(1).build()?;
+    assert!(schedule.tick(&mut world, 0.375, &pool).is_err());
+    schedule.tick(&mut world, 0., &pool)?;
+    assert_eq!(
+        schedule.stages().map(|(_, n)| n).collect::<Vec<_>>(),
+        [3, 3]
+    );
+    Ok(())
+}

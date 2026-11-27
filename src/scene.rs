@@ -11,11 +11,18 @@ mod changes;
 pub(crate) use changes::{Cursor as ChangeCursor, PublishedPose, Write as EntityWrite};
 pub use changes::{Entities, LocalPose, PoseLayout};
 mod components;
+mod geometry_assets;
+pub use geometry_assets::{GeometryAssets, LocalBounds};
 mod gi;
 mod light;
+mod motion_policy;
 pub use gi::{GiHitMaterial, GiHitModel, GiNode, GiTexture};
 pub use light::{Light, LightKind};
+pub(crate) use motion_policy::RootWriter;
+pub use motion_policy::{MOTION_POLICY, Mobility, MotionPolicy, PhysicsParticipation};
 
+mod tick;
+pub use tick::{ClockCheckpoint, TickRate};
 pub type Id = u64;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -184,6 +191,9 @@ pub struct Track {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Instance {
     pub mesh: Id,
+    /// Entity containing the shared geometry-derived products for this instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_assets: Option<Id>,
     pub material: Option<Id>,
     #[serde(default, rename = "shading", skip_serializing)]
     pub(crate) legacy_shading: Option<Shading>,
@@ -197,6 +207,8 @@ pub struct Entity {
     pub local: Mat4,
     pub instance: Option<Instance>,
     pub mesh: Option<Arc<Mesh>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub geometry_assets: Option<Arc<GeometryAssets>>,
     pub texture: Option<Arc<Texture>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gaussian_payload: Option<Arc<Vec<u8>>>,
@@ -218,6 +230,7 @@ impl Instance {
     pub fn new(mesh: Id, material: Option<Id>) -> Self {
         Self {
             mesh,
+            geometry_assets: None,
             material,
             legacy_shading: None,
             outline: false,
@@ -232,6 +245,7 @@ impl Default for Entity {
             local: Mat4::IDENTITY,
             instance: None,
             mesh: None,
+            geometry_assets: None,
             texture: None,
             gaussian_payload: None,
             material: None,
@@ -250,6 +264,11 @@ impl Default for Entity {
 #[derive(Clone, Deserialize)]
 pub struct World {
     version: u32,
+    #[serde(default)]
+    pub(crate) clocks: BTreeMap<String, ClockCheckpoint>,
+    /// Root providers installed by the application while restoring or configuring a scene.
+    #[serde(skip)]
+    pub(crate) motion_writers: &'static [RootWriter],
     pub entities: Entities,
     #[serde(skip)]
     runtime: components::RuntimeComponents,
@@ -260,6 +279,8 @@ impl Default for World {
     fn default() -> Self {
         Self {
             version: 1,
+            motion_writers: &[],
+            clocks: Default::default(),
             entities: Entities::default(),
             runtime: Default::default(),
             simulation_resources: Default::default(),
@@ -282,6 +303,11 @@ impl World {
             "unsupported scene version {}",
             self.version
         );
+        for (name, clock) in &self.clocks {
+            ensure!(!name.is_empty(), "empty simulation clock name");
+            clock.validate()?;
+        }
+        self.validate_motion_components()?;
         let transforms = self.transforms()?;
         for (&id, e) in &self.entities {
             if let Some(light) = e.light {
@@ -289,7 +315,13 @@ impl World {
                     .validate(transforms[&id])
                     .with_context(|| format!("light entity {id}"))?;
             }
+            if let Some(asset) = &e.geometry_assets {
+                asset
+                    .validate(self)
+                    .with_context(|| format!("geometry asset {id}"))?;
+            }
             if let Some(i) = &e.instance {
+                self.validate_geometry_binding(e, i.geometry_assets)?;
                 ensure!(
                     self.entities.get(&i.mesh).is_some_and(|e| e.mesh.is_some()),
                     "entity {id}: missing mesh"
@@ -477,6 +509,14 @@ impl World {
         Ok(order)
     }
     pub fn save(&self, path: &Path) -> Result<()> {
+        self.save_with_clocks(path, &self.clocks)
+    }
+
+    pub(crate) fn save_with_clocks(
+        &self,
+        path: &Path,
+        clocks: &BTreeMap<String, ClockCheckpoint>,
+    ) -> Result<()> {
         self.validate()?;
         let dir = path
             .parent()
@@ -485,7 +525,7 @@ impl World {
         let mut file = tempfile::NamedTempFile::new_in(dir)?;
         {
             let mut writer = std::io::BufWriter::new(file.as_file_mut());
-            serde_json::to_writer(&mut writer, self)?;
+            self.serialize_with_clocks(clocks, &mut serde_json::Serializer::new(&mut writer))?;
             std::io::Write::flush(&mut writer)?;
         }
         file.as_file().sync_all()?;

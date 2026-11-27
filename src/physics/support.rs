@@ -9,7 +9,8 @@ pub struct SupportFace {
     inverse: Mat4,
     pub normal: Vec3,
     pub center: Vec3,
-    /// Linear velocity of the top-face center in metres per second.
+    pivot: Vec3,
+    /// Linear velocity at the twist pivot in metres per second (top-face center by default).
     pub velocity: Vec3,
     pub angular_velocity: Vec3,
     pub(crate) rotation: Quat,
@@ -26,6 +27,7 @@ impl SupportFace {
         }
         let inverse = world.inverse();
         let normal = inverse.transpose().transform_vector3(Vec3::Y).normalize();
+        let center = world.transform_point3(0.5 * Vec3::Y);
         Some(Self {
             id,
             min_normal_y,
@@ -35,11 +37,13 @@ impl SupportFace {
             velocity: Vec3::ZERO,
             angular_velocity: Vec3::ZERO,
             rotation: world.to_scale_rotation_translation().1.normalize(),
-            center: world.transform_point3(0.5 * Vec3::Y),
+            center,
+            pivot: center,
         })
     }
     /// Estimate the rigid twist from two simulation samples. Legacy saves contain only a center.
     pub(crate) fn set_previous(&mut self, center: Vec3, rotation: Option<Quat>, dt: f32) {
+        self.pivot = self.center;
         self.velocity = (self.center - center) / dt;
         self.angular_velocity = Vec3::ZERO;
         if let Some(old) = rotation
@@ -51,9 +55,17 @@ impl SupportFace {
         }
     }
 
+    /// Signed parent-Y angular drive about a stationary box origin (radians per second).
+    /// Retain the sign and speed when sampling aliased poses, including on the first tick.
+    pub(crate) fn set_driven_rotation(&mut self, radians_per_second: f32) {
+        self.angular_velocity = Vec3::Y * radians_per_second;
+        self.pivot = self.world.w_axis.truncate();
+        self.velocity = Vec3::ZERO;
+    }
+
     /// Velocity of a material point expressed in the current world frame.
     pub fn velocity_at(self, point: Vec3) -> Vec3 {
-        self.velocity + self.angular_velocity.cross(point - self.center)
+        self.velocity + self.angular_velocity.cross(point - self.pivot)
     }
 
     /// Carry a point from the start pose of this rigid support to the end pose.
@@ -62,8 +74,8 @@ impl SupportFace {
         if self.angular_velocity == Vec3::ZERO {
             return point + translation;
         }
-        let previous_center = self.center - translation;
-        self.center + Quat::from_scaled_axis(self.angular_velocity * dt) * (point - previous_center)
+        let previous_pivot = self.pivot - translation;
+        self.pivot + Quat::from_scaled_axis(self.angular_velocity * dt) * (point - previous_pivot)
     }
 
     fn clearance(self, p: Vec3) -> f32 {
@@ -92,7 +104,7 @@ impl SupportFace {
                 let turn = Quat::from_scaled_axis(-self.angular_velocity * time);
                 let ballistic = at + (velocity - self.velocity) * time
                     - Vec3::Y * (0.5 * gravity * time * time);
-                self.center + turn * (ballistic - self.center)
+                self.pivot + turn * (ballistic - self.pivot)
             };
             let mut start = 0.;
             let mut above = self.clearance(at);
@@ -156,6 +168,25 @@ impl SupportFace {
 mod tests {
     use super::*;
     use glam::Quat;
+
+    #[test]
+    fn driven_rotation_keeps_signed_velocity_across_whole_turns_about_the_box_origin() {
+        let origin = Vec3::new(3., 2., -4.);
+        let transform = Mat4::from_scale_rotation_translation(
+            Vec3::splat(2.),
+            Quat::from_rotation_x(0.4),
+            origin,
+        );
+        let mut deck = SupportFace::from_box(1, transform, 0.6).unwrap();
+        let dt = 1.;
+        let omega = -2.5 * std::f32::consts::TAU;
+        deck.set_driven_rotation(omega);
+        let point = origin + Vec3::X;
+        assert!(deck.velocity_at(point).abs_diff_eq(-omega * Vec3::Z, 1e-5));
+        assert!(deck.carry(point, dt).abs_diff_eq(origin - Vec3::X, 2e-5));
+        assert_eq!(deck.velocity_at(origin), Vec3::ZERO);
+    }
+
     #[test]
     fn anticipated_landing_uses_actual_height_footprint_and_relative_motion() {
         let deck = SupportFace::from_box(

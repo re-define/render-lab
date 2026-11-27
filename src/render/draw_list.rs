@@ -10,6 +10,14 @@ pub(super) struct MeshTemplate {
 }
 
 impl MeshTemplate {
+    pub(super) fn authored(vertices: usize, bounds: crate::scene::LocalBounds) -> Self {
+        Self {
+            vertices,
+            min: bounds.min.into(),
+            max: bounds.max.into(),
+        }
+    }
+
     pub(super) fn new(mesh: &Mesh) -> Self {
         let mut min = Vec3::splat(f32::INFINITY);
         let mut max = Vec3::splat(f32::NEG_INFINITY);

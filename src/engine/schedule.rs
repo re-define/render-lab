@@ -1,4 +1,6 @@
 //! Dependency-ordered simulation with immutable reads and deterministic deferred writes.
+pub use crate::scene::TickRate;
+mod clocks;
 mod context;
 mod plan;
 mod transforms;
@@ -282,7 +284,9 @@ struct Phase {
     entries: Vec<Entry>,
     automatic: bool,
     fixed: Option<FixedStep>,
-    domain: Option<FixedDomain>,
+    clock: Option<clocks::Declaration>,
+    rate: TickRate,
+    dropped_seconds: f64,
     memberships: Vec<Membership>,
     completed: u64,
 }
@@ -431,36 +435,12 @@ impl Schedule {
         );
         Ok(())
     }
-    fn domain(&mut self, domain: FixedDomain) -> Result<&mut Phase> {
-        anyhow::ensure!(
-            !domain.name.is_empty() && !domain.step.is_zero() && domain.max_steps > 0,
-            "invalid fixed domain"
-        );
-        let index = self
-            .phases
-            .iter()
-            .position(|p| p.domain.is_some_and(|d| d.name == domain.name));
-        let index = if let Some(i) = index {
-            anyhow::ensure!(
-                self.phases[i].domain == Some(domain),
-                "conflicting timestep or catch-up limit in domain {}",
-                domain.name
-            );
-            i
-        } else {
-            self.fixed_stage(domain.step, domain.max_steps, Vec::new())?;
-            let i = self.phases.len() - 1;
-            self.phases[i].domain = Some(domain);
-            i
-        };
-        self.compiled.take();
-        Ok(&mut self.phases[index])
-    }
-
     /// Plugins can register independently, in any order within a named clock. Its position
     /// relative to other phases is determined by its first registration.
     pub fn add_fixed_system(&mut self, domain: FixedDomain, system: Arc<dyn System>) -> Result<()> {
-        self.domain(domain)?.entries.push(Entry::new(system));
+        self.named_phase(clocks::Declaration::fixed(domain)?)?
+            .entries
+            .push(Entry::new(system));
         Ok(())
     }
 
@@ -474,7 +454,7 @@ impl Schedule {
         bind: impl Fn(&World) -> Result<SystemGroup> + Send + Sync + 'static,
     ) -> Result<()> {
         let (systems, is_current) = bind(world)?;
-        let phase = self.domain(domain)?;
+        let phase = self.named_phase(clocks::Declaration::fixed(domain)?)?;
         let start = phase.entries.len();
         phase.entries.extend(systems.into_iter().map(Entry::new));
         phase.memberships.push(Membership {
@@ -510,13 +490,8 @@ impl Schedule {
         self.plan()
             .ok()
             .into_iter()
-            .flat_map(|plan| plan.phases.iter().zip(&self.phases))
-            .flat_map(|(groups, phase)| {
-                groups
-                    .iter()
-                    .flat_map(|segment| &segment.batches)
-                    .map(move |g| (g.access.as_slice(), phase.completed))
-            })
+            .flat_map(|plan| &plan.reports(&self.phases).groups)
+            .map(|(access, phase)| (access.as_slice(), self.phases[*phase].completed))
     }
     pub fn describe(&self) -> String {
         use fmt::Write;
@@ -531,11 +506,11 @@ impl Schedule {
         );
         for (phase, (p, groups)) in self.phases.iter().zip(&plan.phases).enumerate() {
             let clock = p.fixed.as_ref().map_or_else(
-                || "variable".into(),
+                || format!("{} variable", p.clock.map_or("independent", |d| d.name)),
                 |f| {
                     format!(
                         "{} fixed {:.6} s, max {}",
-                        p.domain.map_or("independent", |d| d.name),
+                        p.clock.map_or("independent", |d| d.name),
                         f.seconds,
                         f.max_steps
                     )
@@ -582,29 +557,74 @@ impl Schedule {
                 }
             }
         }
+        for reason in &plan.reports(&self.phases).clock_hazards {
+            let _ = write!(out, "\n  {reason}");
+        }
         out
     }
     pub fn tick(&mut self, world: &mut Arc<World>, dt: f32, pool: &ThreadPool) -> Result<()> {
         anyhow::ensure!(dt.is_finite() && dt >= 0., "invalid simulation time");
         self.validate()?;
         let plan = self.compiled.get_mut().unwrap().as_mut().unwrap();
-        for (p, groups) in self.phases.iter_mut().zip(&mut plan.phases) {
-            let (steps, interval) = match &mut p.fixed {
-                Some(f) => {
-                    f.remainder =
-                        (f.remainder + f64::from(dt)).min(f.seconds * f64::from(f.max_steps));
-                    ((f.remainder / f.seconds).floor() as u32, f.seconds as f32)
+        plan.reports.take();
+        // Credit all fixed domains before work. On a failed earlier domain, retrying
+        // with dt=0 must still advance every subsequent fixed domain to this tick.
+        for phase in &mut self.phases {
+            if let Some(f) = &mut phase.fixed {
+                let elapsed = f.remainder + f64::from(dt);
+                f.remainder = elapsed.min(f.seconds * f64::from(f.max_steps));
+                phase.dropped_seconds += elapsed - f.remainder;
+            }
+        }
+        let mut first = 0;
+        while first < self.phases.len() {
+            let wave = if self
+                .phases
+                .get(first + 1)
+                .is_some_and(clocks::frame_candidate)
+            {
+                clocks::bind_frame_wave(&self.phases[first..], &mut plan.phases[first..], world)?
+            } else {
+                0
+            };
+            if wave > 1 {
+                let phases = &mut self.phases[first..first + wave];
+                let edits = pool.install(|| {
+                    phases
+                        .par_iter()
+                        .zip(&plan.phases[first..first + wave])
+                        .map(|(phase, segments)| {
+                            phase.entries[0].prepare(
+                                world,
+                                dt,
+                                segments[0].bindings.get(&0).map(Arc::as_ref),
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })?;
+                for (phase, changes) in phases.iter_mut().zip(edits) {
+                    for change in changes {
+                        change.apply(Arc::make_mut(world), None);
+                    }
+                    phase.completed += 1;
                 }
+                first += wave;
+                continue;
+            }
+            let p = &mut self.phases[first];
+            let (steps, interval) = match &mut p.fixed {
+                Some(f) => ((f.remainder / f.seconds).floor() as u32, f.seconds as f32),
                 None => (1, dt),
             };
             for _ in 0..steps {
                 p.refresh_membership(world)?;
-                run_substep(p, groups, world, interval, pool)?;
+                run_substep(p, &mut plan.phases[first], world, interval, pool)?;
                 if let Some(f) = &mut p.fixed {
                     f.remainder = (f.remainder - f.seconds).max(0.);
                 }
                 p.completed += 1;
             }
+            first += 1;
         }
         Ok(())
     }

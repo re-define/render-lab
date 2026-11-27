@@ -21,8 +21,8 @@ pub(super) fn register(systems: &mut CharacterSystems, schedule: &mut Schedule) 
 }
 
 pub(super) const BODY: &str = "lab.silver_wolf.body";
-pub(super) const TURNTABLE: &str = "lab.physics.turntable";
-pub(super) const SPRING: &str = "lab.physics.spring_plate";
+pub(crate) const TURNTABLE: &str = "lab.physics.turntable";
+pub(crate) const SPRING: &str = "lab.physics.spring_plate";
 const PLATE_MASS: f32 = 22.;
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -159,7 +159,11 @@ impl SimulationSystem for Turntables {
     fn access(&self) -> SystemAccess {
         SystemAccess {
             name: "Rotating support drives",
-            reads: &[Component(TURNTABLE), LocalTransformsById],
+            reads: &[
+                Component(TURNTABLE),
+                Component(MOTION_POLICY),
+                LocalTransformsById,
+            ],
             writes: &[LocalTransformsById],
         }
     }
@@ -175,11 +179,16 @@ impl SimulationSystem for Turntables {
             let rate = *cx
                 .component::<f32>(id, TURNTABLE)?
                 .context("missing turntable speed")?;
-            let angle = rate * dt;
+            let policy = cx.motion_policy(id, MotionPolicy::MOVING_COLLIDER)?;
+            if policy.mobility == Mobility::Static {
+                continue;
+            }
             ensure!(
-                angle.is_finite() && angle.abs() < std::f32::consts::PI,
-                "turntable rotation must be resolvable within one substep"
+                policy.physics != PhysicsParticipation::Simulated,
+                "turntable {id} is a kinematic drive; a dynamic angular solver is required for simulated rotation"
             );
+            let angle = rate * dt;
+            ensure!(angle.is_finite(), "non-finite turntable rotation");
             if angle != 0. {
                 let transform = cx.local(id)?.context("missing turntable transform")?;
                 let (scale, rotation, translation) = transform.to_scale_rotation_translation();
@@ -196,7 +205,9 @@ impl SimulationSystem for Turntables {
 // A platform is integrated once per substep. All occupants see its same predicted state.
 pub(super) struct Integrate(pub Vec<Vec<Arc<Stage>>>);
 struct Solved {
-    root: Mat4,
+    request: RootMotionRequest,
+    before: Mat4,
+    policy: MotionPolicy,
     body: Body,
     contact: Contact,
     plate_velocity_delta: f32,
@@ -214,7 +225,9 @@ impl SimulationSystem for Integrate {
         SystemAccess {
             name: "Character momentum and support impulses",
             reads: &[
+                Component(MOTION_POLICY),
                 Component(BODY),
+                Component(TURNTABLE),
                 Component(SETTING),
                 Component(SPRING),
                 LocalTransformsById,
@@ -246,29 +259,44 @@ impl SimulationSystem for Integrate {
             let mut spring = *cx
                 .component::<Spring>(id, SPRING)?
                 .context("missing spring state")?;
-            spring.advance(&mut plate, dt);
+            let plate_policy = cx.motion_policy(id, MotionPolicy::DYNAMIC)?;
+            let spring_active = plate_policy.physics == PhysicsParticipation::Simulated;
+            if spring_active {
+                spring.advance(&mut plate, dt);
+            } else {
+                spring.velocity = 0.;
+            }
             let predicted_y = plate.w_axis.y;
-            let mut face = support(id, plate)?;
-            face.velocity.y = spring.velocity;
+            let face = if plate_policy.physics != PhysicsParticipation::Off {
+                let mut face = support(id, plate)?;
+                face.velocity.y = spring.velocity;
+                Some(face)
+            } else {
+                None
+            };
             let mut delta_y = 0.;
             let mut delta_v = 0.;
             let mut solved = Vec::with_capacity(group.len());
             for actor in group {
-                let result = solve(actor, cx, dt, face)?;
+                let result = solve(actor, cx, dt, face, spring_active)?;
                 delta_y += result.plate_height_delta;
                 delta_v += result.plate_velocity_delta;
                 solved.push(result);
             }
             spring.velocity += delta_v;
-            plate.w_axis.y = spring.clamp_height(predicted_y + delta_y);
+            if spring_active {
+                plate.w_axis.y = spring.clamp_height(predicted_y + delta_y);
+            }
             let final_face = if plate.w_axis.y == predicted_y {
                 face
             } else {
-                support(id, plate)?
+                Some(support(id, plate)?)
             };
 
             for (s, mut result) in group.iter().zip(solved) {
-                if result.body.support == Some(id) {
+                if result.policy.physics == PhysicsParticipation::Simulated
+                    && result.body.support == Some(id)
+                {
                     result.body.particle.position.y += plate.w_axis.y - predicted_y;
                 }
                 if let Some((_, last)) = result
@@ -277,48 +305,77 @@ impl SimulationSystem for Integrate {
                     .iter_mut()
                     .find(|(k, _)| *k == id)
                 {
-                    *last = PreviousFace::of(final_face);
+                    *last = PreviousFace::of(final_face.context("missing final plate face")?);
                 }
                 for f in &mut result.faces {
                     if f.id == id {
                         let twist = (f.velocity, f.angular_velocity);
-                        *f = final_face;
+                        *f = final_face.context("missing final plate face")?;
                         (f.velocity, f.angular_velocity) = twist;
                     }
                 }
                 result.body.faces = result.faces.into();
-                result.root.w_axis = result.body.particle.position.extend(1.);
-                cx.set_pose([(s.actor, result.root)])?;
+                let simulated = (result.policy.physics == PhysicsParticipation::Simulated)
+                    .then_some(result.body.particle.position);
+                let root = result
+                    .request
+                    .resolve(result.policy, result.before, simulated)?;
+                if root != result.before {
+                    cx.set_pose([(s.actor, root)])?;
+                }
                 cx.set_typed_component(s.actor, BODY, result.body)?;
                 cx.set_typed_component(s.actor, SETTING, result.contact)?;
             }
-            cx.set_pose([(id, plate)])?;
+            if spring_active {
+                cx.set_pose([(id, plate)])?;
+            }
             cx.set_typed_component(id, SPRING, spring)
         })
     }
 }
 
-fn solve(s: &Stage, cx: &SystemContext<'_>, dt: f32, plate: SupportFace) -> Result<Solved> {
+fn solve(
+    s: &Stage,
+    cx: &SystemContext<'_>,
+    dt: f32,
+    plate: Option<SupportFace>,
+    spring_active: bool,
+) -> Result<Solved> {
     let mut c = s.state(cx)?;
     let mut body = cx
         .component::<Body>(s.actor, BODY)?
         .context("missing character body")?
         .into_owned();
-    let root = cx.local(s.actor)?.context("missing character root")?;
+    let before_root = cx.local(s.actor)?.context("missing character root")?;
+    let motion = c
+        .request
+        .take()
+        .context("animation did not publish root motion this substep")?;
+    if let Some(velocity) = motion.inherited_velocity {
+        body.reset_motion(before_root.w_axis.truncate());
+        body.particle.momentum = velocity * body.particle.mass;
+    }
+    let request = motion.root;
+    let policy = cx.motion_policy(s.actor, MotionPolicy::DYNAMIC)?;
     let mut plate_velocity_delta = 0.;
     let mut plate_height_delta = 0.;
-    let mut floors = s
-        .supports
-        .iter()
-        .map(|&id| {
+    let mut floors = Vec::with_capacity(s.supports.len());
+    if policy.physics != PhysicsParticipation::Off {
+        for &id in &s.supports {
             if id == s.plate {
-                Ok(plate)
+                floors.extend(plate);
             } else {
-                support(id, cx.local(id)?.context("missing support")?)
+                let support_policy = cx.motion_policy(id, MotionPolicy::FIXED_COLLIDER)?;
+                if support_policy.physics != PhysicsParticipation::Off {
+                    floors.push(support(id, cx.local(id)?.context("missing support")?)?);
+                }
             }
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if body.support.is_some_and(|id| !s.supports.contains(&id)) {
+        }
+    }
+    if body
+        .support
+        .is_some_and(|id| !floors.iter().any(|face| face.id == id))
+    {
         body.support = None;
         body.base_velocity = Vec3::ZERO;
     }
@@ -328,17 +385,51 @@ fn solve(s: &Stage, cx: &SystemContext<'_>, dt: f32, plate: SupportFace) -> Resu
             let (center, rotation) = prior.pose();
             floor.set_previous(center, rotation, dt);
         }
+        if let Some(rate) = cx.component::<f32>(floor.id, TURNTABLE)? {
+            // The drive rotates about parent Y through the object's origin. Its signed
+            // angular velocity is known even when the poses differ by whole turns.
+            let movable = cx
+                .motion_policy(floor.id, MotionPolicy::MOVING_COLLIDER)?
+                .mobility
+                == Mobility::Movable;
+            floor.set_driven_rotation(if movable { *rate } else { 0. });
+        }
         // The plate has its own vertical degree of freedom.
-        if floor.id == s.plate {
+        if spring_active
+            && floor.id == s.plate
+            && let Some(plate) = plate
+        {
             floor.velocity.y = plate.velocity.y;
         }
+    }
+    if policy.physics != PhysicsParticipation::Simulated {
+        let resolved = request.resolve(policy, before_root, None)?;
+        let at = resolved.w_axis.truncate();
+        let velocity = (at - before_root.w_axis.truncate()) / dt;
+        body.reset_motion(at);
+        body.particle.momentum = velocity * body.particle.mass;
+        body.support = SupportFace::highest_below(at, &floors, at.y + MAX_STEP)
+            .filter(|(_, point)| point.y >= at.y - MAX_STEP)
+            .map(|(face, _)| face.id);
+        body.previous_faces
+            .extend(floors.iter().map(|f| (f.id, PreviousFace::of(*f))));
+        return Ok(Solved {
+            before: before_root,
+            request,
+            policy,
+            body,
+            contact: c,
+            plate_velocity_delta,
+            plate_height_delta,
+            faces: floors,
+        });
     }
     let previous_support = body.support;
     let mut base = body
         .support
         .and_then(|id| floors.iter().find(|f| f.id == id))
         .map_or(Vec3::ZERO, |f| f.velocity_at(body.particle.position));
-    if body.support == Some(s.plate) {
+    if spring_active && body.support == Some(s.plate) {
         base.y = 0.;
     }
     if body.support.is_some() {
@@ -352,11 +443,7 @@ fn solve(s: &Stage, cx: &SystemContext<'_>, dt: f32, plate: SupportFace) -> Resu
         .play
         .and_then(|p| c.section.launch(p))
         .filter(|_| was_grounded);
-    let goal = if let Some(play) = c.play {
-        c.section.ground_goal(play)
-    } else {
-        root.w_axis.truncate()
-    };
+    let goal = request.target_local().w_axis.truncate();
     if was_grounded && let Some(play) = &mut c.play {
         play.ground_offset += base * Vec3::new(1., 0., 1.) * dt;
     }
@@ -364,7 +451,7 @@ fn solve(s: &Stage, cx: &SystemContext<'_>, dt: f32, plate: SupportFace) -> Resu
         // A single push at takeoff. The authored span sets desired forward launch speed.
         let dv = Vec3::Z * speed - (body.particle.velocity() - base) * Vec3::new(1., 0., 1.);
         let impulse = dv * mass + Vec3::Y * (body.jump_impulse * scale);
-        if body.support == Some(s.plate) {
+        if spring_active && body.support == Some(s.plate) {
             plate_velocity_delta -= impulse.y / PLATE_MASS;
         }
         body.particle.impulse(impulse);
@@ -430,7 +517,7 @@ fn solve(s: &Stage, cx: &SystemContext<'_>, dt: f32, plate: SupportFace) -> Resu
         }
     }
     if let Some((fraction, surf, at)) = contact {
-        let movable = surf.id == s.plate;
+        let movable = spring_active && surf.id == s.plate;
         let inv_mass = if movable { 1. / PLATE_MASS } else { 0. };
         let impulse = body.particle.contact(
             surf.normal,
@@ -473,14 +560,16 @@ fn solve(s: &Stage, cx: &SystemContext<'_>, dt: f32, plate: SupportFace) -> Resu
             .and_then(|id| floors.iter().find(|s| s.id == id))
             .map_or(Vec3::ZERO, |s| s.velocity_at(body.particle.position))
     };
-    if body.support == Some(s.plate) {
+    if spring_active && body.support == Some(s.plate) {
         body.base_velocity.y = 0.;
     }
     body.previous_faces.clear();
     body.previous_faces
         .extend(floors.iter().map(|s| (s.id, PreviousFace::of(*s))));
     Ok(Solved {
-        root,
+        before: before_root,
+        request,
+        policy,
         body,
         contact: c,
         plate_velocity_delta,

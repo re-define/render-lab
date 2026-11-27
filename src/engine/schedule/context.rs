@@ -168,6 +168,18 @@ impl<'w> SystemContext<'w> {
         self.access.require(SimulationData::Component(key), false)?;
         self.world.typed_component(id, key)
     }
+    /// Read motion policy within the system's declared component access.
+    pub fn motion_policy(
+        &self,
+        id: Id,
+        fallback: crate::scene::MotionPolicy,
+    ) -> Result<crate::scene::MotionPolicy> {
+        self.access.require(
+            SimulationData::Component(crate::scene::MOTION_POLICY),
+            false,
+        )?;
+        self.world.motion_policy(id, fallback)
+    }
     pub fn local(&self, id: Id) -> Result<Option<Mat4>> {
         if let Some(ids) = self.local_scope(false)? {
             ensure!(

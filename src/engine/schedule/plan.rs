@@ -15,6 +15,12 @@ pub(super) struct Batch {
 
 pub(super) struct Plan {
     pub phases: Vec<Vec<Segment>>,
+    pub(super) reports: std::sync::OnceLock<Reports>,
+}
+
+pub(super) struct Reports {
+    pub groups: Vec<(Vec<SystemAccess>, usize)>,
+    pub clock_hazards: Vec<String>,
 }
 
 impl Plan {
@@ -102,7 +108,60 @@ impl Plan {
             segments.push(Segment::new(phase, nodes, &parents, boundary));
             batches.push(segments);
         }
-        Ok(Self { phases: batches })
+        Ok(Self {
+            phases: batches,
+            reports: Default::default(),
+        })
+    }
+
+    pub(super) fn reports(&self, phases: &[Phase]) -> &Reports {
+        self.reports.get_or_init(|| self.build_reports(phases))
+    }
+
+    fn build_reports(&self, phases: &[Phase]) -> Reports {
+        let mut groups = Vec::new();
+        let mut clock_hazards = Vec::new();
+        let mut first = 0;
+        while first < phases.len() {
+            let n = super::clocks::parallel_frame_wave(&phases[first..], &self.phases[first..]);
+            if n > 1 {
+                groups.push((
+                    phases[first..first + n]
+                        .iter()
+                        .map(|p| p.entries[0].access)
+                        .collect(),
+                    first,
+                ));
+            } else {
+                for batch in self.phases[first].iter().flat_map(|s| &s.batches) {
+                    groups.push((batch.access.clone(), first));
+                }
+            }
+            let next = first + n.max(1);
+            if n > 0 && next < phases.len() && super::clocks::frame_candidate(&phases[next]) {
+                let right = &phases[next].entries[0];
+                let target = self.phases[next][0].bindings.get(&0).map(Arc::as_ref);
+                for (i, left) in phases.iter().enumerate().take(next).skip(first) {
+                    let left = &left.entries[0];
+                    for ((data, entity), hazard) in left.access.hazards(
+                        right.access,
+                        self.phases[i][0].bindings.get(&0).map(Arc::as_ref),
+                        target,
+                    ) {
+                        let entity = entity.map(|id| format!(" entity {id}")).unwrap_or_default();
+                        clock_hazards.push(format!(
+                            "stage boundary: {hazard} {data}{entity}: {} → {}",
+                            left.access.name, right.access.name
+                        ));
+                    }
+                }
+            }
+            first = next;
+        }
+        Reports {
+            groups,
+            clock_hazards,
+        }
     }
 
     pub fn preview(&mut self, phases: &[Phase], world: &World) -> Result<()> {
@@ -115,13 +174,14 @@ impl Plan {
                 }
             }
         }
+        self.reports.take();
         Ok(())
     }
 }
 
 // A selector may inspect declared component inputs. Resolve it after any earlier
 // change to those inputs or world structure has committed within this substep.
-fn binding_input(
+pub(super) fn binding_input(
     writes: &BTreeSet<SimulationData>,
     access: SystemAccess,
 ) -> Option<SimulationData> {

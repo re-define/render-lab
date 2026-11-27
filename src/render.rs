@@ -17,7 +17,7 @@ mod lights;
 mod motion;
 pub(crate) mod rays;
 pub use geometry::SurfaceBuffers;
-pub(crate) use geometry::{MeshCache, PosedSurface};
+pub(crate) use geometry::{MeshCache, PosedSurface, rigid_triangles};
 pub use lights::RenderLight;
 pub(crate) use lights::{GpuLight, pack_lights};
 pub(crate) use motion::MotionSource;

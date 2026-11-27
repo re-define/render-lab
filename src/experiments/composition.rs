@@ -275,6 +275,7 @@ pub fn command(engine: &mut Engine, arg: &str) -> Result<String> {
     let mut config = config.clone();
     config[*layer] = active.into();
     let mut world = (*engine.world).clone();
+    world.clocks = engine.schedule.checkpoints(&world);
     world.set_setting(id, SETTING, config);
     for e in world
         .entities
@@ -347,12 +348,29 @@ mod tests {
                 .stages()
                 .map(|(systems, _)| systems.iter().map(|s| s.name).collect())
                 .collect();
-            assert_eq!(groups.len(), usize::from(!expected.is_empty()), "{cmd}");
+            // Frame-rate contributors share the first parallel batch. Enabling characters
+            // also installs a fixed-step contact chain for actors that acquire a contact rig.
             assert_eq!(
-                groups.into_iter().flatten().collect::<Vec<_>>(),
+                groups.first().map(Vec::as_slice).unwrap_or_default(),
                 expected,
                 "{cmd}"
             );
+            let contact: Vec<_> = groups.iter().skip(1).flatten().copied().collect();
+            if state[2] {
+                let stage = |name| {
+                    groups
+                        .iter()
+                        .position(|batch| batch.contains(&name))
+                        .unwrap()
+                };
+                assert_eq!(contact.len(), 4, "{cmd}");
+                let dynamics = stage("Character momentum and support impulses");
+                assert!(stage("Rotating support drives") < dynamics, "{cmd}");
+                assert!(stage("Locomotion and traversal intent") < dynamics, "{cmd}");
+                assert!(dynamics < stage("Foot placement and fingertip IK"), "{cmd}");
+            } else {
+                assert!(contact.is_empty(), "{cmd}");
+            }
             if cmd == "actor off" {
                 let temp = tempfile::tempdir()?;
                 let path = temp.path().join("confluence.json");

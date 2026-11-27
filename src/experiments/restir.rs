@@ -390,8 +390,9 @@ impl Restir {
     ) -> Result<AddLight<'a>> {
         let backend = cfg.selected_rays(s.ray_caps, s.scene.setting(super::vegetation::SETTING))?;
         let rigid = (backend == Traversal::Software)
-            .then(|| self.shadow.get(&s.scene, surfaces))
-            .transpose()?;
+            .then(|| self.shadow.get(&s.scene, surfaces, cfg.indirect()))
+            .transpose()?
+            .unwrap_or_default();
         Ok(Box::new(move |g, inputs| {
             if s.extent == [1920, 1080]
                 && cfg.rays == RayBackend::Hardware
@@ -416,7 +417,7 @@ impl Restir {
                 }
             }
             let (direct, controls, indirect) =
-                graph::add_light(g, s, self, cfg, backend, inputs, rigid.as_deref())?;
+                graph::add_light(g, s, self, cfg, backend, inputs, rigid)?;
             Ok(Contribution {
                 channel: Channel::Direct,
                 resources: (direct, controls),
@@ -426,6 +427,9 @@ impl Restir {
         }))
     }
 }
+#[cfg(test)]
+mod geometry_assets_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,6 +1,7 @@
 //! Fixed-camera lighting and ray tracing comparisons.
 use crate::experiments::assembly::{Primary, Registration as SceneModule};
 pub(super) const MODULE: SceneModule = SceneModule {
+    root_writers: &[],
     key: SETTING,
     primary: Primary::Exclusive,
     restore: None,
