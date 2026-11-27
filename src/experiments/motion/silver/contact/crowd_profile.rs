@@ -6,163 +6,54 @@ use std::{
 };
 
 fn population(n: usize, pool: &rayon::ThreadPool) -> Result<(Arc<World>, Schedule)> {
-    let mut initial = Arc::new(scene()?);
-    let mut schedule = Schedule::default();
-    install(&initial, &mut schedule)?;
-    let actor = super::actor(&initial).unwrap();
-    let prototype = initial
-        .typed_component::<Contact>(actor, SETTING)?
-        .unwrap()
-        .into_owned();
-    let f = prototype.course.unwrap();
-    let supports = [
-        prototype.floor,
-        prototype.plate,
-        f.landing,
-        f.station,
-        f.ramp,
-        f.service.unwrap(),
-    ];
-    let mut nodes = BTreeSet::new();
-    for (&id, ent) in &initial.entities {
-        let mut at = Some(id);
-        while let Some(k) = at {
-            if k == actor {
-                nodes.insert(id);
-                break;
-            }
-            at = initial.entities[&k].parent;
-        }
-        if ent.skin.is_some() || ent.skin_binding.is_some() {
-            nodes.insert(id);
-        }
-    }
-    nodes.extend(supports);
-    nodes.extend([f.rail, f.gate, prototype.target]);
-    // Stagger up to twenty states sampled from the real course, including vault and duck.
-    let prototype_parts = initial
-        .entities
-        .values()
-        .filter(|e| e.instance.is_some() && e.skin_binding.is_some())
-        .count();
-    let phases = n.min(20);
-    let mut seeds = vec![initial.clone()];
-    for _ in 1..phases {
-        for _ in 0..24 {
-            schedule.tick(&mut initial, 1. / 60., pool)?;
-        }
-        seeds.push(initial.clone());
-    }
-    let mut w = (*seeds[0]).clone();
-    // Offset the rendered lanes in world space. Each collider and actor simulate in the same lane-local frame.
-    let cols = (n as f32 * 1.8).sqrt().ceil() as usize;
-    let rows = n.div_ceil(cols);
-    for i in 0..n {
-        let seed = &seeds[i % phases];
-        let mut ids = BTreeMap::new();
-        for &k in &nodes {
-            let dst = if i == 0 {
-                k
-            } else {
-                w.spawn(Entity::default())
-            };
-            ids.insert(k, dst);
-        }
-        let map = |id| ids[&id];
-        let shift = Vec3::new(
-            2.7 * ((i % cols) as f32 - (cols - 1) as f32 * 0.5),
-            0.,
-            9.8 * ((i / cols) as f32 - (rows - 1) as f32 * 0.5),
-        );
-        let lane = w.spawn(Entity {
-            local: Mat4::from_translation(shift),
-            ..Default::default()
-        });
-        for &k in &nodes {
-            let mut row = seed.entities[&k].clone();
-            row.parent = Some(
-                row.parent
-                    .map_or(lane, |v| ids.get(&v).copied().unwrap_or(v)),
-            );
-            if let Some(s) = &mut row.skin {
-                for j in &mut s.joints {
-                    *j = map(*j);
-                }
-            }
-            row.skin_binding = row.skin_binding.map(map);
-            // Other lanes share asset data and carry independent, invisible collision fixtures.
-            if i != 0 && (supports.contains(&k) || [f.rail, f.gate, prototype.target].contains(&k))
-            {
-                row.instance = None;
-            }
-            w.entities.insert(map(k), row);
-        }
-        let mut p = player(seed, actor)?.into_owned();
-        p.bones.iter_mut().for_each(|b| *b = map(*b));
-        let mut c = seed
-            .typed_component::<Contact>(actor, SETTING)?
-            .unwrap()
-            .into_owned();
-        let mut b = seed
-            .typed_component::<dynamics::Body>(actor, dynamics::BODY)?
-            .unwrap()
-            .into_owned();
-        b.remap_supports(map);
-        c.finger.iter_mut().for_each(|m| m.joint = map(m.joint));
-        let spring = seed
-            .typed_component::<dynamics::Spring>(prototype.plate, dynamics::SPRING)?
-            .unwrap()
-            .into_owned();
-        w.set_typed_component(map(prototype.plate), dynamics::SPRING, spring);
-        for foot in &mut c.feet {
-            foot.anchor = foot.anchor.map(|(k, p)| (map(k), p));
-        }
-        c.floor = map(c.floor);
-        c.plate = map(c.plate);
-        c.target = map(c.target);
-        c.course = Some(course::Fixtures {
-            landing: map(f.landing),
-            station: map(f.station),
-            ramp: map(f.ramp),
-            service: f.service.map(map),
-            rail: map(f.rail),
-            gate: map(f.gate),
-        });
-        if let Some(binding) = &mut c.source_binding {
-            let binding = Arc::make_mut(binding);
-            binding.bones.clone_from(&p.bones);
-            for (joint, parent) in &mut binding.hierarchy {
-                *joint = map(*joint);
-                *parent = w.entities[joint].parent;
-            }
-            binding.finger.clone_from(&c.finger);
-            (binding.floor, binding.plate, binding.target, binding.course) =
-                (c.floor, c.plate, c.target, c.course);
-        }
-        w.set_typed_component(map(actor), PLAYER, p);
-        w.set_typed_component(map(actor), SETTING, c);
-        w.set_typed_component(map(actor), dynamics::BODY, b);
-    }
-    w.validate()?;
-    let skinned = w
-        .entities
-        .values()
-        .filter(|e| e.instance.is_some() && e.skin_binding.is_some())
-        .count();
-    eprintln!(
-        "population={n}, skinned instances={skinned}, entities={}, players={}",
-        w.entities.len(),
-        w.entities.component_owners(PLAYER).len()
-    );
-    anyhow::ensure!(
-        prototype_parts > 0
-            && skinned == prototype_parts * n
-            && w.entities.component_owners(PLAYER).len() == n
-            && w.entities.component_owners(dynamics::BODY).len() == n
-    );
+    let w = population::populated_world(n, pool, false)?;
     let mut schedule = Schedule::default();
     install(&w, &mut schedule)?;
     Ok((Arc::new(w), schedule))
+}
+
+#[test]
+fn movement_intent_selects_one_character_and_releases_the_previous_owner() -> Result<()> {
+    use crate::engine::{MoveIntent, MovementControls};
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build()?;
+    let mut w = duo_scene()?;
+    let mut schedule = Schedule::default();
+    install(&w, &mut schedule)?;
+    let mut running = Arc::new(w);
+    schedule.tick(&mut running, 1. / 30., &pool)?;
+    w = Arc::try_unwrap(running).ok().unwrap();
+    let ids: [Id; 2] = w.entities.component_owners(PLAYER).try_into().unwrap();
+    let mut controls = MovementControls::new(Some(super::super::MOVEMENT));
+    assert_eq!(controls.target(&w), Some(ids[0]));
+    controls.apply(
+        &mut w,
+        ids[0],
+        MoveIntent {
+            side: 0,
+            forward: 1,
+        },
+    )?;
+    controls.select(&mut w, ids[1])?;
+    controls.apply(
+        &mut w,
+        ids[1],
+        MoveIntent {
+            side: 1,
+            forward: 0,
+        },
+    )?;
+    assert_eq!(controls.target(&w), Some(ids[1]));
+    assert_eq!(player(&w, ids[0])?.target_velocity(), Vec2::ZERO);
+    assert_eq!(player(&w, ids[1])?.target_velocity(), Vec2::new(1.2, 0.));
+    assert!(controls.select(&mut w, Id::MAX).is_err());
+    w.entities.remove(&ids[1]);
+    assert!(controls.target(&w).is_none());
+    assert!(
+        controls
+            .apply(&mut w, ids[1], MoveIntent::default())
+            .is_err()
+    );
+    Ok(())
 }
 
 #[test]
@@ -176,12 +67,8 @@ fn shared_platform_reduces_occupants_once_and_keeps_skeletons_independent() -> R
         .typed_component::<Contact>(ids[0], SETTING)?
         .unwrap()
         .into_owned();
-    let children = rig::children(&w);
-    let alternate = Rig::bind(&w, ids[1], &children)?;
-    let fingertip = alternate.ids[alternate.finger];
-    for &joint in &alternate.ids {
-        w.entities.get_mut(&joint).unwrap().name = format!("alternative rig joint {joint}");
-    }
+    let (spacer, marker) = population::alternate_rig(&mut w, ids[1])?;
+    let fingertip = marker.joint;
     // Both occupants stand on one spring in the same simulation coordinate system.
     w.entities.get_mut(&ids[1]).unwrap().parent = w.entities[&ids[0]].parent;
     fixture.course = None;
@@ -237,6 +124,7 @@ fn shared_platform_reduces_occupants_once_and_keeps_skeletons_independent() -> R
         let b = Rig::bind(&w, ids[1], &children)?;
         assert!(a.ids.iter().all(|id| !b.ids.contains(id)));
         assert_eq!(b.ids[b.finger], fingertip);
+        assert!(b.ids.contains(&spacer) && b.ids.len() == a.ids.len() + 1);
         [a.ids, b.ids].concat()
     };
     let mut w = Arc::new(w);
@@ -318,6 +206,7 @@ fn silver_crowd_extraction_profile() -> Result<()> {
     let mut extractor = SceneExtractor::default();
     let mut times = Vec::new();
     let mut sim_times = Vec::new();
+    let mut pose_counts = [0usize; 3];
     for frame in 0..116 {
         let tick = Instant::now();
         schedule.tick(&mut world, 0.1, &pool)?;
@@ -340,12 +229,24 @@ fn silver_crowd_extraction_profile() -> Result<()> {
                     assert_eq!((a.id, a.model, &a.palette), (b.id, b.model, &b.palette));
                 }
             }
+            let stats = view.scene.stats;
+            for (sum, n) in pose_counts.iter_mut().zip([
+                stats.pose_blocks_read,
+                stats.pose_locals_read,
+                stats.palette_joints_examined,
+            ]) {
+                *sum += n;
+            }
             times.push(ms);
             sim_times.push(sim_ms);
         }
     }
     times.sort_by(f64::total_cmp);
     sim_times.sort_by(f64::total_cmp);
+    let [blocks, locals, examined] = pose_counts.map(|n| n as f64 / 96.);
+    println!(
+        "per sampled frame: {blocks:.1} pose blocks, {locals:.1} dirty joint locals, {examined:.1} palette joints examined"
+    );
     println!(
         "NPCs {count}; 96 frames, 6 fixed substeps; simulation P50/P95 {:.2}/{:.2} ms, extraction P50/P95 {:.2}/{:.2} ms",
         sim_times[48], sim_times[90], times[48], times[90]
@@ -433,6 +334,15 @@ fn silver_crowd_window_profile() -> Result<()> {
                     "lost or reordered completed snapshot"
                 );
                 if observed == 21 {
+                    println!(
+                        "pose: {} blocks, {} dirty locals, {} palette joints examined, {} dynamic upload bytes, {} scene table upload bytes, {} skin pose upload bytes",
+                        p.pose_blocks_read,
+                        p.pose_locals_read,
+                        p.palette_joints_examined,
+                        p.dynamic_upload_bytes,
+                        p.scene_table_upload_bytes,
+                        p.skin_pose_upload_bytes
+                    );
                     println!(
                         "frame: {} passes, {} animation passes, {} recording chunks, {} queue submits, {} bound-device bytes",
                         frame.passes.len(),
@@ -627,3 +537,6 @@ fn verify_character_coverage(engine: Engine, count: usize) -> Result<()> {
     );
     Ok(())
 }
+
+#[path = "crowd_draw_test.rs"]
+mod crowd_draw_test;

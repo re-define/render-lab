@@ -8,8 +8,8 @@ use std::{
     sync::Arc,
 };
 mod changes;
-pub(crate) use changes::{Cursor as ChangeCursor, Write as EntityWrite};
-pub use changes::{Entities, LocalPose};
+pub(crate) use changes::{Cursor as ChangeCursor, PublishedPose, Write as EntityWrite};
+pub use changes::{Entities, LocalPose, PoseLayout};
 mod components;
 mod gi;
 mod light;

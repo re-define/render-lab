@@ -5,9 +5,11 @@ pub(in crate::experiments) const MODULE: SceneModule = SceneModule {
     primary: Primary::Simulation,
     restore: Some(hydrate),
     install: |world, a| {
-        if crate::experiments::composition::enabled(world, "actor")
-            && world.first_raw_component(contact::SETTING).is_none()
-        {
+        if !crate::experiments::composition::enabled(world, "actor") {
+            return Ok(());
+        }
+        a.movement = Some(MOVEMENT);
+        if world.first_raw_component(contact::SETTING).is_none() {
             a.schedule
                 .add_system(std::sync::Arc::new(SilverMatcher::load()?));
         }
@@ -21,6 +23,16 @@ mod search;
 mod trajectory_view;
 use crate::experiments::cartoon;
 pub(in crate::experiments) use trajectory_view::OVERLAY;
+pub(super) const MOVEMENT: crate::engine::MovementDriver = crate::engine::MovementDriver {
+    component: PLAYER,
+    camera_follows: |world, id| {
+        !world.entities[&id]
+            .components
+            .contains_key(contact::SETTING)
+    },
+    active: |world, id| Ok(player(world, id)?.move_root),
+    apply: |world, id, intent| set_actor_goal(world, id, intent.side, intent.forward),
+};
 pub const PLAYER: &str = "lab.silver_wolf.motion";
 const INDEX: &str = include_str!("../../../assets/motion/bank.json");
 const DATA: &[u8] = include_bytes!("../../../assets/motion/poses.bin");
@@ -45,6 +57,8 @@ struct State {
     #[serde(default)]
     evaluated: usize,
     bones: Vec<Id>,
+    #[serde(skip)]
+    layout: Option<crate::scene::PoseLayout>,
     hip_origin: Vec3,
     speed: f32,
     turn: f32,
@@ -126,10 +140,16 @@ pub struct Status {
 }
 
 pub fn status(world: &World) -> Result<Option<Status>> {
-    let Some(id) = actor(world) else {
+    status_for(world, actor(world))
+}
+
+pub fn status_for(world: &World, id: Option<Id>) -> Result<Option<Status>> {
+    let Some(id) = id else {
         return Ok(None);
     };
-    let state = player(world, id)?;
+    let Some(state) = world.typed_component::<State>(id, PLAYER)? else {
+        return Ok(None);
+    };
     Ok(Some(Status {
         clip: state.clip.clone(),
         sample: state.sample,
@@ -275,7 +295,14 @@ impl SilverMatcher {
         let (root, joints) = self.sample_pose(p, root, dt, |_, id| {
             cx.local(id)?.context("missing motion joint")
         })?;
-        cx.set_pose(std::iter::once((id, root)).chain(p.bones.iter().copied().zip(joints)))
+        if p.layout
+            .as_ref()
+            .is_none_or(|layout| layout.joints() != p.bones)
+        {
+            p.layout = Some(crate::scene::PoseLayout::new(p.bones.iter().copied())?);
+        }
+        cx.set_pose([(id, root)])?;
+        cx.publish_pose(id, p.layout.as_ref().unwrap().clone(), joints)
     }
 
     /// The caller owns the previous base pose. Contact corrections must not feed into inertialization.
@@ -460,6 +487,9 @@ pub fn set_goal(w: &mut World, speed: f32, turn: f32, side: f32) -> Result<()> {
 }
 pub fn set_keyboard_goal(w: &mut World, side: i8, forward: i8) -> Result<()> {
     let id = actor(w).context("no Silver Wolf motion player")?;
+    set_actor_goal(w, id, side, forward)
+}
+fn set_actor_goal(w: &mut World, id: Id, side: i8, forward: i8) -> Result<()> {
     let mut p = player(w, id)?.into_owned();
     if forward > 0 && side != 0 {
         p.speed = 1.35;
@@ -527,6 +557,7 @@ pub fn scene() -> Result<World> {
         mode: Default::default(),
         evaluated: 0,
         bones,
+        layout: None,
         hip_origin,
         speed: 0.,
         turn: 0.,
@@ -828,6 +859,7 @@ mod tests {
             mode: Default::default(),
             evaluated: 0,
             bones: vec![],
+            layout: None,
             hip_origin: Vec3::ZERO,
             speed: 0.,
             turn: 0.,

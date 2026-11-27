@@ -4,6 +4,7 @@ mod course;
 mod crowd_profile;
 mod dynamics;
 mod events;
+mod population;
 mod rig;
 mod stage;
 #[cfg(test)]
@@ -48,6 +49,7 @@ fn hydrate_contact(w: &mut World) -> Result<()> {
     w.hydrate_components::<Contact>(SETTING)?;
     w.hydrate_components::<dynamics::Body>(dynamics::BODY)?;
     w.hydrate_components::<dynamics::Spring>(dynamics::SPRING)?;
+    w.hydrate_components::<f32>(dynamics::TURNTABLE)?;
     for actor in w.entities.component_owners(SETTING).to_vec() {
         let mut c = w
             .typed_component::<Contact>(actor, SETTING)?
@@ -179,19 +181,29 @@ struct Stage {
     target: Id,
 }
 
+/// Character motion, contacts and pose feedback advance on this clock. Additional
+/// gameplay systems can order themselves relative to these producers by system key.
+pub fn character_clock() -> crate::engine::FixedDomain {
+    crate::engine::FixedDomain {
+        name: "character",
+        step: Duration::from_secs_f64(1. / 60.),
+        max_steps: 8,
+    }
+}
+
+type Actors = BTreeMap<Id, Arc<Stage>>;
+type CharacterSystems = crate::engine::BoundSystems<Actors>;
+
 fn install(w: &World, schedule: &mut Schedule) -> Result<()> {
-    let bank = Arc::new(SilverMatcher::load()?);
-    schedule.fixed_stage_for_component(Duration::from_secs_f64(1. / 60.), 8, w, SETTING, move |w| {
+    let mut systems = CharacterSystems::default();
+    stage::register_motion(&mut systems, Arc::new(SilverMatcher::load()?));
+    dynamics::register(&mut systems, schedule)?;
+    stage::register_ik(&mut systems);
+    systems.install(schedule, character_clock(), w, SETTING, |w| {
         let children = rig::children(w);
         let mut actors = BTreeMap::new();
-        let mut platforms = BTreeMap::<Id, Vec<Arc<Stage>>>::new();
         for &actor in w.entities.component_owners(SETTING) {
-            let stage = Arc::new(bind_actor(w, actor, &children)?);
-            platforms
-                .entry(stage.plate)
-                .or_default()
-                .push(stage.clone());
-            actors.insert(actor, stage);
+            actors.insert(actor, Arc::new(bind_actor(w, actor, &children)?));
         }
         let bindings: Vec<_> = actors
             .values()
@@ -209,17 +221,7 @@ fn install(w: &World, schedule: &mut Schedule) -> Result<()> {
             }
             Ok(true)
         };
-        Ok((
-            vec![
-                Arc::new(stage::Prepare {
-                    actors: actors.clone(),
-                    bank: bank.clone(),
-                }),
-                Arc::new(dynamics::Integrate(platforms.into_values().collect())),
-                Arc::new(stage::Feedback(actors.into_values().collect())),
-            ],
-            Box::new(current),
-        ))
+        Ok((actors, Box::new(current)))
     })
 }
 
@@ -291,6 +293,16 @@ fn bind_actor(w: &World, actor: Id, children: &BTreeMap<Id, Vec<Id>>) -> Result<
     })
 }
 
+/// Both lanes use Silver Wolf geometry. The second rig has a longer wrist chain and explicit fingertip.
+pub fn duo_scene() -> Result<World> {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build()?;
+    let mut world = population::populated_world(2, &pool, true)?;
+    let second = world.entities.component_owners(PLAYER)[1];
+    population::alternate_rig(&mut world, second)?;
+    world.validate()?;
+    Ok(world)
+}
+
 pub fn scene() -> Result<World> {
     let mut w = super::scene()?;
     let actor = actor(&w).context("missing Silver Wolf")?;
@@ -343,14 +355,15 @@ fn target_point(model: Mat4) -> Vec3 {
 }
 
 pub fn command(engine: &mut Engine, arg: &str) -> Result<String> {
-    let (id, _) = engine
-        .world
-        .first_raw_component(SETTING)
+    let id = engine
+        .movement
+        .target(&engine.world)
+        .or_else(|| engine.world.first_raw_component(SETTING).map(|(id, _)| id))
         .context("open the silver-contact experiment first")?;
     let mut c = engine
         .world
         .typed_component::<Contact>(id, SETTING)?
-        .unwrap()
+        .context("selected entity has no contact controller")?
         .into_owned();
     match arg.split_whitespace().collect::<Vec<_>>().as_slice() {
         [] | ["status"] => {
@@ -409,10 +422,24 @@ pub fn command(engine: &mut Engine, arg: &str) -> Result<String> {
             Arc::make_mut(&mut engine.world).set_typed_component(id, dynamics::BODY, b);
             return Ok(format!("Contact {arg}"));
         }
+        ["spin", speed] => {
+            let rate = speed.parse::<f32>()?.to_radians();
+            ensure!(
+                rate.is_finite()
+                    && rate.abs() * character_clock().step.as_secs_f32() < std::f32::consts::PI,
+                "invalid turntable speed"
+            );
+            Arc::make_mut(&mut engine.world).set_typed_component(
+                c.floor,
+                dynamics::TURNTABLE,
+                rate,
+            );
+            return Ok(format!("Launch deck spinning at {speed} degrees/s"));
+        }
         ["auto"] => c.auto_walk = true,
         ["manual"] => {
             c.auto_walk = false;
-            set_keyboard_goal(Arc::make_mut(&mut engine.world), 0, 0)?;
+            set_actor_goal(Arc::make_mut(&mut engine.world), id, 0, 0)?;
         }
         ["hand", v @ ("on" | "off")] => c.hand_ik = *v == "on",
         ["feet", v @ ("on" | "off")] => c.foot_ik = *v == "on",
@@ -457,7 +484,7 @@ pub fn command(engine: &mut Engine, arg: &str) -> Result<String> {
             return Ok(format!("Contact {arg}"));
         }
         _ => anyhow::bail!(
-            "contact status/physics/auto/manual · gravity M/S² · impulse N·s · action jump/vault/duck · hand on/off · feet on/off · target X Y Z · view wide/jump/vault/duck/finish/hand"
+            "contact status/physics/auto/manual · spin DEG/S · gravity M/S² · impulse N·s · action jump/vault/duck · hand on/off · feet on/off · target X Y Z · view wide/jump/vault/duck/finish/hand"
         ),
     }
     Arc::make_mut(&mut engine.world).set_typed_component(id, SETTING, c);

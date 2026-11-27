@@ -158,6 +158,9 @@ mod tests {
         };
         let first = g.pass("write A", write(a));
         let second = g.pass("write B", write(b));
+        // The probe observes both producers even when its display output is constant.
+        g.mark_external_effect(first)?;
+        g.mark_external_effect(second)?;
         g.passes[second].queue = second_queue;
         if order {
             g.passes[second].after.push(first);
@@ -174,6 +177,7 @@ mod tests {
                     groups: [1; 3],
                 },
             );
+            g.mark_external_effect(read)?;
             g.passes[read].after.push(second);
         }
         let output = g.input("output", vec![0; 16]);

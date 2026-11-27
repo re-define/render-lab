@@ -123,8 +123,9 @@ impl PosedSurface<'_> {
         t: &mut Targets,
         s: &Snapshot,
         material: SurfaceInstance,
+        draws: &mut OrdinaryDrawList,
     ) -> Result<SurfaceBuffers> {
-        self.geometry.draw(g, t, s, self.instance, material)
+        self.geometry.draw(g, t, s, self.instance, material, draws)
     }
 }
 
@@ -209,11 +210,12 @@ impl VisibilityRenderer {
         include: impl Fn(&RenderInstance) -> bool + Sync,
     ) -> Result<()> {
         g.products.instance_visits += s.scene.instances.len();
+        let mut draws = OrdinaryDrawList::default();
         for surface in self.posed_surfaces(s, include)? {
             let material = t.material(s, surface.instance, Mat4::IDENTITY)?;
-            surface.draw(g, t, s, material)?;
+            surface.draw(g, t, s, material, &mut draws)?;
         }
-        Ok(())
+        draws.emit(g, t, s)
     }
 }
 
@@ -319,6 +321,7 @@ impl SurfaceGeometry<'_> {
         s: &Snapshot,
         instance: &RenderInstance,
         mut material: SurfaceInstance,
+        draws: &mut OrdinaryDrawList,
     ) -> Result<SurfaceBuffers> {
         let inputs = *t
             .meshes
@@ -399,7 +402,12 @@ impl SurfaceGeometry<'_> {
                     .map_or(0, |m| s.scene.routes.material_slots[&m] as u32),
             ));
         }
-        raster_plain(g, t, s, &surface, item);
+        draws.push(
+            surface,
+            item,
+            s.scene.meshes[&self.mesh_id].ordinary_draw_template(),
+            self.palette.is_some(),
+        );
         Ok(surface)
     }
 

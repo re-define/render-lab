@@ -9,6 +9,30 @@ pub(super) struct TransformCache {
     pub rows: Vec<Transform>,
     revision: u64,
 }
+/// Most joints feed exactly one skin. Keep that common reverse edge inline.
+#[derive(Default)]
+pub(super) enum SkinUsers {
+    #[default]
+    None,
+    One((usize, usize)),
+    Several(Vec<(usize, usize)>),
+}
+impl SkinUsers {
+    pub fn add(&mut self, next: (usize, usize)) {
+        match self {
+            Self::None => *self = Self::One(next),
+            Self::One(first) => *self = Self::Several(vec![*first, next]),
+            Self::Several(users) => users.push(next),
+        }
+    }
+    pub fn entries(&self) -> &[(usize, usize)] {
+        match self {
+            Self::None => &[],
+            Self::One(user) => std::slice::from_ref(user),
+            Self::Several(users) => users,
+        }
+    }
+}
 pub(super) struct Transform {
     pub id: Id,
     pub parent: Option<Id>,
@@ -18,7 +42,7 @@ pub(super) struct Transform {
     pub world: Mat4,
     pub version: u64,
     pub instance: Option<usize>,
-    pub skins: Vec<Id>,
+    pub skins: SkinUsers,
     pub light: bool,
 }
 impl TransformCache {
@@ -74,7 +98,7 @@ impl TransformCache {
                 world: model,
                 version,
                 instance: None,
-                skins: Vec::new(),
+                skins: SkinUsers::None,
                 light: false,
             });
             if let Some(descendants) = children.get(&id) {

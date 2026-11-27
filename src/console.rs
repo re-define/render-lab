@@ -22,8 +22,8 @@ const HELP: &str = concat!(
     " · post view motion/reprojection/off · stats · schedule · memory idle/alloc/driver [NAME or #OWNER]",
     " · light list/point/sun/move/aim/power/color/enable/angular-radius · import/save/load PATH · lod PIXELS",
     " · lodview on/off · vegetation auto/triangles/voxels/pixels/wind/time/view/camera",
-    " · motion SPEED TURN [STRAFE] · motionsearch kd/scan · record PATH · stoprecord",
-    " · contact status/physics/auto/manual/target/hand/feet/view/action · contact gravity G · contact impulse J",
+    " · control [ENTITY] · motion SPEED TURN [STRAFE] · motionsearch kd/scan · record PATH · stoprecord",
+    " · contact status/physics/auto/manual/target/hand/feet/view/action · contact gravity G · contact impulse J · contact spin DEG/S",
     " · toon outline/width/light/threshold/sdf/view · texture neural/original/stats",
     " · gaussian tile/bvh/compact-tile/compact-bvh/scan/original/stats",
     " · gi off/ssgi/probes/ray/view/camera · shadow hard/pcf/pcss/ray/size/bias/view/camera",
@@ -68,6 +68,18 @@ impl Console {
                 return Ok(format!("GPU timeline saved to {arg}"));
             }
             "memory" => return memory::describe(engine.last_memory().as_ref(), arg),
+            "control" => {
+                if !arg.is_empty() {
+                    engine
+                        .movement
+                        .select(Arc::make_mut(&mut engine.world), arg.parse()?)?;
+                }
+                return Ok(format!(
+                    "Controlled entity: {:?}. Available: {:?}",
+                    engine.movement.target(&engine.world),
+                    engine.movement.candidates(&engine.world)
+                ));
+            }
             "contact" => return motion::silver::contact::command(engine, arg),
             "schedule" => {
                 ensure!(arg.is_empty(), "schedule takes no arguments");
@@ -80,10 +92,12 @@ impl Console {
             }
             "stoprecord" => {
                 engine.capture_viewport = false;
-                self.recording
-                    .take()
-                    .context("no recording is running")?
-                    .finish()?;
+                let recording = self.recording.take().context("no recording is running")?;
+                let dropped = recording.dropped();
+                recording.finish()?;
+                return Ok(format!(
+                    "Recording saved. Encoder queue dropped {dropped} samples."
+                ));
             }
             "fit" => {
                 engine.camera = Camera::fit(&engine.world)?;

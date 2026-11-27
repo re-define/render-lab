@@ -331,6 +331,85 @@ fn reverse_registration_orders_physics_before_animation_in_each_substep() -> Res
 }
 
 #[test]
+fn named_domain_interleaves_plugins_and_rolls_back_an_entire_failed_step() -> Result<()> {
+    use render_lab::engine::{FixedDomain, SimulationData::Component};
+    let clock = FixedDomain {
+        name: "replay",
+        step: Duration::from_secs_f64(1. / 60.),
+        max_steps: 4,
+    };
+    for workers in [1, 4] {
+        let pool = ThreadPoolBuilder::new().num_threads(workers).build()?;
+        let run = |cadence: &[f32], fail: bool| -> Result<_> {
+            let fail_once = std::sync::atomic::AtomicBool::new(fail);
+            let mut base = World::default();
+            let id = base.spawn(Default::default());
+            let mut world = Arc::new(base);
+            let mut sched = Schedule::default();
+            // Plugins register in reverse dependency order. An adjacent independent clock
+            // keeps its own catch-up limit and is not inserted between these systems.
+            sched.add_fixed_system(
+                clock,
+                task(
+                    "feedback",
+                    &["body"],
+                    &[Component("path")],
+                    &[Component("path")],
+                    move |cx, _| {
+                        let n = cx.component::<u64>(id, "path")?.unwrap();
+                        if fail_once.swap(false, Ordering::Relaxed) {
+                            anyhow::bail!("fault after producer commit")
+                        }
+                        cx.set_component(id, "path", (*n * 10 + 2).into())
+                    },
+                ),
+            )?;
+            sched.fixed_stage(Duration::from_millis(250), 1, Vec::new())?;
+            sched.add_fixed_system(
+                clock,
+                task(
+                    "body",
+                    &[],
+                    &[Component("path")],
+                    &[Component("path")],
+                    move |cx, _| {
+                        let n = cx
+                            .component::<u64>(id, "path")?
+                            .map(|x| *x)
+                            .unwrap_or_default();
+                        cx.set_component(id, "path", (n * 10 + 1).into())
+                    },
+                ),
+            )?;
+            assert!(
+                sched
+                    .add_fixed_system(
+                        FixedDomain {
+                            max_steps: 1,
+                            ..clock
+                        },
+                        Arc::new(Nudge { id: 1, delta: 0. })
+                    )
+                    .is_err()
+            );
+            for &dt in cadence {
+                if sched.tick(&mut world, dt, &pool).is_err() {
+                    assert!(fail && !world.entities[&id].components.contains_key("path"));
+                    sched.tick(&mut world, 0., &pool)?;
+                }
+            }
+            assert_eq!(sched.stages().next().unwrap().1, 2);
+            Ok(world.entities[&id].components["path"].as_u64().unwrap())
+        };
+        for fail in [false, true] {
+            assert_eq!(run(&[1. / 30.], fail)?, 1212);
+            assert_eq!(run(&[1. / 60., 1. / 60.], fail)?, 1212);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn independent_systems_on_different_branches_actually_overlap() -> Result<()> {
     use std::sync::{Condvar, Mutex};
     let both = Arc::new((Mutex::new(0), Condvar::new()));
@@ -810,5 +889,79 @@ fn pose_scope_errors_rollback_the_substep() -> Result<()> {
         }
         assert!(schedule.stages().all(|(_, n)| n == 0));
     }
+    Ok(())
+}
+
+#[test]
+fn immutable_transform_sets_are_built_once_per_system_binding() -> Result<()> {
+    use render_lab::engine::{BoundSystems, FixedDomain};
+
+    struct BoundWrite {
+        id: Id,
+        evaluations: Arc<AtomicUsize>,
+    }
+    impl SimulationSystem for BoundWrite {
+        fn access(&self) -> SystemAccess {
+            SystemAccess {
+                name: "bound writer",
+                reads: &[],
+                writes: &[LocalTransformsById],
+            }
+        }
+        fn bound_transforms(&self) -> Option<TransformTargets> {
+            self.evaluations.fetch_add(1, Ordering::Relaxed);
+            Some(TransformTargets {
+                reads: vec![],
+                writes: vec![self.id, self.id],
+            })
+        }
+        fn run(&self, cx: &mut SystemContext, _: f32) -> Result<()> {
+            cx.set_pose([(self.id, Mat4::from_translation(Vec3::Y))])
+        }
+    }
+
+    let evaluated = Arc::new(AtomicUsize::new(0));
+    let mut systems = BoundSystems::default();
+    let counts = evaluated.clone();
+    systems.register(move |&id| BoundWrite {
+        id,
+        evaluations: counts.clone(),
+    });
+    let mut w = World::default();
+    let first = w.spawn(Default::default());
+    let next = w.spawn(Default::default());
+    w.entities
+        .get_mut(&first)
+        .unwrap()
+        .components
+        .insert("bound".into(), true.into());
+    let mut schedule = Schedule::default();
+    let clock = FixedDomain {
+        name: "test-rig",
+        step: Duration::from_millis(125),
+        max_steps: 4,
+    };
+    systems.install(&mut schedule, clock, &w, "bound", |w| {
+        Ok((
+            w.entities.component_owners("bound")[0],
+            Box::new(|_| Ok(true)),
+        ))
+    })?;
+    let mut w = Arc::new(w);
+    let pool = ThreadPoolBuilder::new().num_threads(2).build()?;
+    schedule.bind_transforms(&w)?;
+    schedule.tick(&mut w, 0.5, &pool)?;
+    assert_eq!(evaluated.load(Ordering::Relaxed), 1);
+    assert_eq!(w.entities[&first].local.w_axis.y, 1.);
+    assert_eq!(w.entities[&next].local.w_axis.y, 0.);
+    let rows = &mut Arc::make_mut(&mut w).entities;
+    rows.get_mut(&first).unwrap().components.remove("bound");
+    rows.get_mut(&next)
+        .unwrap()
+        .components
+        .insert("bound".into(), true.into());
+    schedule.tick(&mut w, 0.5, &pool)?;
+    assert_eq!(evaluated.load(Ordering::Relaxed), 2);
+    assert_eq!(w.entities[&next].local.w_axis.y, 1.);
     Ok(())
 }

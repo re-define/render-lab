@@ -16,10 +16,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod movement;
+pub use movement::{MoveIntent, MovementControls, MovementDriver};
 mod schedule;
 pub use schedule::{
-    Edit, Schedule, SimulationData, SimulationSystem, System, SystemAccess, SystemContext,
-    SystemOrder, TransformBindings, TransformTargets,
+    BindingCheck, BoundSystems, Edit, FixedDomain, Schedule, SimulationData, SimulationSystem,
+    System, SystemAccess, SystemContext, SystemOrder, TransformBindings, TransformTargets,
 };
 
 pub type FrameResult = Result<Frame, String>;
@@ -37,7 +39,15 @@ impl Drop for Admission {
         self.0.store(false, Ordering::Release);
     }
 }
+/// Optional readback camera evaluated at the same simulation tick as the main view.
+#[derive(Clone, Copy)]
+pub struct OffscreenView {
+    pub camera: Camera,
+    pub extent: [u32; 2],
+    pub post: post::Settings,
+}
 struct Input {
+    secondary: Option<OffscreenView>,
     admission: Admission,
     stamp: crate::render::FrameStamp,
     main_ms: f64,
@@ -75,6 +85,7 @@ pub struct Engine {
     dlss_unavailable: Option<String>,
     pub ray_caps: crate::rhi::RayCapabilities,
     pub schedule: Schedule,
+    pub movement: MovementControls,
     pub technique: Arc<dyn Technique>,
     pub tasks: Arc<ThreadPool>,
     input: Option<SyncSender<Input>>,
@@ -84,6 +95,7 @@ pub struct Engine {
     snapshot_id: u64,
     skipped: u64,
     latest: Latest,
+    secondary_results: Latest,
     threads: Vec<JoinHandle<()>>,
     extraction: SceneExtractor,
 }
@@ -114,8 +126,10 @@ impl Engine {
                 .build()?,
         );
         let (input, scenes) = mpsc::sync_channel::<Input>(1);
-        let (out, plans) = mpsc::sync_channel::<(FramePlan, Option<isize>)>(1);
+        let (out, plans) = mpsc::sync_channel::<(FramePlan, Option<isize>, bool)>(1);
         let latest = Latest::default();
+        let secondary_results = Latest::default();
+        let secondary_mailbox = secondary_results.clone();
         let generation = Arc::new(AtomicU64::new(0));
         let rhi_generation = generation.clone();
         let pool = tasks.clone();
@@ -141,11 +155,18 @@ impl Engine {
                 {
                     return;
                 }
-                let report = |result: Result<Frame>| {
+                let report = |result: Result<Frame>, secondary: bool| {
                     if result.is_err() {
                         rhi_generation.fetch_add(1, Ordering::AcqRel);
                     }
-                    publish(&mailbox, result.map_err(|e| format!("{e:#}")));
+                    publish(
+                        if secondary {
+                            &secondary_mailbox
+                        } else {
+                            &mailbox
+                        },
+                        result.map_err(|e| format!("{e:#}")),
+                    );
                 };
                 loop {
                     let incoming = if backend.has_pending() {
@@ -154,16 +175,21 @@ impl Engine {
                         plans.recv().map_err(|_| RecvTimeoutError::Disconnected)
                     };
                     match incoming {
-                        Ok((plan, window)) => {
+                        Ok((plan, window, secondary)) => {
                             if window.is_none() {
                                 while let Some(frame) = backend.retire_next() {
-                                    report(frame);
+                                    report(frame, false);
                                 }
                             }
+                            backend.select_view(secondary, plan.stamp.has_secondary);
                             let id = plan.stamp.snapshot_id;
                             if plan.stamp.generation != rhi_generation.load(Ordering::Acquire) {
                                 publish(
-                                    &mailbox,
+                                    if secondary {
+                                        &secondary_mailbox
+                                    } else {
+                                        &mailbox
+                                    },
                                     Err(format!(
                                         "skipped snapshot {id} after RHI history invalidation"
                                     )),
@@ -175,72 +201,102 @@ impl Engine {
                                 None => backend.execute(plan, &pool).map(Some),
                             };
                             match result {
-                                Ok(Some(frame)) => report(Ok(frame)),
+                                Ok(Some(frame)) => report(Ok(frame), secondary),
                                 Ok(None) => (),
-                                Err(error) => report(Err(error.context(format!("snapshot {id}")))),
+                                Err(error) => {
+                                    report(Err(error.context(format!("snapshot {id}"))), secondary)
+                                }
                             }
                         }
                         Err(RecvTimeoutError::Timeout) => {
                             if let Some(frame) = backend.retire_ready() {
-                                report(frame);
+                                report(frame, false);
                             }
                         }
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
                 }
                 while let Some(frame) = backend.retire_next() {
-                    report(frame);
+                    report(frame, false);
                 }
             })?;
         let (dlss_unavailable, buffer_atomic64, ray_caps) =
             startup.recv()?.map_err(|e| anyhow!(e))?;
         let pool = tasks.clone();
         let mailbox = latest.clone();
+        let secondary_mailbox = secondary_results.clone();
         let render = thread::Builder::new()
             .name("lab-render".into())
             .spawn(move || {
-                let mut temporal = post::Sequence::default();
+                let mut sequences = [post::Sequence::default(), post::Sequence::default()];
                 let mut previous_generation = 0;
                 for mut frame in scenes {
                     drop(frame.admission);
                     let epoch = generation.load(Ordering::Acquire);
                     if epoch != previous_generation {
-                        temporal.discard();
+                        for sequence in &mut sequences {
+                            sequence.discard();
+                        }
                         previous_generation = epoch;
                     }
                     frame.stamp.generation = epoch;
                     frame.stamp.render_dequeued = Some(Instant::now());
                     frame.snapshot.buffer_atomic64 = buffer_atomic64;
                     frame.snapshot.ray_caps = ray_caps;
-                    temporal.assign(frame.post, &frame.technique, &mut frame.snapshot);
-                    match pool.install(|| {
-                        let started = std::time::Instant::now();
-                        frame.technique.build(&frame.snapshot).and_then(|mut g| {
-                            if frame.window.is_some() {
-                                let output = g.present()?;
+                    let secondary = frame.secondary.map(|view| {
+                        (
+                            frame.snapshot.for_camera(view.camera, view.extent),
+                            view.post,
+                        )
+                    });
+                    if secondary.is_none() {
+                        sequences[1].discard();
+                    }
+                    let views = std::iter::once((frame.snapshot, frame.post)).chain(secondary);
+                    for (index, (mut snapshot, settings)) in views.enumerate() {
+                        let secondary = index == 1;
+                        let window = frame.window.filter(|_| !secondary);
+                        let temporal = &mut sequences[index];
+                        temporal.assign(settings, &frame.technique, &mut snapshot);
+                        let result = pool.install(|| {
+                            let started = Instant::now();
+                            let mut graph = frame.technique.build(&snapshot)?;
+                            if window.is_some() {
+                                let output = graph.present()?;
                                 if frame.readback {
-                                    g.pass("Capture recording", crate::rdg::Op::HostRead(output));
+                                    graph.pass(
+                                        "Capture recording",
+                                        crate::rdg::Op::HostRead(output),
+                                    );
                                 }
                             }
                             let build_ms = started.elapsed().as_secs_f64() * 1000.;
-                            let mut p = g.compile()?;
-                            frame.stamp.plan_ready = Some(Instant::now());
-                            p.stamp = frame.stamp;
-                            p.build_ms = build_ms;
-                            p.main_ms = frame.main_ms;
-                            p.extract_ms = frame.extract_ms;
-                            p.extraction = frame.snapshot.scene.stats;
-                            Ok(p)
-                        })
-                    }) {
-                        Ok(p) => {
-                            if out.send((p, frame.window)).is_err() {
-                                break;
+                            let mut plan = graph.compile()?;
+                            plan.stamp = frame.stamp;
+                            plan.stamp.plan_ready = Some(Instant::now());
+                            plan.build_ms = build_ms;
+                            plan.main_ms = frame.main_ms;
+                            plan.extract_ms = if secondary { 0. } else { frame.extract_ms };
+                            plan.extraction = snapshot.scene.stats;
+                            Ok::<_, anyhow::Error>(plan)
+                        });
+                        match result {
+                            Ok(plan) => {
+                                if out.send((plan, window, secondary)).is_err() {
+                                    return;
+                                }
                             }
-                        }
-                        Err(e) => {
-                            temporal.discard();
-                            publish(&mailbox, Err(format!("{e:#}")));
+                            Err(error) => {
+                                temporal.discard();
+                                publish(
+                                    if secondary {
+                                        &secondary_mailbox
+                                    } else {
+                                        &mailbox
+                                    },
+                                    Err(format!("{error:#}")),
+                                );
+                            }
                         }
                     }
                 }
@@ -255,6 +311,7 @@ impl Engine {
             dlss_unavailable,
             ray_caps,
             schedule: Schedule::default(),
+            movement: Default::default(),
             technique,
             tasks,
             input: Some(input),
@@ -264,6 +321,7 @@ impl Engine {
             snapshot_id: 0,
             skipped: 0,
             latest,
+            secondary_results,
             threads: vec![render, rhi],
             extraction: SceneExtractor::default(),
         })
@@ -282,13 +340,33 @@ impl Engine {
         Ok(())
     }
     pub fn tick(&mut self, dt: f32, extent: [u32; 2]) -> Result<bool> {
+        self.tick_with_view(dt, extent, None)
+    }
+    pub fn tick_with_view(
+        &mut self,
+        dt: f32,
+        extent: [u32; 2],
+        secondary: Option<OffscreenView>,
+    ) -> Result<bool> {
+        if let Some(view) = secondary {
+            anyhow::ensure!(
+                view.extent.iter().all(|&x| x > 0),
+                "invalid secondary view extent"
+            );
+            anyhow::ensure!(
+                !view.post.mode().uses_ngx(),
+                "the secondary view supports off and TAA; NGX uses the primary viewport feature"
+            );
+        }
         let started = std::time::Instant::now();
         self.schedule.tick(&mut self.world, dt, &self.tasks)?;
         self.tick_id += 1;
-        let pending_reports = {
-            let mailbox = self.latest.lock().unwrap();
+        let full = |mailbox: &Latest| {
+            let mailbox = mailbox.lock().unwrap();
             mailbox.ordered && mailbox.results.len() >= 2
         };
+        let pending_reports =
+            full(&self.latest) || (secondary.is_some() && full(&self.secondary_results));
         let Some(admission) = (!pending_reports)
             .then(|| Admission::reserve(&self.admission))
             .flatten()
@@ -302,12 +380,14 @@ impl Engine {
                 .snapshot(&self.world, self.camera, extent, self.materials.clone())?;
         self.snapshot_id += 1;
         let frame = Input {
+            secondary,
             admission,
             stamp: crate::render::FrameStamp {
                 origin: Some(self.origin),
                 tick_id: self.tick_id,
                 snapshot_id: self.snapshot_id,
                 skipped_ticks: self.skipped,
+                has_secondary: secondary.is_some(),
                 tick_started: Some(started),
                 snapshot_ready: Some(Instant::now()),
                 ..Default::default()
@@ -335,16 +415,21 @@ impl Engine {
     /// Enable before driving a benchmark. Render admission applies backpressure when the
     /// ordered reader falls behind; simulation continues advancing on each tick.
     pub fn set_ordered_completions(&mut self, ordered: bool) {
-        let mut mailbox = self.latest.lock().unwrap();
-        mailbox.ordered = ordered;
-        if !ordered {
-            let latest = mailbox.results.pop_back();
-            mailbox.results.clear();
-            mailbox.results.extend(latest);
+        for mailbox in [&self.latest, &self.secondary_results] {
+            let mut mailbox = mailbox.lock().unwrap();
+            mailbox.ordered = ordered;
+            if !ordered {
+                let latest = mailbox.results.pop_back();
+                mailbox.results.clear();
+                mailbox.results.extend(latest);
+            }
         }
     }
     pub fn take_frame(&self) -> Option<FrameResult> {
         self.latest.lock().unwrap().results.pop_front()
+    }
+    pub fn take_secondary_frame(&self) -> Option<FrameResult> {
+        self.secondary_results.lock().unwrap().results.pop_front()
     }
     pub fn last_memory(&self) -> Option<crate::rhi::ManagedMemory> {
         self.latest.lock().unwrap().memory.clone()

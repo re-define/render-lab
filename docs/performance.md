@@ -36,6 +36,24 @@ cargo test --locked --release --lib silver_crowd_window_profile -- --ignored --n
 
 第一个命令比较固定六子步中的模拟和场景提取，抽查帧与全量重建的每个实例和调色板核对。第二个在 1080p 隐藏交换链窗口中测量 GPU、各线程阶段和全部相邻完成间隔。两者均可通过 `RENDER_LAB_NPCS` 调整人数。检查交互窗口的逐帧记录可使用 `--benchmark 96`，JSON 中的 `frame_times` 给出 CPU 事件，`passes` 给出最近一帧的队列计时。[基准实现](../src/experiments/motion/silver/contact/crowd_profile.rs) · [窗口统计](../src/ui/benchmark.rs)
 
+## 窗口实时录制
+
+在相同静态默认场景和机位上，分别用下列命令启动一个 GPUI 窗口。第二次运行需要可用的 FFmpeg。窗口基准按完成顺序接收 Vulkan 帧，两次各预热 60 个完成帧，再连续采样 180 个。第二次从窗口启动时就录制，基准输出后等待编码线程收尾。
+
+```powershell
+cargo run --release --locked -- --benchmark 180
+cargo run --release --locked -- --benchmark 180 --command "record target/window-live.mp4"
+```
+
+| RTX 5070，816×559，MAILBOX | 完成间隔中位数 | 完成间隔 P95 | GPU 跨度 P95 | 平均完成频率 | 编码队列丢弃样本 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 关闭录制 | 263.44 ms | 266.10 ms | 2.35 ms | 3.82 帧/秒 | — |
+| 开启录制 | 263.54 ms | 267.22 ms | 2.51 ms | 3.81 帧/秒 | 0 |
+
+此次窗口两次都只交付约 3.8 帧/秒。在该条件下，打开录制后的 P95 增加 1.12 ms。完成间隔包含窗口调度，表中的 GPU 耗时为 GPU 上的工作跨度。高刷新率窗口或更重的场景仍需要单独采样。本次输出的 MP4 可解码，含 1,874 帧、时长 62.47 秒，其中包含预热过程。在 20 秒处解码取得了有效画面。
+
+窗口将完成的像素用非阻塞操作移交给容量为两个样本的通道，通道满时丢弃新样本并计数。独立线程按 30 Hz 输出，捕获间隙延用前一采样画面，所以视频帧数可以大于窗口呈现数。停止命令 `stoprecord` 等待队列排空后报告丢弃数。离线 `--record` 按给定步长推进模拟，编码器对每帧施加背压，适用于逐帧对照和多视图录制。[录制实现](../src/recording.rs) · [窗口采样](../src/ui/benchmark.rs)
+
 ## 历史对照
 
 下列记录止于 `5d780d6`，用于保留上轮 ECS 重构的收益和当时的尾帧退化记录。

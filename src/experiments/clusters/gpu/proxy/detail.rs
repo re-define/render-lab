@@ -21,6 +21,10 @@ struct Selection {
     layout: Arc<[u8]>,
     blocks: Vec<Block>,
     spatial_ids: Vec<u32>,
+    cameras: [CameraSelection; 2],
+}
+#[derive(Default)]
+struct CameraSelection {
     eye: Option<Vec3>,
     near: Vec<u32>,
     order: Arc<[u8]>,
@@ -152,44 +156,14 @@ impl Detail {
                 models: s.scene.models.clone(),
                 layout: s.scene.routes.bindings.clone(),
                 blocks,
-                eye: None,
-                near: vec![],
-                order: Arc::from([]),
+                cameras: Default::default(),
             });
         }
-        let c = cache.as_mut().unwrap();
-        let eye = s.camera.eye();
+        let c = cache
+            .as_mut()
+            .unwrap()
+            .for_eye(s.camera.eye(), self.near, s.secondary_view);
         let n = slots.len() as u32;
-        if c.eye != Some(eye) {
-            let mut near = Vec::new();
-            for (block, b) in c.blocks.iter().enumerate() {
-                if eye.clamp(b.low, b.high).distance_squared(eye) > (self.near + 2.).powi(2) {
-                    continue;
-                }
-                for (i, &(pos, radius)) in b.spheres.iter().enumerate() {
-                    let id = (block * 32 + i) as u32;
-                    let margin = if c.near.binary_search(&id).is_ok() {
-                        2.
-                    } else {
-                        0.
-                    };
-                    if eye.distance_squared(pos) <= (self.near + margin + radius).powi(2) {
-                        near.push(id);
-                    }
-                }
-            }
-            if c.near != near {
-                let (mut order, far): (Vec<_>, Vec<_>) = c
-                    .spatial_ids
-                    .iter()
-                    .copied()
-                    .partition(|id| near.binary_search(id).is_ok());
-                order.extend(far);
-                c.order = bytemuck::cast_slice(&order).into();
-                c.near = near;
-            }
-            c.eye = Some(eye);
-        }
         let k = c.near.len() as u32;
         if k == 0 || self.triangles.is_empty() {
             return vec![Batch::coarse(coarse, first, n)];
@@ -209,5 +183,89 @@ impl Detail {
             });
         }
         batches
+    }
+}
+
+impl Selection {
+    fn for_eye(&mut self, eye: Vec3, threshold: f32, secondary: bool) -> &CameraSelection {
+        let camera = &mut self.cameras[usize::from(secondary)];
+        if camera.eye != Some(eye) {
+            let mut near = Vec::new();
+            for (block, b) in self.blocks.iter().enumerate() {
+                if eye.clamp(b.low, b.high).distance_squared(eye) > (threshold + 2.).powi(2) {
+                    continue;
+                }
+                for (i, &(pos, radius)) in b.spheres.iter().enumerate() {
+                    let id = (block * 32 + i) as u32;
+                    let margin = if camera.near.binary_search(&id).is_ok() {
+                        2.
+                    } else {
+                        0.
+                    };
+                    if eye.distance_squared(pos) <= (threshold + margin + radius).powi(2) {
+                        near.push(id);
+                    }
+                }
+            }
+            if camera.near != near {
+                let (mut order, far): (Vec<_>, Vec<_>) = self
+                    .spatial_ids
+                    .iter()
+                    .copied()
+                    .partition(|id| near.binary_search(id).is_ok());
+                order.extend(far);
+                camera.order = bytemuck::cast_slice(&order).into();
+                camera.near = near;
+            }
+            camera.eye = Some(eye);
+        }
+        camera
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn two_cameras_keep_independent_shadow_hysteresis_around_the_same_tree() {
+        let create = || Selection {
+            models: Rows::words(),
+            layout: Arc::default(),
+            blocks: vec![Block {
+                low: -Vec3::ONE,
+                high: Vec3::ONE,
+                spheres: vec![(Vec3::ZERO, 1.)],
+            }],
+            spatial_ids: vec![0],
+            cameras: Default::default(),
+        };
+        let (mut primary, mut secondary, mut paired) = (create(), create(), create());
+        // A tree enters fine at 33 m and exits past 35 m. Both cameras revisit the band
+        // from opposite sides, with a different history at each visit.
+        for (main, second, expected) in [
+            (34., 32., [false, true]),
+            (34., 34., [false, true]),
+            (32., 36., [true, false]),
+            (34., 34., [true, false]),
+        ] {
+            let eye = |z| Vec3::Z * z;
+            let selected = |scene: &mut Selection, z, second| {
+                !scene.for_eye(eye(z), 32., second).near.is_empty()
+            };
+            assert_eq!(
+                [
+                    selected(&mut primary, main, false),
+                    selected(&mut secondary, second, false)
+                ],
+                expected
+            );
+            assert_eq!(
+                [
+                    selected(&mut paired, main, false),
+                    selected(&mut paired, second, true)
+                ],
+                expected
+            );
+        }
     }
 }

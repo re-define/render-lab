@@ -1,3 +1,6 @@
+mod liveness;
+mod range_cache;
+mod ranges;
 mod validate;
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeSet, sync::Arc};
@@ -465,6 +468,10 @@ pub struct Graph {
     pub(crate) addresses: std::collections::BTreeMap<Resource, Vec<Resource>>,
     pub(crate) append_lists: BTreeSet<Resource>,
     pub(crate) histories: std::collections::BTreeMap<Resource, u64>,
+    // Measurements are authored by a workload and applied only on a matching backend and extent.
+    pub(crate) serial_profile: Option<(&'static str, [u32; 2])>,
+    external_effects: BTreeSet<usize>,
+    subranges: ranges::Declarations,
 }
 #[derive(Debug)]
 pub struct Barrier {
@@ -522,12 +529,15 @@ pub struct Step {
 }
 pub struct Plan {
     pub(crate) compile_ms: f64,
+    pub(crate) queue_limit: usize,
     pub(crate) graph: Graph,
     pub(crate) steps: Vec<Step>,
     pub(crate) written: Vec<bool>,
     pub(crate) image_usage: Vec<ImageUsage>,
     /// Expanded descriptor and address-table uses in original pass order.
     pub(crate) pass_uses: Vec<Vec<(Resource, Access)>>,
+    pub(crate) unused: BTreeSet<Resource>,
+    pub(crate) culled_passes: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -568,6 +578,9 @@ impl Graph {
             resources: vec![],
             passes: vec![],
             histories: Default::default(),
+            serial_profile: None,
+            external_effects: Default::default(),
+            subranges: Default::default(),
             append_lists: Default::default(),
             addresses: Default::default(),
         }
@@ -769,6 +782,12 @@ impl Graph {
         i
     }
     pub fn compile(self) -> Result<Plan> {
+        let use_cache = !self.subranges.split.is_empty()
+            && std::env::var_os("RENDER_LAB_RDG_RANGE_CACHE").is_some_and(|v| v == "1");
+        self.compile_with_ranges(use_cache.then_some(&range_cache::CACHE))
+    }
+
+    fn compile_with_ranges(self, cache: Option<&range_cache::Cache>) -> Result<Plan> {
         let started = std::time::Instant::now();
         ensure!(
             self.extent
@@ -792,9 +811,6 @@ impl Graph {
                 .all(|r| { matches!(self.resources.get(r.0), Some((_, Storage::Buffer { .. }))) }),
             "only buffers can request device-local placement"
         );
-        let mut deps = vec![BTreeSet::new(); self.passes.len()];
-        let mut writers = vec![None; self.resources.len()];
-        let mut readers = vec![BTreeSet::new(); self.resources.len()];
         let mut defined = self
             .resources
             .iter()
@@ -828,6 +844,28 @@ impl Graph {
             }
         }
         let pass_uses: Vec<_> = self.passes.iter().map(|pass| self.uses(&pass.op)).collect();
+        ensure!(
+            pass_uses
+                .iter()
+                .flatten()
+                .all(|(r, _)| r.0 < self.resources.len()),
+            "unknown resource"
+        );
+        let expanded = range_cache::expand(&self, &pass_uses, cache);
+        let unpartitioned;
+        let (physical, track_uses) = match expanded.as_deref() {
+            Some(ranges) => (&ranges.physical, &ranges.uses),
+            None => {
+                unpartitioned = (0..self.resources.len()).map(Resource).collect();
+                (&unpartitioned, &pass_uses)
+            }
+        };
+        let mut deps = vec![BTreeSet::new(); self.passes.len()];
+        let mut writers = vec![None; physical.len()];
+        let mut readers = vec![BTreeSet::new(); physical.len()];
+        for r in &physical[self.resources.len()..] {
+            defined.push(defined[r.0]);
+        }
         let mut tlas_sources = std::collections::BTreeMap::new();
         let mut image_read_epoch: Vec<Option<(Access, Vec<usize>)>> =
             vec![None; self.resources.len()];
@@ -835,8 +873,9 @@ impl Graph {
         for (i, p) in self.passes.iter().enumerate() {
             self.validate_pass(p, &defined, &mut tlas_sources)?;
             let mut seen = BTreeSet::new();
-            for &(r, a) in &pass_uses[i] {
-                let (name, s) = self.resources.get(r.0).context("unknown resource")?;
+            for &(r, a) in &track_uses[i] {
+                let physical = *physical.get(r.0).context("unknown resource")?;
+                let (name, s) = &self.resources[physical.0];
                 ensure!(
                     seen.insert(r),
                     "{}: duplicate access to {name}, declare one read/write use",
@@ -844,7 +883,7 @@ impl Graph {
                 );
                 ensure!(s.permits(a), "incompatible access to {name}");
                 ensure!(
-                    !a.writes() || !self.tables.contains_key(&r),
+                    !a.writes() || !self.tables.contains_key(&physical),
                     "write to read-only scene table {name}"
                 );
                 ensure!(
@@ -891,7 +930,7 @@ impl Graph {
         }
         // Host writes to mapped inputs are flushed before queue submission. Submission
         // makes these writes visible to the device. GPU-persistent resources have separate provenance.
-        let mut history: Vec<AccessHistory> = (0..self.resources.len())
+        let mut history: Vec<AccessHistory> = (0..physical.len())
             .map(|_| AccessHistory::default())
             .collect();
         for r in self.histories.keys() {
@@ -904,6 +943,9 @@ impl Graph {
                 (Access::AccelerationWrite, None),
                 (Access::RayAcceleration, None),
             ];
+        }
+        for (i, source) in physical.iter().enumerate().skip(self.resources.len()) {
+            history[i].uses = history[source.0].uses.clone();
         }
         let mut dependents = vec![Vec::new(); deps.len()];
         let mut remaining = Vec::with_capacity(deps.len());
@@ -929,7 +971,8 @@ impl Graph {
             ready.remove(&i);
             previous_queue = Some(self.passes[i].queue);
             let mut barriers = Vec::new();
-            for &(r, a) in &pass_uses[i] {
+            for &(track, a) in &track_uses[i] {
+                let r = physical[track.0];
                 let image = self.image_desc(r).is_some();
                 if image {
                     match layout_owner[r.0] {
@@ -943,8 +986,22 @@ impl Graph {
                         _ => layout_owner[r.0] = Some((a, i)),
                     }
                 }
-                if let Some(barrier) = history[r.0].dependency(r, a, self.passes[i].queue, image) {
-                    barriers.push(barrier);
+                if let Some(barrier) =
+                    history[track.0].dependency(r, a, self.passes[i].queue, image)
+                {
+                    if self.split_buffer(r)
+                        && let Some(same) = barriers
+                            .iter_mut()
+                            .find(|b: &&mut Barrier| b.resource == r && b.to == a)
+                    {
+                        for prior in barrier.from {
+                            if !same.from.contains(&prior) {
+                                same.from.push(prior);
+                            }
+                        }
+                    } else {
+                        barriers.push(barrier);
+                    }
                 }
             }
             for &child in &dependents[i] {
@@ -960,17 +1017,24 @@ impl Graph {
             });
         }
         ensure!(steps.len() == self.passes.len(), "cyclic pass dependencies");
+        let mut written = vec![false; self.resources.len()];
+        for (track, writer) in writers.iter().enumerate() {
+            written[physical[track].0] |= writer.is_some();
+        }
         ensure!(
-            self.resident_inputs.iter().all(|r| writers[r.0].is_none()),
+            self.resident_inputs.iter().all(|r| !written[r.0]),
             "resident input may not be written by a pass"
         );
         Ok(Plan {
+            queue_limit: usize::MAX,
             compile_ms: started.elapsed().as_secs_f64() * 1000.,
             graph: self,
             steps,
-            written: writers.iter().map(Option::is_some).collect(),
+            written,
             image_usage,
             pass_uses,
+            unused: Default::default(),
+            culled_passes: 0,
         })
     }
 }

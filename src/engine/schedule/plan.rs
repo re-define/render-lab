@@ -1,7 +1,10 @@
 use super::{Phase, SimulationData, SystemAccess, TransformTargets};
 use crate::scene::World;
 use anyhow::{Result, bail, ensure};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 #[derive(Default)]
 pub(super) struct Batch {
@@ -136,7 +139,7 @@ pub(super) struct Segment {
     nodes: Vec<(usize, Vec<usize>)>,
     scoped: Vec<usize>,
     boundary: Option<String>,
-    pub bindings: BTreeMap<usize, TransformTargets>,
+    pub bindings: BTreeMap<usize, Arc<TransformTargets>>,
     pub batches: Vec<Batch>,
 }
 
@@ -204,9 +207,11 @@ impl Segment {
             let mut reasons = Vec::new();
             for (j, _) in &self.nodes[..rank] {
                 let prior = phase.entries[*j].access;
-                for ((data, entity), hazard) in
-                    prior.hazards(access, self.bindings.get(j), self.bindings.get(id))
-                {
+                for ((data, entity), hazard) in prior.hazards(
+                    access,
+                    self.bindings.get(j).map(Arc::as_ref),
+                    self.bindings.get(id).map(Arc::as_ref),
+                ) {
                     level = level.max(levels[*j] + 1);
                     let entity = entity.map(|id| format!(" entity {id}")).unwrap_or_default();
                     reasons.push(format!(

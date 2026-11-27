@@ -195,14 +195,15 @@ pub(super) fn draw_surfaces(
     s: &Snapshot,
     surfaces: Vec<PosedSurface<'_>>,
 ) -> Result<()> {
+    let mut draws = crate::render::OrdinaryDrawList::default();
     for surface in surfaces {
         let mut item = t.material(s, surface.instance, Mat4::IDENTITY)?;
         if surface.instance.emitter {
             item.params[3] = 1.;
         }
-        surface.draw(g, t, s, item)?;
+        surface.draw(g, t, s, item, &mut draws)?;
     }
-    Ok(())
+    draws.emit(g, t, s)
 }
 #[cfg(test)]
 pub(super) fn build(

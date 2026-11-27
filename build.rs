@@ -10,6 +10,9 @@ fn main() {
     println!("cargo:rerun-if-changed=shaders");
     let shaders = [
         "plain.mesh",
+        "ordinary_cull.comp",
+        "ordinary_work.comp",
+        "ordinary.mesh",
         "skin.comp",
         "outline_edges.comp",
         "visibility.frag",

@@ -1,0 +1,44 @@
+#version 460
+#include "ordinary_draw.glsl"
+layout(local_size_x=64) in;
+layout(set=0,binding=2,std430) writeonly buffer Counts { uint groups[]; };
+shared uint outside;
+
+// Intersect the six outside half-spaces. A primitive crossing a plane survives.
+// Leave a tolerance for multiply/add differences between compute and mesh stages.
+uint clipMask(vec4 p) {
+    float guard = 1e-5 * max(1.0, max(max(abs(p.x), abs(p.y)), max(abs(p.z), abs(p.w))));
+    return (p.x < -p.w - guard ? 1u : 0u) | (p.x > p.w + guard ? 2u : 0u)
+         | (p.y < -p.w - guard ? 4u : 0u) | (p.y > p.w + guard ? 8u : 0u)
+         | (p.z < -guard ? 16u : 0u) | (p.z > p.w + guard ? 32u : 0u);
+}
+void main() {
+    uint slot = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x;
+    DrawRecord draw = draws[slot];
+    if (lane == 0u) outside = 63u;
+    barrier();
+    uint mask = 63u;
+    if (draw.info.w == 0u) {
+        if (lane < 8u) {
+            vec3 corner = mix(draw.lo.xyz, draw.hi.xyz, notEqual(uvec3(lane) & uvec3(1,2,4), uvec3(0)));
+            mask = clipMask(draw.clipFromVertex * vec4(corner,1.0));
+        }
+    } else if (lane < draw.info.z) {
+        mask = clipMask(draw.clipFromVertex * vec4(Vertices(vertices[slot]).data[2u*lane].xyz,1.0));
+    }
+    atomicAnd(outside, mask);
+    barrier();
+    // Most visible posed meshes need only the first wave. Reject only after all
+    // posed vertices agree on an outside plane; a bind-pose bound is insufficient.
+    uint remainder = outside;
+    barrier();
+    if (remainder != 0u && draw.info.w != 0u) {
+        mask = remainder;
+        for (uint i=lane+64u; i<draw.info.z && mask!=0u; i+=64u) {
+            mask &= clipMask(draw.clipFromVertex * vec4(Vertices(vertices[slot]).data[2u*i].xyz,1.0));
+        }
+        atomicAnd(outside, mask);
+    }
+    barrier();
+    if (lane == 0u) groups[slot] = outside == 0u ? (draw.info.y+31u)/32u : 0u;
+}

@@ -123,6 +123,10 @@ pub(crate) struct TemporalFrame {
 }
 
 impl TemporalFrame {
+    pub(crate) fn standard_taa(&self) -> bool {
+        self.mode == Mode::Taa && self.debug == DebugView::Off
+    }
+
     pub(crate) fn generation_key(&self) -> u64 {
         self.key
     }

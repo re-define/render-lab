@@ -1,5 +1,5 @@
 use super::{Edit, SimulationData, SystemAccess, TransformTargets};
-use crate::scene::{Id, LocalPose, World};
+use crate::scene::{Id, LocalPose, PoseLayout, World};
 use anyhow::{Context, Result, ensure};
 use glam::Mat4;
 use serde::{Serialize, de::DeserializeOwned};
@@ -8,6 +8,7 @@ use std::borrow::Cow;
 
 pub(super) enum Change {
     Pose(LocalPose),
+    PublishedPose(Id, PoseLayout, Vec<Mat4>),
     Component(Id, &'static str, Edit),
     Resource(
         &'static str,
@@ -25,6 +26,21 @@ impl Change {
                     undo.push(Box::new(move |world| previous.apply(world)));
                 }
                 pose.apply(world);
+            }
+            Self::PublishedPose(owner, joints, locals) => {
+                if let Some(undo) = undo {
+                    let previous = joints
+                        .joints()
+                        .iter()
+                        .filter_map(|id| world.entities.get(id).map(|row| (*id, row.local)))
+                        .collect::<Vec<_>>();
+                    undo.push(Box::new(move |world| {
+                        for (id, local) in previous {
+                            let _ = world.set_local(id, local);
+                        }
+                    }));
+                }
+                world.entities.publish_pose(owner, joints, locals);
             }
             Self::Component(id, key, edit) => {
                 // A preceding whole-world command in this batch may have removed the entity.
@@ -175,6 +191,34 @@ impl<'w> SystemContext<'w> {
             Ok(())
         })?;
         self.changes.push(Change::Pose(pose));
+        Ok(())
+    }
+    /// Publish one complete layout of local joint transforms. Readers that missed
+    /// substeps can consume the union of dirty joints and the latest pose version.
+    pub fn publish_pose(&mut self, owner: Id, layout: PoseLayout, locals: Vec<Mat4>) -> Result<()> {
+        ensure!(
+            self.world.entities.contains_key(&owner),
+            "missing pose owner {owner}"
+        );
+        let joints = layout.joints();
+        ensure!(
+            locals.len() == joints.len(),
+            "pose does not match its joint layout"
+        );
+        let scope = self.local_scope(true)?;
+        for (&id, local) in joints.iter().zip(&locals) {
+            ensure!(
+                scope.is_none_or(|ids| ids.binary_search(&id).is_ok()),
+                "{}: undeclared write of LocalTransform entity {id}",
+                self.access.name
+            );
+            ensure!(
+                local.is_finite() && self.world.entities.contains_key(&id),
+                "invalid pose joint {id}"
+            );
+        }
+        self.changes
+            .push(Change::PublishedPose(owner, layout, locals));
         Ok(())
     }
     pub fn set_component(&mut self, id: Id, key: &'static str, value: Value) -> Result<()> {

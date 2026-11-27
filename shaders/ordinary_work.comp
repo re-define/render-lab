@@ -1,0 +1,17 @@
+#version 460
+// One small ordered scan per packet. Each entry is a single surface, not a triangle.
+layout(local_size_x=1) in;
+layout(set=0,binding=0,std430) readonly buffer Counts { uint groups[]; };
+layout(set=0,binding=1,std430) writeonly buffer Ends { uint ends[]; };
+layout(set=0,binding=2,std430) writeonly buffer Args { uint x; uint y; uint z; };
+layout(push_constant) uniform Params { layout(offset=12) uint count; } p;
+void main() {
+    uint total = 0u;
+    for (uint i=0u; i<p.count; ++i) {
+        total += groups[i];
+        ends[i] = total;
+    }
+    x = total;
+    y = 1u;
+    z = 1u;
+}

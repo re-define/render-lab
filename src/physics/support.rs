@@ -1,6 +1,6 @@
 //! Finite support queries shared by character dynamics and animation contact IK.
 use crate::scene::Id;
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Quat, Vec3};
 
 #[derive(Clone, Copy)]
 pub struct SupportFace {
@@ -9,7 +9,10 @@ pub struct SupportFace {
     inverse: Mat4,
     pub normal: Vec3,
     pub center: Vec3,
+    /// Linear velocity of the top-face center in metres per second.
     pub velocity: Vec3,
+    pub angular_velocity: Vec3,
+    pub(crate) rotation: Quat,
     min_normal_y: f32,
 }
 impl SupportFace {
@@ -30,9 +33,39 @@ impl SupportFace {
             inverse,
             normal,
             velocity: Vec3::ZERO,
+            angular_velocity: Vec3::ZERO,
+            rotation: world.to_scale_rotation_translation().1.normalize(),
             center: world.transform_point3(0.5 * Vec3::Y),
         })
     }
+    /// Estimate the rigid twist from two simulation samples. Legacy saves contain only a center.
+    pub(crate) fn set_previous(&mut self, center: Vec3, rotation: Option<Quat>, dt: f32) {
+        self.velocity = (self.center - center) / dt;
+        self.angular_velocity = Vec3::ZERO;
+        if let Some(old) = rotation
+            && old != self.rotation
+        {
+            let delta = self.rotation * old.conjugate();
+            let shortest = if delta.w < 0. { -delta } else { delta };
+            self.angular_velocity = shortest.to_scaled_axis() / dt;
+        }
+    }
+
+    /// Velocity of a material point expressed in the current world frame.
+    pub fn velocity_at(self, point: Vec3) -> Vec3 {
+        self.velocity + self.angular_velocity.cross(point - self.center)
+    }
+
+    /// Carry a point from the start pose of this rigid support to the end pose.
+    pub fn carry(self, point: Vec3, dt: f32) -> Vec3 {
+        let translation = self.velocity * dt;
+        if self.angular_velocity == Vec3::ZERO {
+            return point + translation;
+        }
+        let previous_center = self.center - translation;
+        self.center + Quat::from_scaled_axis(self.angular_velocity * dt) * (point - previous_center)
+    }
+
     fn clearance(self, p: Vec3) -> f32 {
         (p - self.center).dot(self.normal)
     }
@@ -44,9 +77,47 @@ impl SupportFace {
         let q = self.inverse.transform_point3(at);
         (q.x.abs() <= 0.50001 && q.z.abs() <= 0.50001).then_some(at)
     }
-    /// Earliest descending ballistic intersection with this finite translating face.
+    /// Predict a landing on a finite support assuming its current linear and angular velocities persist.
+    /// Rotating faces refine the first descending crossing in a bounded look-ahead window.
     pub fn landing_time(self, at: Vec3, velocity: Vec3, gravity: f32) -> Option<f32> {
         if self.normal.y <= 0. || self.normal.y < self.min_normal_y {
+            return None;
+        }
+        if self.angular_velocity.length_squared() > 1e-8 {
+            let horizon = 3.;
+            let slices = (self.angular_velocity.length() * horizon * 12.)
+                .ceil()
+                .clamp(48., 192.) as usize;
+            let relative_at = |time: f32| {
+                let turn = Quat::from_scaled_axis(-self.angular_velocity * time);
+                let ballistic = at + (velocity - self.velocity) * time
+                    - Vec3::Y * (0.5 * gravity * time * time);
+                self.center + turn * (ballistic - self.center)
+            };
+            let mut start = 0.;
+            let mut above = self.clearance(at);
+            for i in 1..=slices {
+                let end = horizon * i as f32 / slices as f32;
+                let clearance = self.clearance(relative_at(end));
+                if above >= 0. && clearance < 0. {
+                    let (mut a, mut b) = (start, end);
+                    for _ in 0..12 {
+                        let mid = 0.5 * (a + b);
+                        if self.clearance(relative_at(mid)) > 0. {
+                            a = mid;
+                        } else {
+                            b = mid;
+                        }
+                    }
+                    let hit = (a + b) * 0.5;
+                    let normal = Quat::from_scaled_axis(self.angular_velocity * hit) * self.normal;
+                    if normal.y >= self.min_normal_y && self.below(relative_at(hit)).is_some() {
+                        return Some(hit);
+                    }
+                }
+                start = end;
+                above = clearance;
+            }
             return None;
         }
         let relative = velocity - self.velocity;

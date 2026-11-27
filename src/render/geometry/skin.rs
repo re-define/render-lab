@@ -123,7 +123,7 @@ impl SkinBatches {
         Ok(out)
     }
 
-    pub(in crate::render) fn finish(self, g: &mut Graph) {
+    pub(in crate::render) fn finish(self, g: &mut Graph) -> Vec<Resource> {
         let pages: Vec<_> = self
             .pages
             .into_iter()
@@ -152,6 +152,7 @@ impl SkinBatches {
                 (jobs, Access::ComputeRead),
             ]);
         }
+        pages
     }
 }
 
@@ -301,6 +302,7 @@ mod tests {
             .map(|word| f32::from_ne_bytes(word.try_into().unwrap()))
             .collect();
         assert_eq!(actual, expected);
+        assert_eq!(frame.profile.skin_pose_upload_bytes, 4 * 64);
         Ok(())
     }
 }

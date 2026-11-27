@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-from motion_index import write_index
+from motion_index import cook
 from scipy.ndimage import gaussian_filter1d, median_filter
 from scipy.spatial.transform import Rotation
 
@@ -282,10 +282,10 @@ def main():
         meta["clips"].append({"name": p.stem, "frames": len(clip)})
         rows.append(clip)
     np.concatenate(rows).tofile(args.output / "poses.bin")
-    write_index(rows, args.output)
     (args.output / "bank.json").write_text(
         json.dumps(meta, indent=2) + "\n", encoding="utf8"
     )
+    cook(args.output)
 
 
 if __name__ == "__main__":

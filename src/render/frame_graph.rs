@@ -58,7 +58,7 @@ impl FrameGraph {
         Ok(output)
     }
     pub fn compile(mut self) -> Result<FramePlan> {
-        std::mem::take(&mut self.skins).finish(&mut self.graph);
+        let skin_pages = std::mem::take(&mut self.skins).finish(&mut self.graph);
         let output = self
             .products
             .final_color
@@ -96,8 +96,9 @@ impl FrameGraph {
         }
         Ok(FramePlan {
             stamp: Default::default(),
-            commands: self.graph.compile()?,
+            commands: self.graph.compile_frame()?,
             output,
+            skin_pages,
             instance_visits: self.products.instance_visits,
             material_atlas: self.products.material_atlas,
             atlas_build: self.products.atlas_build,
@@ -125,6 +126,7 @@ pub(crate) struct FrameStamp {
     pub tick_id: u64,
     pub snapshot_id: u64,
     pub skipped_ticks: u64,
+    pub has_secondary: bool,
     pub generation: u64,
     pub origin: Option<std::time::Instant>,
     pub tick_started: Option<std::time::Instant>,
@@ -136,6 +138,7 @@ pub struct FramePlan {
     pub(crate) stamp: FrameStamp,
     pub(crate) commands: Plan,
     pub(crate) output: Resource,
+    pub(crate) skin_pages: Vec<Resource>,
     pub(crate) instance_visits: usize,
     pub(crate) material_atlas: Option<Resource>,
     pub(crate) atlas_build: (u64, usize),

@@ -19,6 +19,7 @@ pub(super) struct Assembly {
     pub caps: RayCapabilities,
     pub materials: MaterialPrograms,
     pub schedule: Schedule,
+    pub movement: Option<crate::engine::MovementDriver>,
     pub camera: Option<Camera>,
     pub technique: Option<Arc<dyn Technique>>,
     pub visibility: composition::GeometryModules,
@@ -42,6 +43,7 @@ pub(super) struct SceneConfiguration {
     camera: Camera,
     materials: Arc<MaterialPrograms>,
     schedule: Schedule,
+    movement: Option<crate::engine::MovementDriver>,
     technique: Arc<dyn Technique>,
 }
 impl SceneConfiguration {
@@ -104,6 +106,7 @@ impl SceneConfiguration {
             caps,
             materials: MaterialPrograms::default(),
             schedule: Schedule::default(),
+            movement: None,
             camera: None,
             technique: None,
             visibility: Default::default(),
@@ -124,6 +127,7 @@ impl SceneConfiguration {
             camera,
             materials: Arc::new(a.materials),
             schedule: a.schedule,
+            movement: a.movement,
             technique,
         })
     }
@@ -132,9 +136,14 @@ impl SceneConfiguration {
         if uses_same_systems {
             self.schedule = std::mem::take(&mut e.schedule);
         }
-        self.apply(e);
+        e.movement.rebind(self.movement);
+        self.apply_rendering_and_schedule(e);
     }
     pub fn apply(self, e: &mut Engine) {
+        e.movement = crate::engine::MovementControls::new(self.movement);
+        self.apply_rendering_and_schedule(e);
+    }
+    fn apply_rendering_and_schedule(self, e: &mut Engine) {
         e.camera = self.camera;
         e.materials = self.materials;
         e.schedule = self.schedule;

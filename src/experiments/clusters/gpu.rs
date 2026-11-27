@@ -779,12 +779,20 @@ impl Pyramid {
                 break;
             }
         }
-        Ok(Self {
-            levels,
-            header: src + 1,
-        })
+        let header = src.checked_add(1).context("Hi-Z size overflow")?;
+        header
+            .checked_add(17)
+            .context("Hi-Z camera header overflow")?;
+        Ok(Self { levels, header })
     }
-    fn build(&self, g: &mut FrameGraph, depth: Resource, h: Resource, view: Resource, name: &str) {
+    fn build(
+        &self,
+        g: &mut FrameGraph,
+        depth: Resource,
+        h: Resource,
+        view: Resource,
+        name: &str,
+    ) -> Result<()> {
         for (i, &params) in self.levels.iter().enumerate() {
             let mut bindings = vec![(h, RW), (view, R)];
             let shader: &'static [u8] = if i == 0 {
@@ -794,7 +802,7 @@ impl Pyramid {
                 spirv!("hiz.comp")
             };
             let program = compute(shader, &bindings, bytemuck::bytes_of(&params).to_vec());
-            g.pass_in(
+            let pass = g.pass_in(
                 PassPhase::Pyramids,
                 &format!("{name} mip {}", i + 1),
                 Op::Compute {
@@ -802,7 +810,29 @@ impl Pyramid {
                     groups: [params[0].div_ceil(16), params[1].div_ceil(16), 1],
                 },
             );
+            let [w, height, src, dst] = params;
+            let last = i + 1 == self.levels.len();
+            let next = dst + w.div_ceil(2) * height.div_ceil(2);
+            // The last invocation also publishes the camera matrix and validity word.
+            let end = if last { self.header + 17 } else { next };
+            let bytes = |v: u32| v as usize * size_of::<f32>();
+            g.buffer_ranges(
+                pass,
+                h,
+                vec![
+                    (
+                        bytes(src)..bytes(dst),
+                        if i == 0 {
+                            Access::ComputeWrite
+                        } else {
+                            Access::ComputeRead
+                        },
+                    ),
+                    (bytes(dst)..bytes(end), Access::ComputeWrite),
+                ],
+            )?;
         }
+        Ok(())
     }
 }
 impl ClusterLod {
@@ -969,7 +999,7 @@ impl ClusterLod {
 
         // A triangle-only intermediate pyramid is conservative. Main and
         // recovered brick jobs wait for the final opaque triangle depth.
-        pyramid.build(g, t.depth, history, view, "Current Hi-Z");
+        pyramid.build(g, t.depth, history, view, "Current Hi-Z")?;
         scene.visibility(g, history, deferred, post, None, bricks.as_ref());
         scene.draw(g, t, post, "Post mesh visibility");
         if let Some(jobs) = &bricks {
@@ -993,7 +1023,7 @@ impl ClusterLod {
                 },
             },
         );
-        pyramid.build(g, t.depth, history, view, "History Hi-Z");
+        pyramid.build(g, t.depth, history, view, "History Hi-Z")?;
         Ok(())
     }
     pub(in crate::experiments) fn owns(s: &Snapshot, i: &RenderInstance) -> bool {
@@ -1033,19 +1063,86 @@ impl Technique for ClusterLod {
                     } else {
                         let slots = &s.scene.routes.ordinary;
                         g.products.instance_visits += slots.len();
+                        let mut draws = crate::render::OrdinaryDrawList::default();
                         for surface in front.prepare_surfaces(
                             s,
                             slots.iter().map(|&i| &s.scene.instances[i]).collect(),
                         )? {
                             let material = t.material(s, surface.instance, Mat4::IDENTITY)?;
-                            surface.draw(g, t, s, material)?;
+                            surface.draw(g, t, s, material, &mut draws)?;
                         }
-                        Ok(())
+                        draws.emit(g, t, s)
                     }
                 })
             },
             |g, inputs| Self::atmosphere(g, s, inputs),
             |_, _| Ok(()),
         )
+    }
+}
+
+#[cfg(test)]
+mod pyramid_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires Vulkan descriptor heaps"]
+    fn packed_hiz_mips_and_camera_match_scalar_reduction() -> Result<()> {
+        let mut gpu = crate::rhi::Backend::open()?;
+        let tasks = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+        for [w, h] in [[1, 1], [31, 17], [64, 2]] {
+            let pyramid = Pyramid::new([w, h])?;
+            let depth: Vec<f32> = (0..w * h)
+                .map(|i| ((i * 97 + 19) % 256) as f32 / 256.)
+                .collect();
+            let mut expected = depth.clone();
+            for &[width, height, src, dst] in &pyramid.levels {
+                assert_eq!(dst as usize, expected.len());
+                for y in 0..height.div_ceil(2) {
+                    for x in 0..width.div_ceil(2) {
+                        let mut farthest = 0.0_f32;
+                        for dy in 0..2 {
+                            for dx in 0..2 {
+                                let i = src
+                                    + (2 * y + dy).min(height - 1) * width
+                                    + (2 * x + dx).min(width - 1);
+                                farthest = farthest.max(expected[i as usize]);
+                            }
+                        }
+                        expected.push(farthest);
+                    }
+                }
+            }
+            assert_eq!(expected.len(), pyramid.header as usize);
+            let view = View {
+                vp: Mat4::IDENTITY.to_cols_array(),
+                screen: [w, h, pyramid.header, 0],
+                ..View::zeroed()
+            };
+            expected.extend(view.vp);
+            expected.push(1.);
+            let mut graph = FrameGraph::new([w, h]);
+            graph.display_extent = Some([expected.len() as u32, 1]);
+            let src = graph.input("input depth", bytemuck::cast_slice(&depth).into());
+            let image = graph.resource("sampled depth", Storage::Depth);
+            graph.pass("upload depth", Op::WritePixels { buffer: src, image });
+            let camera = graph.input("camera", bytemuck::bytes_of(&view).into());
+            let mips = graph.resource(
+                "mips",
+                Storage::Buffer {
+                    bytes: expected.len() * 4,
+                    initial: Some(vec![0; expected.len() * 4].into()),
+                },
+            );
+            pyramid.build(&mut graph, image, mips, camera, "test Hi-Z")?;
+            graph.set_output(mips);
+            let frame = gpu.execute(graph.compile()?, &tasks)?;
+            assert_eq!(
+                frame.pixels.as_slice(),
+                bytemuck::cast_slice::<f32, u8>(&expected),
+                "{w}x{h}"
+            );
+        }
+        Ok(())
     }
 }

@@ -393,6 +393,28 @@ impl Restir {
             .then(|| self.shadow.get(&s.scene, surfaces))
             .transpose()?;
         Ok(Box::new(move |g, inputs| {
+            if s.extent == [1920, 1080]
+                && cfg.rays == RayBackend::Hardware
+                && cfg.gi == DiffuseGi::Multi
+                && cfg.sampling == Sampling::Restir
+                && cfg.denoise == Denoise::Svgf
+                && s.temporal
+                    .as_ref()
+                    .is_some_and(|frame| frame.standard_taa())
+                && let Some(raw) = s.scene.setting(super::vegetation::SETTING)
+            {
+                use super::vegetation::{BrickRaster, Mode, Preset, Settings as Plants};
+                let plants = Plants::decode(raw)?;
+                if matches!(plants.preset, Preset::Karst)
+                    && matches!(plants.mode, Mode::Auto)
+                    && plants.raster == BrickRaster::Auto
+                    && !plants.mega_shadows
+                    && !plants.visualize
+                {
+                    // Device-specific result of the 1080p karst zoom replay. The queue override wins.
+                    g.serial_profile = Some(("NVIDIA GeForce RTX 5070", s.extent));
+                }
+            }
             let (direct, controls, indirect) =
                 graph::add_light(g, s, self, cfg, backend, inputs, rigid.as_deref())?;
             Ok(Contribution {

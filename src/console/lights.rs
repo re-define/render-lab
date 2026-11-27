@@ -95,18 +95,7 @@ pub(super) fn command(engine: &mut Engine, args: &str) -> Result<String> {
                     "light angular-radius ID DEGREES · move/aim ID X Y Z · power ID I · color ID R G B · enable ID on/off"
                 ),
             }
-            let parent = if let Some(parent) = e.parent {
-                engine.world.transforms()?[&parent]
-            } else {
-                Mat4::IDENTITY
-            };
-            light.validate(parent * local)?;
-            let e = Arc::make_mut(&mut engine.world)
-                .entities
-                .get_mut(&id)
-                .unwrap();
-            e.light = Some(light);
-            e.local = local;
+            Arc::make_mut(&mut engine.world).set_light_instance(id, light, local)?;
             return Ok(format!("Light #{id} updated"));
         }
         _ => (),

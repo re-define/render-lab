@@ -129,6 +129,11 @@ pub struct SystemOrder {
 /// Implement this interface for systems that can share a parallel simulation batch.
 pub trait SimulationSystem: Send + Sync {
     fn access(&self) -> SystemAccess;
+    /// When all target IDs come from this system's immutable binding, supply them
+    /// once per bound system instance. A rebind installs a replacement instance.
+    fn bound_transforms(&self) -> Option<TransformTargets> {
+        None
+    }
     /// Resolve separate read and write sets from this snapshot. The selector may
     /// read its declared component inputs and should have no side effects.
     fn transform_targets(&self, _: &TransformBindings<'_>) -> Result<TransformTargets> {
@@ -170,7 +175,13 @@ impl<T: SimulationSystem + 'static> System for T {
     }
     fn update(&self, world: &World, dt: f32) -> Result<Edit> {
         let access = SimulationSystem::access(self);
-        let targets = resolve_targets(self, access, world)?;
+        let targets = match self.bound_transforms() {
+            Some(mut targets) if access.scoped() => {
+                targets.normalize();
+                Some(targets)
+            }
+            _ => resolve_targets(self, access, world)?,
+        };
         let mut context = SystemContext::new(world, access, targets.as_ref());
         self.run(&mut context, dt)?;
         let changes = context.finish();
@@ -203,11 +214,19 @@ struct Entry {
     system: Implementation,
     access: SystemAccess,
     order: SystemOrder,
+    bound: Option<Arc<TransformTargets>>,
 }
 impl Entry {
     fn new(system: Arc<dyn System>) -> Self {
         if let Some(checked) = system.clone().checked() {
             Self {
+                bound: checked
+                    .bound_transforms()
+                    .filter(|_| checked.access().scoped())
+                    .map(|mut t| {
+                        t.normalize();
+                        Arc::new(t)
+                    }),
                 access: checked.access(),
                 order: checked.order(),
                 system: Implementation::Checked(checked),
@@ -221,12 +240,18 @@ impl Entry {
                 },
                 order: system.order(),
                 system: Implementation::Opaque(system),
+                bound: None,
             }
         }
     }
-    fn targets(&self, world: &World) -> Result<Option<TransformTargets>> {
+    fn targets(&self, world: &World) -> Result<Option<Arc<TransformTargets>>> {
+        if let Some(bound) = &self.bound {
+            return Ok(Some(bound.clone()));
+        }
         match &self.system {
-            Implementation::Checked(s) => resolve_targets(s.as_ref(), self.access, world),
+            Implementation::Checked(s) => {
+                Ok(resolve_targets(s.as_ref(), self.access, world)?.map(Arc::new))
+            }
             Implementation::Opaque(_) => Ok(None),
         }
     }
@@ -257,13 +282,15 @@ struct Phase {
     entries: Vec<Entry>,
     automatic: bool,
     fixed: Option<FixedStep>,
-    membership: Option<Membership>,
+    domain: Option<FixedDomain>,
+    memberships: Vec<Membership>,
     completed: u64,
 }
-type BindingCheck = Box<dyn Fn(&World) -> Result<bool> + Send + Sync>;
+pub type BindingCheck = Box<dyn Fn(&World) -> Result<bool> + Send + Sync>;
 type SystemGroup = (Vec<Arc<dyn System>>, BindingCheck);
 type BindSystems = dyn Fn(&World) -> Result<SystemGroup> + Send + Sync;
 struct Membership {
+    entries: std::ops::Range<usize>,
     component: &'static str,
     owners: Vec<Id>,
     hierarchy_revision: u64,
@@ -272,35 +299,86 @@ struct Membership {
 }
 impl Phase {
     fn refresh_membership(&mut self, world: &World) -> Result<()> {
-        let Some(membership) = &mut self.membership else {
-            return Ok(());
-        };
-        let owners = world.entities.component_owners(membership.component);
-        if owners == membership.owners
-            && membership.hierarchy_revision == world.entities.hierarchy_revision()
-            && (membership.is_current)(world)?
-        {
-            return Ok(());
+        for membership in &mut self.memberships {
+            let owners = world.entities.component_owners(membership.component);
+            if owners == membership.owners
+                && membership.hierarchy_revision == world.entities.hierarchy_revision()
+                && (membership.is_current)(world)?
+            {
+                continue;
+            }
+            let (systems, check) = (membership.bind)(world)?;
+            let replacement: Vec<_> = systems.into_iter().map(Entry::new).collect();
+            let current = &mut self.entries[membership.entries.clone()];
+            anyhow::ensure!(
+                replacement.len() == current.len()
+                    && replacement
+                        .iter()
+                        .zip(current.iter())
+                        .all(|(a, b)| a.access == b.access && a.order == b.order),
+                "membership refresh changed the declared simulation schedule"
+            );
+            for (entry, new) in current.iter_mut().zip(replacement) {
+                *entry = new;
+            }
+            membership.is_current = check;
+            membership.hierarchy_revision = world.entities.hierarchy_revision();
+            membership.owners.clear();
+            membership.owners.extend_from_slice(owners);
         }
-        let (systems, check) = (membership.bind)(world)?;
-        let replacement: Vec<_> = systems.into_iter().map(Entry::new).collect();
-        // Rebind resources and per-entity targets while preserving the compiled dependency graph.
-        anyhow::ensure!(
-            replacement.len() == self.entries.len()
-                && replacement
-                    .iter()
-                    .zip(&self.entries)
-                    .all(|(a, b)| a.access == b.access && a.order == b.order),
-            "membership refresh changed the declared simulation schedule"
-        );
-        self.entries = replacement;
-        membership.is_current = check;
-        membership.hierarchy_revision = world.entities.hierarchy_revision();
-        membership.owners.clear();
-        membership.owners.extend_from_slice(owners);
         Ok(())
     }
 }
+/// Modules using the same name share one clock, dependency graph, and substep transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixedDomain {
+    pub name: &'static str,
+    pub step: Duration,
+    pub max_steps: u32,
+}
+
+type SystemFactory<B> = dyn Fn(&B) -> Arc<dyn System> + Send + Sync;
+
+/// Independently registered systems share one immutable membership binding per rebuild.
+pub struct BoundSystems<B> {
+    factories: Vec<Box<SystemFactory<B>>>,
+}
+impl<B> Default for BoundSystems<B> {
+    fn default() -> Self {
+        Self {
+            factories: Vec::new(),
+        }
+    }
+}
+impl<B: 'static> BoundSystems<B> {
+    pub fn register<S: System + 'static>(
+        &mut self,
+        factory: impl Fn(&B) -> S + Send + Sync + 'static,
+    ) {
+        self.factories
+            .push(Box::new(move |binding| Arc::new(factory(binding))));
+    }
+    pub fn install(
+        self,
+        schedule: &mut Schedule,
+        domain: FixedDomain,
+        world: &World,
+        component: &'static str,
+        bind: impl Fn(&World) -> Result<(B, BindingCheck)> + Send + Sync + 'static,
+    ) -> Result<()> {
+        schedule.bind_fixed_systems(domain, world, component, move |world| {
+            let (binding, is_current) = bind(world)?;
+            Ok((
+                self.factories
+                    .iter()
+                    .map(|factory| factory(&binding))
+                    .collect(),
+                is_current,
+            ))
+        })
+    }
+}
+
 struct FixedStep {
     seconds: f64,
     remainder: f64,
@@ -353,19 +431,54 @@ impl Schedule {
         );
         Ok(())
     }
-    /// Keep fixed-step timing when entities enter or leave a component-defined system group.
-    /// Binding runs at substep boundaries; ordinary component value writes keep the existing binding.
-    pub(crate) fn fixed_stage_for_component(
+    fn domain(&mut self, domain: FixedDomain) -> Result<&mut Phase> {
+        anyhow::ensure!(
+            !domain.name.is_empty() && !domain.step.is_zero() && domain.max_steps > 0,
+            "invalid fixed domain"
+        );
+        let index = self
+            .phases
+            .iter()
+            .position(|p| p.domain.is_some_and(|d| d.name == domain.name));
+        let index = if let Some(i) = index {
+            anyhow::ensure!(
+                self.phases[i].domain == Some(domain),
+                "conflicting timestep or catch-up limit in domain {}",
+                domain.name
+            );
+            i
+        } else {
+            self.fixed_stage(domain.step, domain.max_steps, Vec::new())?;
+            let i = self.phases.len() - 1;
+            self.phases[i].domain = Some(domain);
+            i
+        };
+        self.compiled.take();
+        Ok(&mut self.phases[index])
+    }
+
+    /// Plugins can register independently, in any order within a named clock. Its position
+    /// relative to other phases is determined by its first registration.
+    pub fn add_fixed_system(&mut self, domain: FixedDomain, system: Arc<dyn System>) -> Result<()> {
+        self.domain(domain)?.entries.push(Entry::new(system));
+        Ok(())
+    }
+
+    /// Related systems may share a costly binding rebuild while participating in the same
+    /// dependency graph as independently registered systems in this clock.
+    fn bind_fixed_systems(
         &mut self,
-        step: Duration,
-        max_steps: u32,
+        domain: FixedDomain,
         world: &World,
         component: &'static str,
         bind: impl Fn(&World) -> Result<SystemGroup> + Send + Sync + 'static,
     ) -> Result<()> {
         let (systems, is_current) = bind(world)?;
-        self.fixed_stage(step, max_steps, systems)?;
-        self.phases.last_mut().unwrap().membership = Some(Membership {
+        let phase = self.domain(domain)?;
+        let start = phase.entries.len();
+        phase.entries.extend(systems.into_iter().map(Entry::new));
+        phase.memberships.push(Membership {
+            entries: start..phase.entries.len(),
             component,
             owners: world.entities.component_owners(component).to_vec(),
             hierarchy_revision: world.entities.hierarchy_revision(),
@@ -419,7 +532,14 @@ impl Schedule {
         for (phase, (p, groups)) in self.phases.iter().zip(&plan.phases).enumerate() {
             let clock = p.fixed.as_ref().map_or_else(
                 || "variable".into(),
-                |f| format!("fixed {:.6} s, max {}", f.seconds, f.max_steps),
+                |f| {
+                    format!(
+                        "{} fixed {:.6} s, max {}",
+                        p.domain.map_or("independent", |d| d.name),
+                        f.seconds,
+                        f.max_steps
+                    )
+                },
             );
             for (level, (segment, g)) in groups
                 .iter()
@@ -507,7 +627,13 @@ fn run_substep(
                     batch
                         .ids
                         .par_iter()
-                        .map(|&i| phase.entries[i].prepare(world, dt, segment.bindings.get(&i)))
+                        .map(|&i| {
+                            phase.entries[i].prepare(
+                                world,
+                                dt,
+                                segment.bindings.get(&i).map(Arc::as_ref),
+                            )
+                        })
                         .collect::<Result<Vec<_>>>()
                 })?;
                 let more = index + 1 < segment_count || level + 1 < segment.batches.len();

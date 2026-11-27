@@ -169,6 +169,7 @@ impl Cartoon {
             "face SDF requires seven square tiles"
         );
         let mut outlines = vec![];
+        let mut draws = crate::render::OrdinaryDrawList::default();
         for surface in surfaces {
             let i = surface.instance;
             let mut obj = t.material(s, i, Mat4::IDENTITY)?;
@@ -182,11 +183,12 @@ impl Cartoon {
                     obj.routing[1..].copy_from_slice(&[sdf[0], signed_angle.to_bits(), sdf[2]]);
                 }
             }
-            let surface = surface.draw(g, t, s, obj)?;
+            let surface = surface.draw(g, t, s, obj, &mut draws)?;
             if cartoon && matches!(cfg.outline, Outline::Hull | Outline::Quad) {
                 outlines.push((i.mesh, surface));
             }
         }
+        draws.emit(g, t, s)?;
         if !outlines.is_empty() {
             let mut camera = s.view_projection().to_cols_array().to_vec();
             camera.extend(s.camera.eye().extend(1.).to_array());

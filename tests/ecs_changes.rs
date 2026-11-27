@@ -218,3 +218,44 @@ fn readers_older_than_retained_epochs_reconcile_from_the_world() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn moving_and_toggling_one_light_preserves_other_records_and_old_snapshots() -> Result<()> {
+    let mut w = World::demo();
+    let ids: Vec<_> = (0..256)
+        .map(|_| {
+            w.spawn(Entity {
+                light: Some(Light::point([1.; 3], 2., 8.)),
+                ..Default::default()
+            })
+        })
+        .collect();
+    let id = ids[103];
+    let mut x = SceneExtractor::default();
+    let before = extract(&mut x, &w)?;
+    let mut light = w.entities[&id].light.unwrap();
+    let local = Mat4::from_translation(Vec3::Y);
+    light.intensity = 7.;
+    w.set_light_instance(id, light, local)?;
+    let moved = extract(&mut x, &w)?;
+    assert_eq!(moved.scene.stats.entities_visited, 1);
+    assert!(!moved.scene.stats.full_rebuild);
+    for (old, new) in before.scene.lights().iter().zip(moved.scene.lights()) {
+        if old.id == id {
+            assert_eq!(old.position, Vec3::ZERO);
+            assert_eq!(new.position, Vec3::Y);
+            assert_eq!(new.radiance, [7.; 3]);
+        } else {
+            assert_eq!(old, new);
+        }
+    }
+    for enabled in [false, true] {
+        light.enabled = enabled;
+        w.set_light_instance(id, light, local)?;
+        let partial = extract(&mut x, &w)?;
+        let full = extract(&mut SceneExtractor::default(), &w)?;
+        assert_eq!(partial.scene.stats.entities_visited, 1);
+        assert_eq!(partial.scene.lights(), full.scene.lights());
+    }
+    Ok(())
+}

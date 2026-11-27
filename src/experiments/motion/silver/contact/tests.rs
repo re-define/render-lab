@@ -583,6 +583,88 @@ fn translating_deck_carries_the_root_and_takeoff_inherits_its_velocity() -> Resu
 }
 
 #[test]
+fn rotating_deck_transfers_contact_point_velocity_and_replays_across_save_and_cadence() -> Result<()>
+{
+    let mut world = scene()?;
+    let id = actor(&world).unwrap();
+    let mut contact = world
+        .typed_component::<Contact>(id, SETTING)?
+        .unwrap()
+        .into_owned();
+    traversal::Section::Gap.practice(&mut world, id, &mut contact)?;
+    let floor = contact.floor;
+    let axis_center = world.entities[&floor].local.w_axis.truncate();
+    let rate = 0.8;
+    world.set_typed_component(floor, dynamics::TURNTABLE, rate);
+    world.set_typed_component(id, SETTING, contact);
+    let one = rayon::ThreadPoolBuilder::new().num_threads(1).build()?;
+    let four = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+    let mut s = Schedule::default();
+    install(&world, &mut s)?;
+    let mut w = Arc::new(world);
+    for _ in 0..4 {
+        s.tick(&mut w, 1. / 60., &one)?;
+    }
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("rotating.json");
+    w.save(&path)?;
+    let mut resumed_world = World::load(&path)?;
+    crate::experiments::SceneConfiguration::restore(&mut resumed_world)?;
+    let mut resumed_s = Schedule::default();
+    install(&resumed_world, &mut resumed_s)?;
+    let mut resumed = Arc::new(resumed_world);
+    let mut launch = None;
+    for _ in 0..16 {
+        for _ in 0..2 {
+            let before = w
+                .typed_component::<dynamics::Body>(id, dynamics::BODY)?
+                .unwrap();
+            let grounded = before.support == Some(floor);
+            let root = before.particle.position;
+            s.tick(&mut w, 1. / 60., &one)?;
+            let after = w
+                .typed_component::<dynamics::Body>(id, dynamics::BODY)?
+                .unwrap();
+            if grounded && after.support.is_none() {
+                let expected_x = rate * (root.z - axis_center.z);
+                let actual_x = after.particle.velocity().x;
+                assert!(expected_x.abs() > 0.1);
+                assert!(
+                    (actual_x - expected_x).abs() < 0.002,
+                    "takeoff x: {actual_x}, expected {expected_x}"
+                );
+                launch = Some((actual_x, expected_x));
+            }
+        }
+        resumed_s.tick(&mut resumed, 1. / 30., &four)?;
+        let a = w
+            .typed_component::<dynamics::Body>(id, dynamics::BODY)?
+            .unwrap();
+        let b = resumed
+            .typed_component::<dynamics::Body>(id, dynamics::BODY)?
+            .unwrap();
+        assert_eq!(a.support, b.support);
+        assert!(a.particle.position.abs_diff_eq(b.particle.position, 2e-5));
+        assert!(a.particle.momentum.abs_diff_eq(b.particle.momentum, 2e-4));
+        assert!(
+            w.entities[&floor]
+                .local
+                .abs_diff_eq(resumed.entities[&floor].local, 2e-5)
+        );
+        for &joint in &player(&w, id)?.bones {
+            assert!(
+                w.entities[&joint]
+                    .local
+                    .abs_diff_eq(resumed.entities[&joint].local, 2e-5)
+            );
+        }
+    }
+    let (actual, expected) = launch.context("no takeoff from the driven deck")?;
+    println!("rotating deck takeoff x: actual {actual:.6}, expected {expected:.6} m/s");
+    Ok(())
+}
+
+#[test]
 fn replacing_a_live_rig_discards_stale_sources_and_restores_after_save() -> Result<()> {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build()?;
     let mut world = Arc::new(scene()?);

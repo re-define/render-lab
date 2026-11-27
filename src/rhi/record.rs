@@ -96,11 +96,12 @@ struct RecordContext<'a> {
 }
 
 impl Recorder {
-    unsafe fn barriers(&mut self, graph: &Graph, step: &Step, res: &[Physical]) {
+    unsafe fn barriers(&mut self, plan: &Plan, step: &Step, res: &[Physical]) {
+        let graph = &plan.graph;
         let mut images = vec![];
         let mut memory = vk::MemoryBarrier2::default();
         let pass = &graph.passes[step.index];
-        let count = self.gpu.queues.len();
+        let count = self.gpu.queues.len().min(plan.queue_limit);
         let queue = queues::physical_queue(pass.queue, count);
         // Submission order alone does not establish an execution dependency.
         if pass
@@ -234,7 +235,7 @@ impl Recorder {
         let d = &gpu.dev;
         let cmd = self.cmd;
         d.cmd_write_timestamp2(cmd, S::TOP_OF_PIPE, self.query, 2 * offset as u32);
-        self.barriers(&plan.graph, step, res);
+        self.barriers(plan, step, res);
         let op = &plan.graph.passes[step.index].op;
         let raster = if gpu.raster_queries && matches!(op, Op::Draw { .. }) {
             self.raster

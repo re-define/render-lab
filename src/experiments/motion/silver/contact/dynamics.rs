@@ -5,7 +5,23 @@ use crate::{
     physics::{Particle, SupportFace},
 };
 
+pub(super) fn register(systems: &mut CharacterSystems, schedule: &mut Schedule) -> Result<()> {
+    schedule.add_fixed_system(character_clock(), Arc::new(Turntables))?;
+    systems.register(|actors| {
+        let mut platforms = BTreeMap::<Id, Vec<Arc<Stage>>>::new();
+        for actor in actors.values() {
+            platforms
+                .entry(actor.plate)
+                .or_default()
+                .push(actor.clone());
+        }
+        Integrate(platforms.into_values().collect())
+    });
+    Ok(())
+}
+
 pub(super) const BODY: &str = "lab.silver_wolf.body";
+pub(super) const TURNTABLE: &str = "lab.physics.turntable";
 pub(super) const SPRING: &str = "lab.physics.spring_plate";
 const PLATE_MASS: f32 = 22.;
 
@@ -31,6 +47,29 @@ impl Spring {
 const MAX_STEP: f32 = 0.16;
 const TRACTION: f32 = 1.4;
 
+// Old saves recorded the top-face position only. They recover translation on the first
+// substep and start measuring rotation once a full orientation has been observed.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(untagged)]
+enum PreviousFace {
+    Rigid { center: Vec3, rotation: glam::Quat },
+    Translation(Vec3),
+}
+impl PreviousFace {
+    fn of(face: SupportFace) -> Self {
+        Self::Rigid {
+            center: face.center,
+            rotation: face.rotation,
+        }
+    }
+    fn pose(self) -> (Vec3, Option<glam::Quat>) {
+        match self {
+            Self::Rigid { center, rotation } => (center, Some(rotation)),
+            Self::Translation(center) => (center, None),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Body {
     pub particle: Particle,
@@ -43,9 +82,8 @@ pub(super) struct Body {
     /// Final support poses for same-substep IK. Recomputed before the first IK after load.
     #[serde(skip)]
     pub faces: Arc<[SupportFace]>,
-    // Prior top centers supply a translating movement base's velocity, including on replay.
-    #[serde(default)]
-    previous_centers: Vec<(Id, Vec3)>,
+    #[serde(default, alias = "previous_centers")]
+    previous_faces: Vec<(Id, PreviousFace)>,
     #[serde(default)]
     base_velocity: Vec3,
 }
@@ -64,14 +102,13 @@ impl Body {
             landing_impulse: 0.,
             palm_impulse: 0.,
             faces: Arc::default(),
-            previous_centers: Vec::new(),
+            previous_faces: Vec::new(),
             base_velocity: Vec3::ZERO,
         }
     }
-    #[cfg(test)]
     pub(super) fn remap_supports(&mut self, map: impl Fn(Id) -> Id) {
         self.support = self.support.map(&map);
-        for (id, _) in &mut self.previous_centers {
+        for (id, _) in &mut self.previous_faces {
             *id = map(*id);
         }
     }
@@ -83,7 +120,7 @@ impl Body {
         self.landing_impulse = 0.;
         self.palm_impulse = 0.;
         self.base_velocity = Vec3::ZERO;
-        self.previous_centers.clear();
+        self.previous_faces.clear();
         self.faces = Arc::default();
     }
     pub fn validate(&self) -> Result<()> {
@@ -93,7 +130,10 @@ impl Body {
                 && self.particle.mass.is_finite()
                 && self.particle.mass > 0.
                 && self.base_velocity.is_finite()
-                && self.previous_centers.iter().all(|(_, p)| p.is_finite())
+                && self.previous_faces.iter().all(|(_, prior)| {
+                    let (p, q) = prior.pose();
+                    p.is_finite() && q.is_none_or(|q| q.is_finite() && q.is_normalized())
+                })
                 && self.gravity.is_finite()
                 && self.gravity > 0.
                 && self.jump_impulse.is_finite()
@@ -105,6 +145,53 @@ impl Body {
 }
 fn support(id: Id, model: Mat4) -> Result<SupportFace> {
     SupportFace::from_box(id, model, 0.65).context("invalid walkable support transform")
+}
+/// Optional yaw drive, registered independently on the character clock. Its state is
+/// the support entity's transform plus its speed in radians per second.
+pub(super) struct Turntables;
+impl SimulationSystem for Turntables {
+    fn order(&self) -> SystemOrder {
+        SystemOrder {
+            key: Some(TURNTABLE),
+            after: &[],
+        }
+    }
+    fn access(&self) -> SystemAccess {
+        SystemAccess {
+            name: "Rotating support drives",
+            reads: &[Component(TURNTABLE), LocalTransformsById],
+            writes: &[LocalTransformsById],
+        }
+    }
+    fn transform_targets(&self, bindings: &TransformBindings<'_>) -> Result<TransformTargets> {
+        let ids = bindings.component_owners(TURNTABLE)?.to_vec();
+        Ok(TransformTargets {
+            reads: ids.clone(),
+            writes: ids,
+        })
+    }
+    fn run(&self, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
+        for id in cx.component_owners(TURNTABLE)?.to_vec() {
+            let rate = *cx
+                .component::<f32>(id, TURNTABLE)?
+                .context("missing turntable speed")?;
+            let angle = rate * dt;
+            ensure!(
+                angle.is_finite() && angle.abs() < std::f32::consts::PI,
+                "turntable rotation must be resolvable within one substep"
+            );
+            if angle != 0. {
+                let transform = cx.local(id)?.context("missing turntable transform")?;
+                let (scale, rotation, translation) = transform.to_scale_rotation_translation();
+                let rotated = (Quat::from_rotation_y(angle) * rotation).normalize();
+                cx.set_pose([(
+                    id,
+                    Mat4::from_scale_rotation_translation(scale, rotated, translation),
+                )])?;
+            }
+        }
+        Ok(())
+    }
 }
 // A platform is integrated once per substep. All occupants see its same predicted state.
 pub(super) struct Integrate(pub Vec<Vec<Arc<Stage>>>);
@@ -120,7 +207,7 @@ impl SimulationSystem for Integrate {
     fn order(&self) -> SystemOrder {
         SystemOrder {
             key: Some(BODY),
-            after: &[PLAYER],
+            after: &[PLAYER, TURNTABLE],
         }
     }
     fn access(&self) -> SystemAccess {
@@ -140,7 +227,7 @@ impl SimulationSystem for Integrate {
             ],
         }
     }
-    fn transform_targets(&self, _: &TransformBindings<'_>) -> Result<TransformTargets> {
+    fn bound_transforms(&self) -> Option<TransformTargets> {
         let mut targets = TransformTargets::default();
         for group in &self.0 {
             targets.writes.push(group[0].plate);
@@ -150,7 +237,7 @@ impl SimulationSystem for Integrate {
                 targets.writes.push(s.actor);
             }
         }
-        Ok(targets)
+        Some(targets)
     }
     fn run(&self, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
         cx.for_each_parallel(&self.0, |group, cx| {
@@ -179,24 +266,24 @@ impl SimulationSystem for Integrate {
             } else {
                 support(id, plate)?
             };
-            let center = final_face.center;
+
             for (s, mut result) in group.iter().zip(solved) {
                 if result.body.support == Some(id) {
                     result.body.particle.position.y += plate.w_axis.y - predicted_y;
                 }
                 if let Some((_, last)) = result
                     .body
-                    .previous_centers
+                    .previous_faces
                     .iter_mut()
                     .find(|(k, _)| *k == id)
                 {
-                    *last = center;
+                    *last = PreviousFace::of(final_face);
                 }
                 for f in &mut result.faces {
                     if f.id == id {
-                        let velocity = f.velocity;
+                        let twist = (f.velocity, f.angular_velocity);
                         *f = final_face;
-                        f.velocity = velocity;
+                        (f.velocity, f.angular_velocity) = twist;
                     }
                 }
                 result.body.faces = result.faces.into();
@@ -237,18 +324,20 @@ fn solve(s: &Stage, cx: &SystemContext<'_>, dt: f32, plate: SupportFace) -> Resu
     }
 
     for floor in &mut floors {
-        if let Some((_, prior)) = body.previous_centers.iter().find(|(id, _)| *id == floor.id) {
-            floor.velocity = (floor.center - *prior) / dt;
+        if let Some((_, prior)) = body.previous_faces.iter().find(|(id, _)| *id == floor.id) {
+            let (center, rotation) = prior.pose();
+            floor.set_previous(center, rotation, dt);
         }
         // The plate has its own vertical degree of freedom.
         if floor.id == s.plate {
             floor.velocity.y = plate.velocity.y;
         }
     }
+    let previous_support = body.support;
     let mut base = body
         .support
         .and_then(|id| floors.iter().find(|f| f.id == id))
-        .map_or(Vec3::ZERO, |f| f.velocity);
+        .map_or(Vec3::ZERO, |f| f.velocity_at(body.particle.position));
     if body.support == Some(s.plate) {
         base.y = 0.;
     }
@@ -315,7 +404,7 @@ fn solve(s: &Stage, cx: &SystemContext<'_>, dt: f32, plate: SupportFace) -> Resu
             .iter()
             .filter_map(|&surface| {
                 surface
-                    .sweep(before, end, surface.velocity * dt)
+                    .sweep(before, end, surface.carry(before, dt) - before)
                     .map(|(t, p)| (t, surface, p))
             })
             .min_by(|a, b| a.0.total_cmp(&b.0));
@@ -345,7 +434,7 @@ fn solve(s: &Stage, cx: &SystemContext<'_>, dt: f32, plate: SupportFace) -> Resu
         let inv_mass = if movable { 1. / PLATE_MASS } else { 0. };
         let impulse = body.particle.contact(
             surf.normal,
-            surf.velocity,
+            surf.velocity_at(at),
             inv_mass,
             if grounded { 0. } else { 0.38 },
         );
@@ -354,7 +443,7 @@ fn solve(s: &Stage, cx: &SystemContext<'_>, dt: f32, plate: SupportFace) -> Resu
         } else {
             // Sweep returns the impact point expressed on the end-of-step face.
             body.particle.position =
-                at + (body.particle.velocity() - surf.velocity) * dt * (1. - fraction);
+                at + (body.particle.velocity() - surf.velocity_at(at)) * dt * (1. - fraction);
             if let Some(point) = surf.below(body.particle.position) {
                 body.particle.position.y = point.y;
             }
@@ -375,16 +464,21 @@ fn solve(s: &Stage, cx: &SystemContext<'_>, dt: f32, plate: SupportFace) -> Resu
             }
         }
     }
-    body.base_velocity = body
-        .support
-        .and_then(|id| floors.iter().find(|s| s.id == id))
-        .map_or(Vec3::ZERO, |s| s.velocity);
+    body.base_velocity = if body.support == previous_support && body.support.is_some() {
+        // The applied carrier impulse used the point velocity at the start of the step.
+        // Keep that sample so a rotating carrier supplies the next centripetal change.
+        base
+    } else {
+        body.support
+            .and_then(|id| floors.iter().find(|s| s.id == id))
+            .map_or(Vec3::ZERO, |s| s.velocity_at(body.particle.position))
+    };
     if body.support == Some(s.plate) {
         body.base_velocity.y = 0.;
     }
-    body.previous_centers.clear();
-    body.previous_centers
-        .extend(floors.iter().map(|s| (s.id, s.center)));
+    body.previous_faces.clear();
+    body.previous_faces
+        .extend(floors.iter().map(|s| (s.id, PreviousFace::of(*s))));
     Ok(Solved {
         root,
         body,
@@ -393,4 +487,20 @@ fn solve(s: &Stage, cx: &SystemContext<'_>, dt: f32, plate: SupportFace) -> Resu
         plate_height_delta,
         faces: floors,
     })
+}
+
+#[cfg(test)]
+#[test]
+fn serialized_translation_history_upgrades_to_rigid_history() -> Result<()> {
+    let mut saved = serde_json::to_value(Body::new(Vec3::ZERO))?;
+    saved.as_object_mut().unwrap().remove("previous_faces");
+    saved["previous_centers"] = serde_json::json!([[11, [1.0, 2.0, 3.0]]]);
+    let body: Body = serde_json::from_value(saved)?;
+    body.validate()?;
+    assert_eq!(body.previous_faces[0].0, 11);
+    assert_eq!(
+        body.previous_faces[0].1.pose(),
+        (Vec3::new(1., 2., 3.), None)
+    );
+    Ok(())
 }

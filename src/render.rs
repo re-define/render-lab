@@ -10,7 +10,9 @@ pub(crate) use frame_graph::FrameStamp;
 pub use frame_graph::{FrameGraph, FramePlan, FrameProducts};
 mod atlas;
 pub(crate) use atlas::{Atlas, AtlasCache};
+mod draw_list;
 mod geometry;
+pub(crate) use draw_list::OrdinaryDrawList;
 mod lights;
 mod motion;
 pub(crate) mod rays;
@@ -138,8 +140,11 @@ pub(crate) use materials::material_code;
 pub use materials::{LightingInput, MaterialCode, MaterialPrograms};
 pub mod post;
 pub struct Snapshot {
+    pub(crate) secondary_view: bool,
     /// Capabilities of the backend which will execute this snapshot.
     pub buffer_atomic64: bool,
+    /// Keep individual mesh draws for correctness and performance comparisons.
+    pub reference_draws: bool,
     pub ray_caps: crate::rhi::RayCapabilities,
     pub materials: Arc<MaterialPrograms>,
     pub scene: Arc<RenderScene>,
@@ -155,6 +160,21 @@ impl Snapshot {
         materials: Arc<MaterialPrograms>,
     ) -> Result<Self> {
         SceneExtractor::default().snapshot(world, camera, extent, materials)
+    }
+
+    /// A second view reads the same extracted scene, with its own camera and temporal sequence.
+    pub(crate) fn for_camera(&self, camera: Camera, extent: [u32; 2]) -> Self {
+        Self {
+            secondary_view: true,
+            camera,
+            extent,
+            scene: self.scene.clone(),
+            materials: self.materials.clone(),
+            temporal: None,
+            ray_caps: self.ray_caps,
+            buffer_atomic64: self.buffer_atomic64,
+            reference_draws: self.reference_draws,
+        }
     }
 
     pub fn view_projection(&self) -> Mat4 {

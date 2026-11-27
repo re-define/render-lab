@@ -102,6 +102,7 @@ pub(super) fn remove_semaphore_covered_reads(plan: &mut Plan, queue_count: usize
         let queue = physical_queue(plan.graph.passes[step.index].queue, queue_count);
         step.barriers.retain(|barrier| {
             barrier.to.writes()
+                || plan.graph.split_buffer(barrier.resource)
                 || barrier.to == Access::HostRead
                 || plan.graph.image_desc(barrier.resource).is_some()
                 || !writer[barrier.resource.0].is_some_and(|(producer, source)| {
@@ -122,7 +123,7 @@ pub(super) struct Timelines {
     gpu: Arc<Gpu>,
     sems: Vec<vk::Semaphore>,
     values: Vec<u64>,
-    histories: HashMap<u64, Vec<u64>>,
+    pub(super) histories: HashMap<u64, Vec<u64>>,
     release_ready: bool,
 }
 impl Timelines {
@@ -152,7 +153,12 @@ impl Timelines {
         Ok(result)
     }
     pub fn recording_layout(&self, p: &Plan, workers: usize) -> RecordingLayout {
-        let queue = |step: &Step| physical_queue(p.graph.passes[step.index].queue, self.sems.len());
+        let queue = |step: &Step| {
+            physical_queue(
+                p.graph.passes[step.index].queue,
+                self.sems.len().min(p.queue_limit),
+            )
+        };
         let device_work = |step: &Step| {
             !matches!(
                 p.graph.passes[step.index].op,
@@ -175,7 +181,12 @@ impl Timelines {
         resources: &[Physical],
         image: Option<present::Acquired>,
     ) -> Result<Vec<Arc<frame::QueueBatch>>> {
-        let queue = |step: &Step| physical_queue(p.graph.passes[step.index].queue, g.queues.len());
+        let queue = |step: &Step| {
+            physical_queue(
+                p.graph.passes[step.index].queue,
+                g.queues.len().min(p.queue_limit),
+            )
+        };
         let previous = std::mem::take(&mut self.histories);
         let uses = &p.pass_uses;
         let mut signals = vec![(0, 0u64); p.steps.len()];

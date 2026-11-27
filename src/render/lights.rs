@@ -77,6 +77,7 @@ pub(crate) fn pack_lights(lights: &[GpuLight]) -> Arc<[u8]> {
     packed.into()
 }
 
+#[derive(Clone)]
 pub(crate) struct SceneLights {
     /// An authored table remains selected when every light is disabled.
     pub present: bool,
@@ -87,22 +88,79 @@ pub(crate) struct SceneLights {
 }
 
 impl SceneLights {
-    pub(super) fn new(present: bool, entries: Vec<RenderLight>) -> Self {
-        let bytes = pack_lights(&entries.iter().map(GpuLight::from).collect::<Vec<_>>());
-        let mut key = DefaultHasher::new();
-        bytes.hash(&mut key);
-        entries.iter().for_each(|light| light.id.hash(&mut key));
-        let diffuse_sky = entries
+    fn hash(light: &RenderLight) -> u64 {
+        let mut hash = DefaultHasher::new();
+        light.id.hash(&mut hash);
+        bytemuck::bytes_of(&GpuLight::from(light)).hash(&mut hash);
+        hash.finish()
+    }
+
+    pub(super) fn entry(&self, id: Id) -> Option<&RenderLight> {
+        self.entries
+            .binary_search_by_key(&id, |light| light.id)
+            .ok()
+            .map(|i| &self.entries[i])
+    }
+
+    pub(super) fn update(&mut self, changes: Vec<(Id, Option<RenderLight>)>) {
+        let mut layout_changed = false;
+        let mut sky_changed = false;
+        for (id, new) in changes {
+            let at = self.entries.binary_search_by_key(&id, |light| light.id);
+            if let Ok(i) = at {
+                let old = &self.entries[i];
+                self.signature ^= Self::hash(old);
+                sky_changed |= old.sky_fraction != 0.;
+            }
+            if let Some(new) = new {
+                self.signature ^= Self::hash(&new);
+                sky_changed |= new.sky_fraction != 0.;
+                match at {
+                    Ok(i) => {
+                        self.entries[i] = new;
+                        if !layout_changed {
+                            let stride = size_of::<GpuLight>();
+                            let start = 16 + stride * i;
+                            Arc::make_mut(&mut self.bytes)[start..start + stride]
+                                .copy_from_slice(bytemuck::bytes_of(&GpuLight::from(&new)));
+                        }
+                    }
+                    Err(i) => {
+                        self.entries.insert(i, new);
+                        layout_changed = true;
+                    }
+                }
+            } else if let Ok(i) = at {
+                self.entries.remove(i);
+                layout_changed = true;
+            }
+        }
+        if layout_changed {
+            self.bytes = pack_lights(&self.entries.iter().map(GpuLight::from).collect::<Vec<_>>());
+        }
+        if sky_changed {
+            self.diffuse_sky = Self::sky(&self.entries);
+        }
+    }
+
+    fn sky(entries: &[RenderLight]) -> [f32; 4] {
+        entries
             .iter()
             .map(|l| Vec3::from(l.radiance) * l.sky_fraction)
             .sum::<Vec3>()
             .extend(0.)
-            .to_array();
+            .to_array()
+    }
+
+    pub(super) fn new(present: bool, entries: Vec<RenderLight>) -> Self {
+        let bytes = pack_lights(&entries.iter().map(GpuLight::from).collect::<Vec<_>>());
+        let signature = entries.iter().fold(0, |sum, light| sum ^ Self::hash(light));
+        let diffuse_sky = Self::sky(&entries);
         Self {
             present,
             entries,
             bytes,
-            signature: key.finish(),
+            signature,
             diffuse_sky,
         }
     }

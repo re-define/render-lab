@@ -1,7 +1,7 @@
 //! Bounded, multi-reader edit history. Each extractor keeps its own cursor.
 use super::*;
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ops::Deref,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -52,6 +52,7 @@ pub(crate) enum Write {
     Local,
     Material,
     Texture,
+    Light,
     Component(&'static str),
     TypedValue(&'static str),
 }
@@ -68,7 +69,69 @@ struct Journal {
     identity: Arc<()>,
     epoch: u64,
     sealed: AtomicBool,
-    history: VecDeque<HashSet<(Id, Write)>>,
+    history: VecDeque<Epoch>,
+    pose_revision: u64,
+}
+
+#[derive(Default)]
+struct Epoch {
+    writes: HashSet<(Id, Write)>,
+    poses: HashMap<Id, PublishedPose>,
+}
+
+pub(crate) struct Edits<'a>(std::collections::vec_deque::Iter<'a, Epoch>);
+impl Edits<'_> {
+    pub fn writes(&self) -> impl Iterator<Item = (Id, Write)> + '_ {
+        self.0
+            .clone()
+            .flat_map(|epoch| epoch.writes.iter().copied())
+    }
+    pub fn poses(&self) -> impl Iterator<Item = &PublishedPose> {
+        self.0.clone().flat_map(|epoch| epoch.poses.values())
+    }
+}
+
+/// Stable local-joint order for a pose producer. Validate the binding once at rig setup.
+#[derive(Clone)]
+pub struct PoseLayout(Arc<[Id]>);
+impl PoseLayout {
+    pub fn new(ids: impl IntoIterator<Item = Id>) -> Result<Self> {
+        let ids: Arc<[Id]> = ids.into_iter().collect();
+        ensure!(
+            !ids.is_empty() && ids.iter().copied().collect::<HashSet<_>>().len() == ids.len(),
+            "pose layout needs distinct joints"
+        );
+        Ok(Self(ids))
+    }
+    pub fn joints(&self) -> &[Id] {
+        &self.0
+    }
+}
+/// The latest complete authored pose in this journal epoch, with the union of
+/// changes since it opened. Older snapshots retain their own immutable palette.
+pub(crate) struct PublishedPose {
+    pub revision: u64,
+    pub joints: Arc<[Id]>,
+    pub locals: Vec<Mat4>,
+    dirty: Vec<u64>,
+}
+impl PublishedPose {
+    pub fn changes(&self) -> impl Iterator<Item = (Id, Mat4)> + '_ {
+        self.dirty
+            .iter()
+            .enumerate()
+            .flat_map(move |(word, &mask)| {
+                let mut remaining = mask;
+                std::iter::from_fn(move || {
+                    if remaining == 0 {
+                        return None;
+                    }
+                    let index = word * 64 + remaining.trailing_zeros() as usize;
+                    remaining &= remaining - 1;
+                    Some((self.joints[index], self.locals[index]))
+                })
+            })
+    }
 }
 impl Journal {
     fn invalidate(&mut self) {
@@ -76,19 +139,23 @@ impl Journal {
             *self = Self::default();
         }
     }
-    fn write(&mut self, id: Id, kind: Write) {
+    fn current(&mut self) -> &mut Epoch {
         if self.history.is_empty() || *self.sealed.get_mut() {
             *self.sealed.get_mut() = false;
             self.epoch = self.epoch.checked_add(1).expect("ECS epoch exhausted");
             let mut batch = if self.history.len() == RETAINED_EPOCHS {
                 self.history.pop_front().unwrap()
             } else {
-                HashSet::new()
+                Epoch::default()
             };
-            batch.clear();
+            batch.writes.clear();
+            batch.poses.clear();
             self.history.push_back(batch);
         }
-        self.history.back_mut().unwrap().insert((id, kind));
+        self.history.back_mut().unwrap()
+    }
+    fn write(&mut self, id: Id, kind: Write) {
+        self.current().writes.insert((id, kind));
     }
 }
 
@@ -160,16 +227,61 @@ impl Entities {
             sequence: self.journal.epoch,
         }
     }
-    pub(crate) fn changes(
-        &self,
-        cursor: &Cursor,
-    ) -> Option<impl Iterator<Item = (Id, Write)> + '_> {
+    pub(crate) fn publish_pose(&mut self, owner: Id, layout: PoseLayout, locals: Vec<Mat4>) {
+        let joints = layout.0;
+        debug_assert_eq!(joints.len(), locals.len());
+        let (rows, journal) = (&mut self.rows, &mut self.journal);
+        let mut changed = joints
+            .iter()
+            .zip(&locals)
+            .enumerate()
+            .filter_map(|(i, (id, local))| {
+                let row = rows.get_mut(id)?;
+                if row.local == *local {
+                    return None;
+                }
+                row.local = *local;
+                Some(i)
+            });
+        let Some(first) = changed.next() else {
+            return;
+        };
+        journal.pose_revision = journal
+            .pose_revision
+            .checked_add(1)
+            .expect("pose versions exhausted");
+        let revision = journal.pose_revision;
+        let epoch = journal.current();
+        if let Some(old) = epoch.poses.get(&owner)
+            && !Arc::ptr_eq(&old.joints, &joints)
+            && *old.joints != *joints
+        {
+            // A new binding can omit joints changed earlier in the same epoch.
+            for (id, _) in old.changes() {
+                epoch.writes.insert((id, Write::Local));
+            }
+            epoch.poses.remove(&owner);
+        }
+        let word_count = joints.len().div_ceil(64);
+        let pose = epoch.poses.entry(owner).or_insert_with(|| PublishedPose {
+            revision,
+            joints: joints.clone(),
+            locals: Vec::new(),
+            dirty: vec![0; word_count],
+        });
+        for index in std::iter::once(first).chain(changed) {
+            pose.dirty[index / 64] |= 1 << (index % 64);
+        }
+        pose.revision = revision;
+        pose.locals = locals;
+    }
+    pub(crate) fn changes(&self, cursor: &Cursor) -> Option<Edits<'_>> {
         if !Arc::ptr_eq(&self.journal.identity, &cursor.identity) {
             return None;
         }
         let count = usize::try_from(self.journal.epoch.checked_sub(cursor.sequence)?).ok()?;
         let start = self.journal.history.len().checked_sub(count)?;
-        Some(self.journal.history.range(start..).flatten().copied())
+        Some(Edits(self.journal.history.range(start..)))
     }
     /// A raw row edit may alter several fields. Asset layouts and extension membership
     /// use full reconciliation; sparse rows are checked against their old bindings.
@@ -241,6 +353,27 @@ impl World {
         self.entities
             .set_local_if_present(id, local)
             .context("missing transform entity")
+    }
+    /// Update an existing light, validating its new world-space direction before either edit commits.
+    pub fn set_light_instance(&mut self, id: Id, light: Light, local: Mat4) -> Result<()> {
+        let entity = self.entities.get(&id).context("missing light entity")?;
+        let old = entity.light.context("entity has no light")?;
+        let mut parent = entity.parent;
+        let mut chain = Vec::new();
+        while let Some(next) = parent {
+            ensure!(
+                chain.len() < self.entities.len(),
+                "cycle in light hierarchy"
+            );
+            let ancestor = self.entities.get(&next).context("missing light parent")?;
+            chain.push(ancestor.local);
+            parent = ancestor.parent;
+        }
+        light.validate(chain.into_iter().rev().fold(Mat4::IDENTITY, |m, t| m * t) * local)?;
+        if old != light {
+            self.entities.edit(id, Write::Light).unwrap().light = Some(light);
+        }
+        self.set_local(id, local)
     }
     /// Replace a texture asset while retaining its entity ID and all material bindings.
     pub fn set_texture(&mut self, id: Id, texture: Arc<Texture>) -> Result<()> {

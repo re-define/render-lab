@@ -1,6 +1,6 @@
 # 实验与操作
 
-从仓库根运行 `cargo run --release --locked -- --experiment 名称`。省略预设时打开默认演示。窗口控制台和 `--command` 共用命令分派。保存和加载使用 `save PATH`、`load PATH`。不同的主渲染技术由装配器校验兼容性。[完整预设](../src/presets.rs) · [调试命令](../src/console.rs)
+引擎提供 22 个具名预设。可用 `--list-experiments` 列出名称。从仓库根运行 `cargo run --release --locked -- --experiment 名称`。省略预设时打开默认演示。窗口控制台和 `--command` 共用命令分派。保存和加载使用 `save PATH`、`load PATH`。不同的主渲染技术由装配器校验兼容性。[完整预设](../src/presets.rs) · [调试命令](../src/console.rs)
 
 | 预设 | 输入、执行内容和观察方法 |
 | --- | --- |
@@ -12,6 +12,7 @@
 | `destruction` | 物体破碎和消融，观察碎片局部变换、可见性及材料随时间变化。 |
 | `motion` | 轨迹预测驱动银狼的 Motion Matching；IJKL 控制移动，`motionsearch kd` 与 `motionsearch scan` 可对照检索。 |
 | `silver-contact` | 走、跳、撑栏、钻行与终点触摸。可调重力、起跳冲量和 IK，支持保存并继续中途动作。 |
+| `silver-contact-duo` | 两条相邻障碍路线共用银狼网格。第二个角色多一个腕部父关节，使用显式指尖绑定。用 `control ENTITY` 切换输入，`contact spin 45` 旋转受控角色的起跳板。 |
 | `toon` | 二分光照、面部 SDF 与轮廓。图像、法线外扩及边拓扑四边形路径共用同一人物资产。 |
 | `texture` | Modern Hall 的基础色用特征网格和小型 MLP 在着色时恢复。`texture original`、`texture neural` 用于同视图对照。 |
 | `gaussian` | 2D Gaussian 表示贴图；支持扫描、tile、BVH 与紧凑参数。用 `gaussian stats` 检查表示成本，比较时计入索引。 |

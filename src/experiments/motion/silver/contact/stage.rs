@@ -2,11 +2,22 @@ use super::*;
 use crate::engine::SimulationData::{Component, LocalTransformsById};
 use glam::Vec3Swizzles;
 
-pub(super) struct Prepare {
-    pub actors: BTreeMap<Id, Arc<Stage>>,
-    pub bank: Arc<SilverMatcher>,
+pub(super) fn register_motion(systems: &mut CharacterSystems, bank: Arc<SilverMatcher>) {
+    systems.register(move |actors| Prepare {
+        actors: actors.clone(),
+        bank: bank.clone(),
+    });
 }
-pub(super) struct Feedback(pub Vec<Arc<Stage>>);
+
+pub(super) fn register_ik(systems: &mut CharacterSystems) {
+    systems.register(|actors| Feedback(actors.values().cloned().collect()));
+}
+
+struct Prepare {
+    actors: Actors,
+    bank: Arc<SilverMatcher>,
+}
+struct Feedback(Vec<Arc<Stage>>);
 
 impl Stage {
     pub(super) fn state(&self, cx: &SystemContext<'_>) -> Result<Contact> {
@@ -14,13 +25,6 @@ impl Stage {
             .component::<Contact>(self.actor, SETTING)?
             .context("missing contact state")?
             .into_owned())
-    }
-    fn corrected(&self) -> Vec<Id> {
-        self.rig
-            .corrected
-            .iter()
-            .map(|&i| self.rig.ids[i])
-            .collect()
     }
 }
 fn local(cx: &SystemContext<'_>, id: Id) -> Result<Mat4> {
@@ -125,15 +129,17 @@ impl SimulationSystem for Feedback {
             writes: &[Component(SETTING), LocalTransformsById],
         }
     }
-    fn transform_targets(&self, _: &TransformBindings<'_>) -> Result<TransformTargets> {
+    fn bound_transforms(&self) -> Option<TransformTargets> {
         let mut targets = TransformTargets::default();
         for s in &self.0 {
             targets.reads.extend_from_slice(&s.rig.ids);
             targets.reads.extend(s.rail);
             targets.reads.push(s.target);
-            targets.writes.extend(s.corrected());
+            targets
+                .writes
+                .extend_from_slice(s.rig.published_joints.joints());
         }
-        Ok(targets)
+        Some(targets)
     }
     fn run(&self, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
         cx.for_each_parallel(&self.0, |s, cx| feedback(s, cx, dt))
@@ -261,6 +267,10 @@ fn feedback(s: &Stage, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
     c.error_m = pose.world[r.finger]
         .transform_point3(r.fingertip)
         .distance(target);
-    cx.set_pose(r.corrected.iter().map(|&i| (r.ids[i], pose.local[i])))?;
+    cx.publish_pose(
+        s.actor,
+        r.published_joints.clone(),
+        r.corrected.iter().map(|&i| pose.local[i]).collect(),
+    )?;
     cx.set_typed_component(s.actor, SETTING, c)
 }

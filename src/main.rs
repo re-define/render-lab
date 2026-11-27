@@ -10,6 +10,9 @@ use std::{
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let mut capture = None;
+    let mut secondary_capture = None;
+    let mut secondary_record = None;
+    let mut secondary_yaw = 45.0_f32;
     let mut warmup = None;
     let mut output_size: Option<[u32; 2]> = None;
     let mut benchmark = None;
@@ -25,6 +28,23 @@ fn main() -> Result<()> {
             Some("--record") => recordings.push(PathBuf::from(
                 args.next().context("--record needs a GIF or MP4 path")?,
             )),
+            Some("--secondary-capture") => {
+                secondary_capture = Some(PathBuf::from(
+                    args.next().context("missing secondary PNG path")?,
+                ))
+            }
+            Some("--secondary-record") => {
+                secondary_record = Some(PathBuf::from(
+                    args.next().context("missing secondary recording path")?,
+                ))
+            }
+            Some("--secondary-yaw") => {
+                secondary_yaw = args
+                    .next()
+                    .context("missing orbit angle in degrees")?
+                    .to_string_lossy()
+                    .parse()?
+            }
             Some("--fps") => {
                 fps = args
                     .next()
@@ -109,7 +129,7 @@ fn main() -> Result<()> {
             }
             Some("--help") => {
                 println!(
-                    "render-lab [--list-experiments] [--experiment NAME] [--scene FILE] [--command COMMAND] [--capture FILE.png [--size WIDTHxHEIGHT] [--warmup FRAMES] | --benchmark FRAMES | --record FILE.mp4|FILE.gif [--size WIDTHxHEIGHT] [--duration SEC] [--fps N] [--at SEC COMMAND]]"
+                    "render-lab [--list-experiments] [--experiment NAME] [--scene FILE] [--command COMMAND] [--capture FILE.png [--size WIDTHxHEIGHT] [--warmup FRAMES] [--secondary-capture FILE.png] | --benchmark FRAMES | --record FILE.mp4|FILE.gif [--size WIDTHxHEIGHT] [--secondary-record FILE.mp4|FILE.gif] [--secondary-yaw DEGREES] [--duration SEC] [--fps N] [--at SEC COMMAND]]"
                 );
                 return Ok(());
             }
@@ -131,6 +151,22 @@ fn main() -> Result<()> {
         output_size.is_none() || capture.is_some() || !recordings.is_empty(),
         "--size applies to captured images and recordings"
     );
+    anyhow::ensure!(
+        secondary_capture.is_none() || capture.is_some(),
+        "a secondary capture needs a distinct primary capture"
+    );
+    anyhow::ensure!(
+        secondary_record.is_none() || !recordings.is_empty(),
+        "a secondary recording needs a distinct primary recording"
+    );
+    validate_outputs(
+        capture
+            .iter()
+            .chain(&secondary_capture)
+            .chain(&recordings)
+            .chain(&secondary_record),
+    )?;
+    anyhow::ensure!(secondary_yaw.is_finite(), "invalid secondary camera yaw");
     let output_size = output_size.unwrap_or([800, 500]);
     anyhow::ensure!(
         (1..=100).contains(&fps) && duration.is_finite() && duration > 0.,
@@ -175,6 +211,10 @@ fn main() -> Result<()> {
             .iter()
             .map(|p| render_lab::recording::Encoder::open(p, output_size, fps))
             .collect::<Result<Vec<_>>>()?;
+        let mut second_encoder = secondary_record
+            .as_ref()
+            .map(|p| render_lab::recording::Encoder::open(p, output_size, fps))
+            .transpose()?;
         let mut events = events.into_iter().peekable();
         let n = (duration * fps as f64).ceil() as u64;
         let mut previous_clip = String::new();
@@ -186,15 +226,19 @@ fn main() -> Result<()> {
                     console.execute(&mut engine, &[], &events.next().unwrap().1)?
                 );
             }
-            let frame = read_frame(
+            let (frame, secondary) = read_views(
                 &mut engine,
                 output_size,
+                second_encoder.as_ref().map(|_| secondary_yaw),
                 if i == 0 || console.paused {
                     0.
                 } else {
                     1. / fps as f32
                 },
             )?;
+            if let (Some(encoder), Some(view)) = (&mut second_encoder, secondary) {
+                encoder.write(&view)?;
+            }
             for encoder in &mut encoders {
                 encoder.write(&frame)?;
             }
@@ -208,7 +252,7 @@ fn main() -> Result<()> {
                 previous_clip = state.clip;
             }
         }
-        for encoder in encoders {
+        for encoder in encoders.into_iter().chain(second_encoder) {
             encoder.finish()?;
         }
         println!("Recorded {n} frames at {fps} fps");
@@ -219,22 +263,26 @@ fn main() -> Result<()> {
                 .schedule
                 .tick(&mut engine.world, 1. / 60., &engine.tasks)?;
         }
-        for _ in 0..warmup.unwrap_or(1) {
-            read_frame(&mut engine, output_size, 1. / 60.)?;
+        let orbit = secondary_capture.as_ref().map(|_| secondary_yaw);
+        for i in 0..warmup.unwrap_or(1) {
+            let (frame, _) = read_views(&mut engine, output_size, orbit, 1. / 60.)?;
+            if i == 0 {
+                println!(
+                    "First frame pipelines={} create_ms={:.3}",
+                    frame.profile.pipeline_creations, frame.profile.pipeline_create_ms
+                );
+            }
         }
-        let f = read_frame(&mut engine, output_size, 0.)?;
+        let (f, secondary) = read_views(&mut engine, output_size, orbit, 0.)?;
+        if let (Some(p), Some(s)) = (secondary_capture, secondary) {
+            save_capture(p, s.extent, s.pixels)?;
+        }
+        println!(
+            "Capture pipelines={} create_ms={:.3} culled_passes={}",
+            f.profile.pipeline_creations, f.profile.pipeline_create_ms, f.profile.culled_passes
+        );
         println!("{:?}", f.counters);
-        let mut rgba = f.pixels;
-        for pixel in rgba.chunks_exact_mut(4) {
-            pixel.swap(0, 2);
-        }
-        image::save_buffer(
-            path,
-            &rgba,
-            f.extent[0],
-            f.extent[1],
-            image::ColorType::Rgba8,
-        )?;
+        save_capture(path, f.extent, f.pixels)?;
         println!("{}", f.gpu);
         for p in &f.passes {
             let parents = p
@@ -250,21 +298,94 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn read_frame(
+fn validate_outputs<'a>(outputs: impl Iterator<Item = &'a PathBuf>) -> Result<()> {
+    use std::{collections::BTreeSet, path::Path};
+    let mut seen = BTreeSet::new();
+    for path in outputs {
+        let file = path.file_name().context("output needs a filename")?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let resolved = if path.exists() {
+            path.canonicalize()?
+        } else {
+            parent.canonicalize()?.join(file)
+        };
+        #[cfg(windows)]
+        let resolved = PathBuf::from(resolved.to_string_lossy().to_lowercase());
+        anyhow::ensure!(
+            seen.insert(resolved),
+            "multiple outputs resolve to {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn save_capture(path: PathBuf, extent: [u32; 2], mut pixels: Vec<u8>) -> Result<()> {
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    image::save_buffer(path, &pixels, extent[0], extent[1], image::ColorType::Rgba8)?;
+    Ok(())
+}
+
+fn read_views(
     engine: &mut render_lab::engine::Engine,
     size: [u32; 2],
+    orbit_degrees: Option<f32>,
     dt: f32,
-) -> Result<render_lab::rhi::Frame> {
-    anyhow::ensure!(engine.tick(dt, size)?, "capture queue unexpectedly full");
+) -> Result<(render_lab::rhi::Frame, Option<render_lab::rhi::Frame>)> {
+    let secondary = orbit_degrees.map(|yaw| {
+        let mut camera = engine.camera;
+        camera.yaw += yaw.to_radians();
+        let mut post = render_lab::render::post::Settings::default();
+        post.select(render_lab::render::post::Mode::Taa);
+        render_lab::engine::OffscreenView {
+            camera,
+            extent: size,
+            post,
+        }
+    });
+    anyhow::ensure!(
+        engine.tick_with_view(dt, size, secondary)?,
+        "capture queue unexpectedly full"
+    );
     let start = Instant::now();
+    let mut primary = None;
+    let mut other = None;
     loop {
         if let Some(result) = engine.take_frame() {
-            return result.map_err(anyhow::Error::msg);
+            primary = Some(result.map_err(anyhow::Error::msg)?);
+        }
+        if let Some(result) = engine.take_secondary_frame() {
+            other = Some(result.map_err(anyhow::Error::msg)?);
+        }
+        if primary.is_some() && (secondary.is_none() || other.is_some()) {
+            return Ok((primary.take().unwrap(), other));
         }
         anyhow::ensure!(
             start.elapsed() < Duration::from_secs(120),
             "frame timed out"
         );
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[test]
+    fn output_aliases_cannot_overwrite_another_view() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let first = dir.path().join("frame.png");
+        let second = dir.path().join("nested/../frame.png");
+        assert!(validate_outputs([&first, &second].into_iter()).is_err());
+        #[cfg(windows)]
+        assert!(validate_outputs([&first, &dir.path().join("FRAME.png")].into_iter()).is_err());
+        Ok(())
     }
 }

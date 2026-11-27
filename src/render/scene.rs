@@ -28,6 +28,7 @@ pub struct MaterialId(pub Id);
 
 pub struct MeshAsset {
     ordinary: bool,
+    draw_template: std::sync::OnceLock<super::draw_list::MeshTemplate>,
     pub mesh: Arc<Mesh>,
     pub meshlets: Option<Arc<Vec<Meshlet>>>,
     pub hierarchy: Option<Arc<Vec<ClusterNode>>>,
@@ -44,6 +45,11 @@ fn same_arc<T: ?Sized>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
 }
 
 impl MeshAsset {
+    pub(super) fn ordinary_draw_template(&self) -> &super::draw_list::MeshTemplate {
+        self.draw_template
+            .get_or_init(|| super::draw_list::MeshTemplate::new(&self.mesh))
+    }
+
     pub(super) fn same_motion_geometry(&self, previous: &Self) -> bool {
         Arc::ptr_eq(&self.mesh, &previous.mesh)
             && same_arc(&self.meshlets, &previous.meshlets)
@@ -52,9 +58,11 @@ impl MeshAsset {
     }
 
     pub fn from_entity(entity: &Entity) -> Option<Self> {
+        let mesh = entity.mesh.clone()?;
         Some(Self {
             ordinary: Self::ordinary(entity),
-            mesh: entity.mesh.clone()?,
+            draw_template: Default::default(),
+            mesh,
             meshlets: entity.meshlets.clone(),
             hierarchy: entity.hierarchy.clone(),
             topology: entity.topology.clone(),
@@ -128,6 +136,11 @@ pub struct ExtractionStats {
     pub entities_visited: usize,
     pub transforms_updated: usize,
     pub palettes_updated: usize,
+    /// Per-actor pose records consumed from the journal since this reader's last snapshot.
+    pub pose_blocks_read: usize,
+    pub pose_locals_read: usize,
+    /// Palette entries actually inspected, including a dense scan when most joints changed.
+    pub palette_joints_examined: usize,
     pub instances_updated: usize,
 }
 
@@ -194,7 +207,7 @@ impl SceneExtractor {
             .as_ref()
             .and_then(|cursor| world.entities.changes(cursor));
         let partial = match edits {
-            Some(edits) => self.incremental(world, edits)?,
+            Some(edits) => self.incremental(world, edits.writes(), edits.poses())?,
             None => None,
         };
         let scene = match partial {
@@ -204,7 +217,9 @@ impl SceneExtractor {
         self.cursor = Some(world.entities.cursor());
         self.previous = Some(scene.clone());
         Ok(Snapshot {
+            secondary_view: false,
             buffer_atomic64: false,
+            reference_draws: std::env::var_os("RENDER_LAB_REFERENCE_DRAWS").is_some(),
             ray_caps: Default::default(),
             scene,
             materials,
@@ -238,7 +253,6 @@ impl SceneExtractor {
             stats.entities_visited += 1;
             if let Some(light) = entity.light {
                 has_lights = true;
-                dependencies.lights.insert(id);
                 self.transforms.row_mut(id).light = true;
                 if let Some(render_light) = self.light(id, light)? {
                     lights.push(render_light);
@@ -304,8 +318,15 @@ impl SceneExtractor {
                 if let Some(skin) = entity.skin_binding.filter(|_| !mesh.weights.is_empty()) {
                     if active_palettes.insert(skin) {
                         stats.palettes_updated += usize::from(self.update_palette(world, skin)?);
-                        for &(joint, _) in &self.palettes[&skin].joints {
-                            self.transforms.row_mut(joint).skins.push(skin);
+                        let palette = &self.palettes[&skin];
+                        let index = dependencies.skin_layouts.len();
+                        dependencies.skin_layouts.push((skin, palette.slots.len()));
+                        stats.palette_joints_examined += palette.slots.len();
+                        for (joint_index, &(joint, _)) in palette.joints.iter().enumerate() {
+                            self.transforms
+                                .row_mut(joint)
+                                .skins
+                                .add((index, joint_index));
                         }
                     }
                     dependencies.skin_users.entry(skin).or_default().push(id);

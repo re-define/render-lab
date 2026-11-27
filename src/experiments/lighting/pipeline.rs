@@ -147,6 +147,7 @@ pub(super) fn raster_frame(
         Atlas::cached(&s.scene)?,
         |g, t| {
             g.products.instance_visits += surfaces.len();
+            let mut draws = crate::render::OrdinaryDrawList::default();
             for surface in surfaces {
                 let mut material = t.material(s, surface.instance, Mat4::IDENTITY)?;
                 material.params[3] = if surface.instance.emitter {
@@ -156,9 +157,9 @@ pub(super) fn raster_frame(
                 } else {
                     0.
                 };
-                surface.draw(g, t, s, material)?;
+                surface.draw(g, t, s, material, &mut draws)?;
             }
-            Ok(())
+            draws.emit(g, t, s)
         },
         |g,
          ResolveInputs {

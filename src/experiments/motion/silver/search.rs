@@ -78,10 +78,53 @@ struct Query<'a> {
     class: Option<Candidate>,
 }
 
+#[derive(Deserialize)]
+struct CookedIndex<'a> {
+    format: u32,
+    source_key: &'a str,
+    tree_sha256: &'a str,
+    #[serde(borrow)]
+    tree: &'a serde_json::value::RawValue,
+}
+
+fn source_key() -> &'static str {
+    use sha2::{Digest, Sha256};
+    static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        let mut hash = Sha256::new();
+        hash.update(b"render-lab/motion-search/2\0");
+        for text in [
+            include_str!("../../../../tools/motion_index.py"),
+            super::INDEX,
+        ] {
+            hash.update(text.replace("\r\n", "\n").as_bytes());
+            hash.update([0]);
+        }
+        hash.update(super::DATA);
+        format!("{:x}", hash.finalize())
+    })
+}
+
+fn read_tree(text: &str, expected: &str) -> Result<Index> {
+    use sha2::{Digest, Sha256};
+    let cooked: CookedIndex<'_> = serde_json::from_str(text)?;
+    ensure!(
+        cooked.format == 2 && cooked.source_key == expected,
+        "stale motion search index; run python tools/motion_index.py"
+    );
+    ensure!(
+        format!("{:x}", Sha256::digest(cooked.tree.get().as_bytes())) == cooked.tree_sha256,
+        "damaged motion search index; run python tools/motion_index.py"
+    );
+    Ok(serde_json::from_str(cooked.tree.get())?)
+}
+
 impl Index {
     pub fn load(raw: Vec<Feature>, clips: &[(Range<usize>, String)]) -> Result<Self> {
-        let mut index: Self =
-            serde_json::from_str(include_str!("../../../../assets/motion/search.json"))?;
+        let mut index = read_tree(
+            include_str!("../../../../assets/motion/search.json"),
+            source_key(),
+        )?;
         ensure!(
             index.version == 1 && !index.nodes.is_empty(),
             "invalid motion index version or root"
@@ -208,5 +251,20 @@ impl Index {
             }
         }
         hit
+    }
+}
+
+#[cfg(test)]
+mod asset_tests {
+    use super::*;
+    #[test]
+    fn refuses_stale_or_corrupt_cooked_tree() {
+        let data = include_str!("../../../../assets/motion/search.json");
+        assert!(read_tree(data, source_key()).is_ok());
+        assert!(read_tree(data, "different bank").is_err());
+        let corrupt = data.replace("\"mean\":", "\"other\":");
+        assert!(
+            format!("{:#}", read_tree(&corrupt, source_key()).err().unwrap()).contains("damaged")
+        );
     }
 }

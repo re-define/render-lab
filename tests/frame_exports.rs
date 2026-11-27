@@ -119,3 +119,38 @@ fn raster_and_ray_capture_export_the_same_pixels_with_extra_readbacks() -> Resul
     }
     Ok(())
 }
+
+#[test]
+#[ignore = "requires Vulkan descriptor heap"]
+fn unobserved_large_resource_allocates_no_gpu_memory_or_pipeline() -> Result<()> {
+    use render_lab::rdg::{Access, Dispatch, Shader, Storage};
+    let mut gpu = Backend::open()?;
+    let tasks = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+    let mut frame = FrameGraph::new([1, 1]);
+    let unused = frame.resource(
+        "unobserved payload",
+        Storage::Buffer {
+            bytes: 512 << 20,
+            initial: None,
+        },
+    );
+    frame.pass(
+        "unobserved producer",
+        Op::Compute {
+            program: Dispatch {
+                shader: Shader::Compute(&[]),
+                bindings: vec![(unused, Access::ComputeWrite)],
+                push: vec![],
+            },
+            groups: [1; 3],
+        },
+    );
+    let out = frame.input("color", vec![10, 20, 30, 255]);
+    frame.set_output(out);
+    let result = gpu.execute(frame.compile()?, &tasks)?;
+    assert_eq!(result.pixels, [10, 20, 30, 255]);
+    assert_eq!(result.profile.culled_passes, 1);
+    assert_eq!(result.profile.pipeline_creations, 0);
+    assert!(result.memory.device_local_bytes + result.memory.nonlocal_bytes < 512 << 20);
+    Ok(())
+}

@@ -249,6 +249,8 @@ pub struct RayCapabilities {
     pub clusters: bool,
 }
 
+type HistoryBuffers = HashMap<(u64, usize, [u32; 2]), Arc<Buffer>>;
+
 pub struct Backend {
     gpu: Arc<Gpu>,
     slots: [FrameSlot; 2],
@@ -258,18 +260,24 @@ pub struct Backend {
     resident: HashMap<(usize, u32), ResidentBuffer>,
     paged_assets: HashMap<(usize, u32), Weak<Buffer>>,
     static_blas: ray::StaticCache,
-    histories: HashMap<(u64, usize, [u32; 2]), Arc<Buffer>>,
-    frame_number: u64,
+    histories: HistoryBuffers,
+    parked_histories: HistoryBuffers,
+    parked_waits: HashMap<u64, Vec<u64>>,
+    secondary_active: bool,
+    frame_numbers: [u64; 2],
     submitted_frames: u64,
-    first_profile: Option<Arc<FrameProfile>>,
+    first_profile: [Option<Arc<FrameProfile>>; 2],
     timelines: queues::Timelines,
     surface: Option<present::Surface>,
 }
 #[derive(Default)]
 struct UploadBytes {
+    pipelines: usize,
+    pipeline_ms: f64,
     resident: u64,
     dynamic: u64,
     tables: u64,
+    skin_poses: u64,
     atlas: u64,
 }
 struct ResidentBuffer {
@@ -330,9 +338,12 @@ impl Backend {
             paged_assets: HashMap::new(),
             static_blas: Default::default(),
             histories: HashMap::new(),
-            frame_number: 0,
+            parked_histories: Default::default(),
+            parked_waits: Default::default(),
+            secondary_active: false,
+            frame_numbers: [0; 2],
             submitted_frames: 0,
-            first_profile: None,
+            first_profile: Default::default(),
             timelines,
             surface: None,
         })
@@ -433,7 +444,10 @@ impl Backend {
         });
         let mut resident_upload_bytes = 0;
         let mut atlas_bytes = 0;
+        let mut pipelines = 0;
+        let mut pipeline_ms = 0.;
         let mut dynamic_bytes = 0;
+        let mut skin_pose_bytes = 0;
         let mut table_bytes = 0;
         let mut pooled = HashMap::<usize, Arc<Buffer>>::new();
         self.static_blas.prune();
@@ -467,6 +481,11 @@ impl Backend {
         let mut claimed = std::collections::BTreeSet::new();
         for (i, (name, s)) in graph.resources.iter().enumerate() {
             let resource = Resource(i);
+            if plan.unused.contains(&resource) {
+                slot.resources[i] = Physical::Vacant;
+                slot.heap.slots[i] = None;
+                continue;
+            }
             let tag = Purpose {
                 name,
                 class: Class::Transient,
@@ -716,6 +735,9 @@ impl Backend {
                     if !b.uploaded.as_ref().is_some_and(|last| last.ptr_eq(&source)) {
                         b.mapped(|p| {
                             dynamic_bytes += data.len() as u64;
+                            if plan.skin_pages.contains(&resource) {
+                                skin_pose_bytes += data.len() as u64;
+                            }
                             p[..data.len()].copy_from_slice(data);
                             if !graph.append_lists.contains(&Resource(i)) {
                                 p[data.len()..].fill(0);
@@ -826,7 +848,10 @@ impl Backend {
                 );
                 let key = (d.shader, d.bindings.len());
                 if let std::collections::hash_map::Entry::Vacant(e) = self.pipes.entry(key) {
+                    let start = Instant::now();
                     e.insert(Pipeline::new(g, d, slot.heap.stride)?);
+                    pipeline_ms += start.elapsed().as_secs_f64() * 1000.;
+                    pipelines += 1;
                 }
             }
             if let Op::Compute { groups, .. } | Op::RayQuery { groups, .. } = p.op {
@@ -840,9 +865,12 @@ impl Backend {
             }
         }
         Ok(UploadBytes {
+            pipelines,
+            pipeline_ms,
             resident: resident_upload_bytes,
             dynamic: dynamic_bytes,
             tables: table_bytes,
+            skin_poses: skin_pose_bytes,
             atlas: atlas_bytes,
         })
     }
@@ -931,6 +959,19 @@ impl Backend {
         !self.completed.is_empty() || !self.pending.is_empty()
     }
 
+    /// Commands keep buffer references in their frame slots until the queue retires.
+    pub(crate) fn select_view(&mut self, secondary: bool, has_secondary: bool) {
+        if self.secondary_active != secondary {
+            std::mem::swap(&mut self.histories, &mut self.parked_histories);
+            std::mem::swap(&mut self.timelines.histories, &mut self.parked_waits);
+            self.secondary_active = secondary;
+        }
+        if !has_secondary {
+            self.parked_histories.clear();
+            self.parked_waits.clear();
+        }
+    }
+
     fn recover(&mut self) -> Result<()> {
         unsafe {
             self.gpu.dev.device_wait_idle()?;
@@ -940,6 +981,8 @@ impl Backend {
         self.timelines = queues::Timelines::new(&self.gpu)?;
         self.static_blas = Default::default();
         self.histories.clear();
+        self.parked_histories.clear();
+        self.parked_waits.clear();
         for slot in &mut self.slots {
             slot.clear();
         }
@@ -990,8 +1033,16 @@ impl Backend {
         {
             self.surface = Some(present::Surface::new(&self.gpu, hwnd)?);
         }
-        queues::remove_semaphore_covered_reads(&mut plan.commands, self.gpu.queues.len());
-        let reuse = transient::Reuse::plan(&mut plan, self.gpu.queues.len());
+        let queue_count = if !self.gpu.explicit_queue_count
+            && plan.graph.serial_profile == Some((&self.gpu.name, plan.graph.extent))
+        {
+            1
+        } else {
+            self.gpu.queues.len()
+        };
+        plan.commands.queue_limit = queue_count;
+        queues::remove_semaphore_covered_reads(&mut plan.commands, queue_count);
+        let reuse = transient::Reuse::plan(&mut plan, queue_count);
         let uploads = self.prepare_with_budget(&plan, index, &reuse)?;
         let layout = self
             .timelines
@@ -1117,6 +1168,7 @@ impl Backend {
         });
         let profile = FrameProfile {
             cpu_times_us,
+            secondary_view: self.secondary_active,
             submission_id: self.submitted_frames,
             tick_id: stamp.tick_id, snapshot_id: stamp.snapshot_id,
             skipped_render_ticks: stamp.skipped_ticks, history_generation: stamp.generation,
@@ -1127,6 +1179,9 @@ impl Backend {
             extract_ms: plan.extract_ms,
             build_ms: plan.build_ms,
             compile_ms: plan.compile_ms,
+            culled_passes: plan.culled_passes,
+            pipeline_creations: uploads.pipelines,
+            pipeline_create_ms: uploads.pipeline_ms,
             rhi_prepare_ms: prepare_ms,
             acquire_ms,
             record_ms,
@@ -1145,10 +1200,14 @@ impl Backend {
             transient_reuse_bytes: reuse.saved_bytes,
             dynamic_upload_bytes: uploads.dynamic,
             scene_table_upload_bytes: uploads.tables,
+            skin_pose_upload_bytes: uploads.skin_poses,
             geometry_instance_visits: plan.instance_visits,
             extraction_full_rebuild: plan.extraction.full_rebuild,
             updated_transforms: plan.extraction.transforms_updated,
             updated_palettes: plan.extraction.palettes_updated,
+            pose_blocks_read: plan.extraction.pose_blocks_read,
+            pose_locals_read: plan.extraction.pose_locals_read,
+            palette_joints_examined: plan.extraction.palette_joints_examined,
             extracted_entities: plan.extraction.entities_visited,
             updated_instances: plan.extraction.instances_updated,
             acceleration_builds: slot.resources.iter().filter(|resource| {
@@ -1203,7 +1262,7 @@ impl Backend {
         let mut clock_origin = None;
         let mut span = [0i64; 2];
         let period_ms = f64::from(self.gpu.limits.timestamp_period) * 1e-6;
-        let aligned = self.gpu.common_clock || self.gpu.queues.len() == 1;
+        let aligned = self.gpu.common_clock || plan.queue_limit == 1;
         let mut timestamps = [[0_u64; 2]; queues::MAX_STEPS_PER_COMMAND];
         for (r, range) in recorders.iter().zip(&layout.chunks) {
             let times = &mut timestamps[..range.len()];
@@ -1296,7 +1355,7 @@ impl Backend {
         let mut shared = std::collections::BTreeSet::new();
         for r in &slot.resources {
             match r {
-                Physical::Vacant => unreachable!("submitted frame contains an unbound resource"),
+                Physical::Vacant => continue,
                 Physical::Buffer(b) => account(&b.allocation),
                 Physical::SharedBuffer(b) => {
                     if shared.insert(b.address) {
@@ -1321,7 +1380,7 @@ impl Backend {
                 scratch.take();
             }
         }
-        if let Some(r) = plan.material_atlas {
+        if let Some(r) = plan.material_atlas.filter(|r| !plan.unused.contains(r)) {
             let atlas = slot.resources[r.0].buffer();
             memory.atlas_buffer_bytes = plan
                 .graph
@@ -1352,7 +1411,9 @@ impl Backend {
                 *total += n;
             }
         }
-        self.frame_number += u64::from(presentation.is_none() || profile.wsi_binary_pairs != 0);
+        let view = usize::from(profile.secondary_view);
+        self.frame_numbers[view] +=
+            u64::from(presentation.is_none() || profile.wsi_binary_pairs != 0);
         profile.rhi_ms = start.elapsed().as_secs_f64() * 1000.;
         profile.gpu_span_ms = aligned.then(|| (span[1] - span[0]) as f64 * period_ms);
         for p in &mut passes {
@@ -1365,7 +1426,7 @@ impl Backend {
         profile.recording_workers = workers.len();
         profile.recording_chunks = recorders.len();
         profile.overlapping_recordings = peak as usize;
-        profile.physical_queues = self.gpu.queues.len();
+        profile.physical_queues = plan.queue_limit;
         profile.dependency_edges = plan.steps.iter().map(|s| s.parents.len()).sum();
         profile.resource_barriers = plan.steps.iter().map(|s| s.barriers.len()).sum();
         profile.barrier_calls = barriers[0];
@@ -1391,14 +1452,13 @@ impl Backend {
             .stamp
             .tick_started
             .map(|s| (completed - s).as_secs_f64() * 1000.);
-        let first_profile = self
-            .first_profile
+        let first_profile = self.first_profile[view]
             .get_or_insert_with(|| Arc::new(profile.clone()))
             .clone();
         Ok(Frame {
             first_profile,
             profile,
-            sequence: self.frame_number,
+            sequence: self.frame_numbers[view],
             completed,
             counters,
             submissions: submits,

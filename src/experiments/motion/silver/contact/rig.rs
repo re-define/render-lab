@@ -15,6 +15,7 @@ pub(super) struct Rig {
     pub arm: [usize; 3],
     pub finger: usize,
     pub corrected: Vec<usize>,
+    pub published_joints: crate::scene::PoseLayout,
     /// Motion bank slot -> index in the saved base pose.
     pub source_slots: Vec<usize>,
     source_for_joint: Vec<Option<usize>>,
@@ -152,6 +153,7 @@ impl Rig {
             }
         }
         Ok(Self {
+            published_joints: crate::scene::PoseLayout::new(corrected.iter().map(|&i| ids[i]))?,
             ids,
             parents,
             descendants,

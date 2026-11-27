@@ -42,6 +42,8 @@ pub struct FrameProfile {
     pub cpu_times_us: Option<CpuFrameTimes>,
     pub tick_id: u64,
     pub snapshot_id: u64,
+    /// Both views of a tick share the snapshot ID and have distinct submissions.
+    pub secondary_view: bool,
     /// Monotonic frame submission ID for this backend, including offscreen frames.
     pub submission_id: u64,
     pub skipped_render_ticks: u64,
@@ -65,11 +67,16 @@ pub struct FrameProfile {
     /// Payload bytes written through mapped buffers, excluding resident assets and zero padding.
     pub dynamic_upload_bytes: u64,
     pub scene_table_upload_bytes: u64,
+    /// Current and previous skin matrix bytes actually copied to mapped GPU pages.
+    pub skin_pose_upload_bytes: u64,
     /// CPU visits to instances during geometry routing and packet preparation.
     pub geometry_instance_visits: usize,
     pub extraction_full_rebuild: bool,
     pub updated_transforms: usize,
     pub updated_palettes: usize,
+    pub pose_blocks_read: usize,
+    pub pose_locals_read: usize,
+    pub palette_joints_examined: usize,
     pub extracted_entities: usize,
     pub updated_instances: usize,
     pub acceleration_builds: usize,
@@ -91,6 +98,9 @@ pub struct FrameProfile {
     pub recording_chunks: usize,
     pub overlapping_recordings: usize,
     pub dependency_edges: usize,
+    pub culled_passes: usize,
+    pub pipeline_creations: usize,
+    pub pipeline_create_ms: f64,
     pub resource_barriers: usize,
     pub barrier_calls: usize,
     pub memory_barriers: usize,

@@ -55,11 +55,7 @@ fn toolbar_button(id: &'static str, label: &'static str, active: bool) -> Statef
 }
 impl Studio {
     fn control_motion(&mut self, dt: f32) -> bool {
-        let Some((id, _)) = self
-            .engine
-            .world
-            .first_raw_component(motion::silver::PLAYER)
-        else {
+        let Some(id) = self.engine.movement.target(&self.engine.world) else {
             self.motion_keys = [0; 2];
             self.motion_anchor = None;
             return false;
@@ -67,13 +63,9 @@ impl Studio {
         let root = self.engine.world.entities[&id].local.w_axis.truncate();
         let keys = self.navigation.motion_keys();
         let new_actor = self.motion_anchor.is_none_or(|(old, _)| old != id);
-        let fixed_camera = self
-            .engine
-            .world
-            .first_raw_component(motion::silver::contact::SETTING)
-            .is_some();
+        let follows = self.engine.movement.camera_follows(&self.engine.world, id);
         let followed = self.motion_anchor.map_or(root, |(old, previous)| {
-            if old != id || fixed_camera {
+            if old != id || !follows {
                 return root;
             }
             let delta = (root - previous) * (1. - (-5. * dt).exp());
@@ -82,15 +74,19 @@ impl Studio {
         });
         self.motion_anchor = Some((id, followed));
         let saved_motion = new_actor
-            && motion::silver::status(&self.engine.world)
-                .ok()
-                .flatten()
-                .is_some_and(|state| state.move_root);
-        if (keys != self.motion_keys || saved_motion)
-            && let Err(e) = motion::silver::set_keyboard_goal(
+            && self
+                .engine
+                .movement
+                .active(&self.engine.world, id)
+                .unwrap_or(false);
+        if (keys != self.motion_keys || saved_motion || (new_actor && keys != [0; 2]))
+            && let Err(e) = self.engine.movement.apply(
                 Arc::make_mut(&mut self.engine.world),
-                keys[0],
-                keys[1],
+                id,
+                render_lab::engine::MoveIntent {
+                    side: keys[0],
+                    forward: keys[1],
+                },
             )
         {
             self.message = format!("{e:#}");
@@ -282,9 +278,9 @@ impl Render for Studio {
         }
         while let Some(frame) = self.engine.take_frame() {
             match frame {
-                Ok(f) => {
+                Ok(mut f) => {
                     if let Some(recording) = self.console.recording.as_mut()
-                        && let Err(error) = recording.push(&f)
+                        && let Err(error) = recording.offer(&mut f)
                     {
                         if let Some(failed) = self.console.recording.take() {
                             failed.abort();
@@ -293,6 +289,13 @@ impl Render for Studio {
                         self.message = format!("Recording stopped: {error:#}");
                     }
                     if self.benchmark.as_mut().is_some_and(|b| b.observe(&f)) {
+                        if let Some(recording) = self.console.recording.take() {
+                            let dropped = recording.dropped();
+                            match recording.finish() {
+                                Ok(()) => println!("LIVE_RECORDING dropped_samples={dropped}"),
+                                Err(error) => eprintln!("Benchmark recording failed: {error:#}"),
+                            }
+                        }
                         cx.quit();
                         break;
                     }
@@ -344,7 +347,10 @@ impl Render for Studio {
             .gap_1()
             .text_xs()
             .text_color(rgb(0xb9cde1));
-        if let Ok(Some(p)) = motion::silver::status(&self.engine.world) {
+        if let Ok(Some(p)) = motion::silver::status_for(
+            &self.engine.world,
+            self.engine.movement.target(&self.engine.world),
+        ) {
             details = details
                 .child(format!(
                     "Motion · {} · sample {} · cost {:.3}",
