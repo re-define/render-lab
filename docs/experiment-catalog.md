@@ -19,6 +19,7 @@ cargo run --release --locked -- --scene target/saved.json
 | `forest-karst` | 岩柱、河谷植物、太阳、ReSTIR 和缓存间接光。预设要求硬件光追，CLI 默认选择 TAA。 | `vegetation camera karst` 固定机位，分别输入 `restir gi direct`、`restir gi multi`。 |
 | `movement` | 三个共享网格的物体分别静止、水平移动、受重力落下。 | `object` 列出 ID，`object 3` 查看策略。`tick movement 30` 调整普通运动频率。 |
 | `motion` | 银狼骨架和烘焙的动作库，观察输入轨迹、姿态候选和转向。 | 用 IJKL 改方向，再用 `motionsearch kd`、`motionsearch scan` 对照查询。 |
+| `hair` | 程序化假发、头模与肩部胶囊；侧风、头部转动和造型刚度可以独立调节。 | `hair status` 查看最大伸长，`hair wind -8` 反转侧风。[毛发模拟研究与操作](hair-simulation.md) |
 | `silver-contact` | 银狼通过平台、栏杆和低矮障碍，用接触反馈修正脚掌和末端触点。 | `contact status` 查看状态，`contact limbs on` 打开局部物理动画，`contact grip off` 关闭机械撑栏。[子步与实验命令](character-motion.md) |
 | `silver-contact-duo` | 双角色障碍路线。两者共享可见网格，第二名角色采用不同的腕部关节链与指尖绑定。 | `control` 查询角色 ID，`control ID` 选择角色，`drive 0.25 0.8` 输入连续方向，`motionroot clip` 采用片段根运动，`contact mode free` 切到独立移动。 |
 | `water` | 程序化台阶上，计算着色器推进水量和流动状态，水面随模拟变化。 | `effect restart` 重新开始，`effect time 2` 指定观察时刻。 |

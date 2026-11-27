@@ -20,6 +20,7 @@ pub(super) const PRESETS: &[(&str, SceneBuilder)] = &[
     ("forest-karst", restir::karst_study),
     ("confluence", composition::scene),
     ("movement", render_lab::experiments::movement_lab::scene),
+    ("hair", render_lab::experiments::hair::scene),
     ("water", effects::water),
     ("destruction", effects::destruction),
     ("motion", motion::silver::scene),

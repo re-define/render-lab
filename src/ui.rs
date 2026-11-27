@@ -21,7 +21,7 @@ struct Studio {
     motion_anchor: Option<(render_lab::scene::Id, glam::Vec3)>,
     benchmark: Option<benchmark::Benchmark>,
     viewport: Rc<viewport::Viewport>,
-    counters: std::collections::BTreeMap<&'static str, u64>,
+    counters: render_lab::rhi::FrameCounters,
     passes: Vec<PassReport>,
     gpu: String,
     hud: Option<Entity<hud::Hud>>,
@@ -367,7 +367,7 @@ impl Render for Studio {
                 ));
             }
         }
-        for (name, n) in &self.counters {
+        for (name, n) in self.counters.iter() {
             if *n > 0 {
                 details = details.child(format!("{name}   {n}"));
             }

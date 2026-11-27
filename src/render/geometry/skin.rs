@@ -4,9 +4,15 @@ use super::*;
 use crate::rdg::Graph;
 use anyhow::Context;
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Source {
+    Page(usize),
+    Gpu(Resource),
+}
+
 #[derive(Default)]
 pub(in crate::render) struct SkinBatches {
-    active: BTreeMap<(Resource, bool, usize), usize>,
+    active: BTreeMap<(Resource, bool, Source), usize>,
     // Hold each palette until the graph is finalized so its Arc address cannot be recycled.
     palettes: BTreeMap<usize, (Arc<[Mat4]>, usize, u32)>,
     pages: Vec<Vec<[f32; 16]>>,
@@ -15,7 +21,7 @@ pub(in crate::render) struct SkinBatches {
 
 struct Batch {
     pass: usize,
-    page: usize,
+    page: Source,
     jobs: Vec<SkinJob>,
     outputs: Vec<Resource>,
 }
@@ -59,6 +65,44 @@ impl SkinBatches {
         previous: bool,
     ) -> Result<Resource> {
         let (page, offset) = self.palette_slot(palette)?;
+        self.add_source(
+            g,
+            input,
+            vertices,
+            [model, root],
+            (Source::Page(page), offset),
+            previous,
+        )
+    }
+
+    pub(super) fn add_gpu(
+        &mut self,
+        g: &mut Graph,
+        input: MeshInputs,
+        vertices: u32,
+        transforms: [Mat4; 2],
+        pose: Resource,
+        previous: bool,
+    ) -> Result<Resource> {
+        self.add_source(
+            g,
+            input,
+            vertices,
+            transforms,
+            (Source::Gpu(pose), 0),
+            previous,
+        )
+    }
+
+    fn add_source(
+        &mut self,
+        g: &mut Graph,
+        input: MeshInputs,
+        vertices: u32,
+        [model, root]: [Mat4; 2],
+        (page, offset): (Source, u32),
+        previous: bool,
+    ) -> Result<Resource> {
         let influences = input
             .influences
             .context("skinned mesh lacks joint influences")?;
@@ -139,7 +183,13 @@ impl SkinBatches {
             };
             groups[2] = instances;
             program.bindings.extend([
-                (pages[batch.page], Access::ComputeRead),
+                (
+                    match batch.page {
+                        Source::Page(i) => pages[i],
+                        Source::Gpu(r) => r,
+                    },
+                    Access::ComputeRead,
+                ),
                 (outputs, Access::ComputeRead),
                 (jobs, Access::ComputeRead),
             ]);

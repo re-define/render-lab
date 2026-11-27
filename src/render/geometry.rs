@@ -156,6 +156,7 @@ impl PosedSurface<'_> {
 }
 
 pub(crate) struct SurfaceGeometry<'a> {
+    instance_id: Id,
     mesh_id: MeshId,
     pub(crate) mesh: &'a Arc<Mesh>,
     model: Mat4,
@@ -213,6 +214,7 @@ impl VisibilityRenderer {
                 Ok(PosedSurface {
                     instance,
                     geometry: SurfaceGeometry {
+                        instance_id: instance.id,
                         mesh_id: instance.mesh,
                         mesh,
                         model,
@@ -349,6 +351,13 @@ impl SurfaceGeometry<'_> {
         };
         let motion = if let Some(history) = s.surface_history(instance)? {
             let source = match (history.previous, self.palette) {
+                _ if g
+                    .gpu_poses
+                    .get(&instance.id)
+                    .is_some_and(|poses| poses[1].is_none()) =>
+                {
+                    MotionSource::Unavailable
+                }
                 (Some(prior), Some(_)) => {
                     let palette = prior.palette.as_ref().unwrap();
                     if inputs
@@ -448,6 +457,15 @@ impl SurfaceGeometry<'_> {
         previous: bool,
     ) -> Result<Resource> {
         let count = self.mesh.positions.len().try_into()?;
+        if let Some(pose) = g
+            .gpu_poses
+            .get(&self.instance_id)
+            .and_then(|poses| poses[usize::from(previous)])
+        {
+            return g
+                .skins
+                .add_gpu(&mut g.graph, input, count, transforms, pose, previous);
+        }
         g.skins
             .add(&mut g.graph, input, count, transforms, palette, previous)
     }

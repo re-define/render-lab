@@ -318,7 +318,7 @@ pub(super) fn raster_frame(
 }
 
 pub(super) fn trace_frame(s: &Snapshot, cfg: Settings) -> Result<FrameGraph> {
-    let mut g = FrameGraph::new(s.extent);
+    let mut g = FrameGraph::for_scene(s)?;
     let mut imports = Default::default();
     for posed in Forward::default().posed_surfaces(s, |i| !i.emitter)? {
         let streams = posed.geometry.ray_stream(&mut g, s, &mut imports)?;

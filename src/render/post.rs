@@ -166,15 +166,41 @@ struct Previous {
     revision: u64,
 }
 
+struct PreviousDeformation {
+    scene: Arc<RenderScene>,
+    technique: Arc<dyn Technique>,
+}
+
 #[derive(Default)]
 pub(crate) struct Sequence {
     previous: Option<Previous>,
+    deformation: Option<PreviousDeformation>,
     generation: u64,
     sample: usize,
 }
 
 impl Sequence {
     pub fn assign(
+        &mut self,
+        settings: Settings,
+        technique: &Arc<dyn Technique>,
+        view: &mut Snapshot,
+    ) {
+        self.assign_post(settings, technique, view);
+        let prior = self.deformation.take();
+        view.previous_deformation = None;
+        if crate::experiments::has_deformation(&view.scene) {
+            view.previous_deformation = prior
+                .filter(|f| Arc::ptr_eq(&f.technique, technique))
+                .map(|f| f.scene);
+            self.deformation = Some(PreviousDeformation {
+                scene: view.scene.clone(),
+                technique: technique.clone(),
+            });
+        }
+    }
+
+    fn assign_post(
         &mut self,
         settings: Settings,
         technique: &Arc<dyn Technique>,
@@ -299,6 +325,7 @@ impl Sequence {
 
     pub fn discard(&mut self) {
         self.previous = None;
+        self.deformation = None;
     }
 }
 

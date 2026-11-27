@@ -237,6 +237,7 @@ impl SceneExtractor {
                     &self.transforms,
                     Arc::make_mut(&mut scene.components),
                 )?;
+                visited.extend(&owner.reads);
                 visited.extend(owner.watched_settings.values().flatten());
             }
         }

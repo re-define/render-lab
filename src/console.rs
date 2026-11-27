@@ -23,6 +23,7 @@ const HELP: &str = concat!(
     " · post view motion/reprojection/off · stats · schedule [profile on/off] · tick [MODULE HZ/frame/default] · memory idle/alloc/driver [NAME or #OWNER]",
     " · light list/point/sun/move/aim/power/color/enable/angular-radius · import/save/load PATH · lod PIXELS",
     " · lodview on/off · vegetation auto/triangles/voxels/pixels/wind/time/view/camera",
+    " · hair status/wind/stiffness/head/view/reset",
     " · control [ENTITY] · drive SIDE FORWARD · motion SPEED TURN [STRAFE] · motionroot controller/clip · motionsearch kd/scan · motionbudget N/off · record PATH · stoprecord",
     " · contact status/physics/auto/manual/target/hand/grip/limbs/feet/view/action · contact mode free/contact · contact gravity G · contact impulse J · contact spin DEG/S",
     " · toon outline/width/light/threshold/sdf/view · texture neural/original/stats",
@@ -97,6 +98,19 @@ impl Console {
                     engine.movement.target(&engine.world),
                     engine.movement.candidates(&engine.world)
                 ));
+            }
+            "hair" => {
+                let mut reply =
+                    crate::experiments::hair::command(Arc::make_mut(&mut engine.world), arg)?;
+                if matches!(arg, "" | "status")
+                    && let Some(ppm) = engine.last_counter(crate::experiments::hair::STRETCH)
+                {
+                    reply.push_str(&format!(
+                        " · last rendered peak stretch {:.2}%",
+                        ppm as f64 / 10_000.
+                    ));
+                }
+                return Ok(reply);
             }
             "contact" => return motion::silver::contact::command(engine, arg),
             "tick" => {

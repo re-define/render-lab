@@ -115,13 +115,15 @@ pub struct FrameProfile {
     pub wsi_transitions: usize,
     pub wsi_binary_pairs: usize,
 }
+pub type FrameCounters = Arc<std::collections::BTreeMap<&'static str, u64>>;
+
 pub struct Frame {
     pub first_profile: Arc<FrameProfile>,
     pub profile: FrameProfile,
     pub completed: Instant,
     pub sequence: u64,
     pub pixels: Vec<u8>,
-    pub counters: std::collections::BTreeMap<&'static str, u64>,
+    pub counters: FrameCounters,
     pub extent: [u32; 2],
     pub passes: Vec<PassReport>,
     pub gpu: String,

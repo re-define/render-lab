@@ -31,6 +31,7 @@ pub struct FrameGraph {
     pub(super) graph: Graph,
     pub(super) skins: SkinBatches,
     pub(crate) products: FrameProducts,
+    pub(crate) gpu_poses: std::collections::BTreeMap<crate::scene::Id, [Option<Resource>; 2]>,
     present: Option<Resource>,
 }
 impl FrameGraph {
@@ -39,8 +40,14 @@ impl FrameGraph {
             graph: Graph::new(extent),
             skins: SkinBatches::default(),
             products: FrameProducts::default(),
+            gpu_poses: Default::default(),
             present: None,
         }
+    }
+    pub(crate) fn for_scene(s: &super::Snapshot) -> Result<Self> {
+        let mut g = Self::new(s.extent);
+        crate::experiments::prepare_deformations(&mut g, s)?;
+        Ok(g)
     }
     pub fn products(&self) -> &FrameProducts {
         &self.products

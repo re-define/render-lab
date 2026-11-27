@@ -4,6 +4,7 @@ pub mod clusters;
 pub mod composition;
 pub mod effects;
 pub mod gaussian;
+pub mod hair;
 pub mod ibl;
 mod light_stack;
 use assembly::SceneConfiguration;
@@ -24,6 +25,29 @@ use crate::{
 };
 use anyhow::Result;
 use std::sync::Arc;
+
+/// Render-time deformations are extracted with the scene, then registered before surface consumers.
+struct Deformer {
+    component: SnapshotComponent,
+    prepare: fn(&mut FrameGraph, &Snapshot) -> Result<()>,
+}
+const DEFORMERS: &[Deformer] = &[Deformer {
+    component: hair::SNAPSHOT,
+    prepare: hair::prepare,
+}];
+
+pub(crate) fn has_deformation(scene: &crate::render::RenderScene) -> bool {
+    DEFORMERS.iter().any(|d| scene.has_derived(d.component.key))
+}
+pub(crate) fn prepare_deformations(g: &mut FrameGraph, s: &Snapshot) -> Result<()> {
+    for d in DEFORMERS
+        .iter()
+        .filter(|d| s.scene.has_derived(d.component.key))
+    {
+        (d.prepare)(g, s)?;
+    }
+    Ok(())
+}
 
 /// Overlays for the packed color buffer at display resolution after temporal resolve and tone mapping.
 pub(super) struct VisibilityOverlay {
@@ -63,6 +87,7 @@ pub(crate) fn snapshot_components() -> impl Iterator<Item = SnapshotComponent> {
         SnapshotComponent::setting(vegetation::SETTING),
     ]
     .into_iter()
+    .chain(DEFORMERS.iter().map(|d| d.component))
     .chain(VISIBILITY_OVERLAYS.iter().map(|overlay| overlay.component))
     .chain(
         light_stack::REGISTRY

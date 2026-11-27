@@ -4,7 +4,9 @@ mod allocator;
 mod clusters;
 mod device;
 mod frame;
-pub use frame::{AllocationInfo, Frame, FrameMemory, FrameProfile, PassReport, RasterCounts};
+pub use frame::{
+    AllocationInfo, Frame, FrameCounters, FrameMemory, FrameProfile, PassReport, RasterCounts,
+};
 mod memory;
 mod raster_queries;
 use memory::Class;
@@ -440,7 +442,10 @@ impl Backend {
         self.resident
             .retain(|_, resource| resource.source.strong_count() != 0);
         self.histories.retain(|(key, _, extent), _| {
-            *extent == graph.extent && graph.histories.values().any(|&current| current == *key)
+            graph
+                .histories
+                .iter()
+                .any(|(&r, &current)| current == *key && *extent == graph.history_extent(r))
         });
         let mut resident_upload_bytes = 0;
         let mut atlas_bytes = 0;
@@ -514,7 +519,7 @@ impl Backend {
                 let Storage::Buffer { bytes, .. } = *s else {
                     unreachable!()
                 };
-                let key = (key, bytes, graph.extent);
+                let key = (key, bytes, graph.history_extent(resource));
                 let entry = match self.histories.entry(key) {
                     std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::hash_map::Entry::Vacant(entry) => {
@@ -1467,7 +1472,7 @@ impl Backend {
             profile,
             sequence: self.frame_numbers[view],
             completed,
-            counters,
+            counters: Arc::new(counters),
             submissions: submits,
             presentation: presentation.clone(),
             pixels,

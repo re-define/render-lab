@@ -33,6 +33,7 @@ pub struct SnapshotContext<'a> {
     world: &'a World,
     transforms: &'a TransformCache,
     watched: &'a mut BTreeMap<Id, Option<u64>>,
+    reads: &'a mut Vec<Id>,
     settings: &'a mut BTreeMap<&'static str, Option<Id>>,
 }
 
@@ -45,6 +46,26 @@ impl SnapshotContext<'_> {
         self.world
             .typed_component(self.owner, self.key)?
             .context("missing component owner")
+    }
+
+    /// Subscribe to the membership and values of every owner of a typed component.
+    pub(crate) fn all_typed<T: Clone + DeserializeOwned + 'static>(
+        &mut self,
+        key: &'static str,
+    ) -> Result<Vec<(Id, T)>> {
+        let owners = self.world.entities.component_owners(key);
+        self.settings.insert(key, owners.first().copied());
+        self.reads.extend_from_slice(owners);
+        owners
+            .iter()
+            .map(|&id| {
+                let value = self
+                    .world
+                    .typed_component::<T>(id, key)?
+                    .context("missing component")?;
+                Ok((id, value.into_owned()))
+            })
+            .collect()
     }
 
     /// Subscribe to a scene-wide raw setting, including its later addition or removal.
@@ -86,6 +107,7 @@ impl RenderScene {
 pub(super) struct ComponentOwner {
     pub id: Id,
     watched: BTreeMap<Id, Option<u64>>,
+    pub reads: Vec<Id>,
     pub watched_settings: BTreeMap<&'static str, Option<Id>>,
 }
 
@@ -94,6 +116,7 @@ impl ComponentOwner {
         Self {
             id,
             watched: Default::default(),
+            reads: Vec::new(),
             watched_settings: Default::default(),
         }
     }
@@ -131,6 +154,7 @@ impl ComponentOwner {
             }
         }
         if let Some(extract) = spec.extract {
+            self.reads.clear();
             self.watched.clear();
             self.watched_settings.clear();
             let value = extract(&mut SnapshotContext {
@@ -139,6 +163,7 @@ impl ComponentOwner {
                 world,
                 transforms,
                 watched: &mut self.watched,
+                reads: &mut self.reads,
                 settings: &mut self.watched_settings,
             })
             .with_context(|| format!("extract {} on entity {}", spec.key, self.id))?;

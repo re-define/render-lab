@@ -38,6 +38,7 @@ const MODULES: &[Registration] = &[
     clusters::MODULE,
     vegetation::MODULE,
     effects::MODULE,
+    super::hair::MODULE,
     cartoon::MODULE,
     vegetation::WIND_SYSTEM,
     motion::MODULE,

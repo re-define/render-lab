@@ -471,6 +471,7 @@ pub struct Graph {
     pub(crate) addresses: std::collections::BTreeMap<Resource, Vec<Resource>>,
     pub(crate) append_lists: BTreeSet<Resource>,
     pub(crate) histories: std::collections::BTreeMap<Resource, u64>,
+    extent_independent: BTreeSet<Resource>,
     external_effects: BTreeSet<usize>,
     subranges: ranges::Declarations,
 }
@@ -581,6 +582,7 @@ impl Graph {
             resources: vec![],
             passes: vec![],
             histories: Default::default(),
+            extent_independent: Default::default(),
             external_effects: Default::default(),
             subranges: Default::default(),
             append_lists: Default::default(),
@@ -723,6 +725,19 @@ impl Graph {
             }
         }
         uses
+    }
+    /// Particle and geometry state survives viewport resolution changes.
+    pub(crate) fn geometry_history(&mut self, name: &str, key: u64, bytes: usize) -> Resource {
+        let r = self.history_buffer(name, key, bytes);
+        self.extent_independent.insert(r);
+        r
+    }
+    pub(crate) fn history_extent(&self, r: Resource) -> [u32; 2] {
+        if self.extent_independent.contains(&r) {
+            [0; 2]
+        } else {
+            self.extent
+        }
     }
     pub fn history_buffer(&mut self, name: &str, key: u64, bytes: usize) -> Resource {
         let r = self.resource(

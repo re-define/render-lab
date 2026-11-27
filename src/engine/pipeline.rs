@@ -21,6 +21,7 @@ struct LastFrame {
     results: std::collections::VecDeque<FrameResult>,
     ordered: bool,
     memory: Option<ManagedMemory>,
+    counters: crate::rhi::FrameCounters,
 }
 
 #[derive(Default)]
@@ -32,6 +33,7 @@ impl Completions {
     fn publish(&self, secondary: bool, frame: FrameResult) {
         let mut last = self.views[usize::from(secondary)].lock().unwrap();
         if !secondary && let Ok(frame) = &frame {
+            last.counters.clone_from(&frame.counters);
             last.memory = Some(frame.memory.managed.clone());
         }
         if !last.ordered {
@@ -49,6 +51,9 @@ impl Completions {
             .unwrap()
             .results
             .pop_front()
+    }
+    pub(super) fn counter(&self, key: &str) -> Option<u64> {
+        self.views[0].lock().unwrap().counters.get(key).copied()
     }
     pub(super) fn primary_memory(&self) -> Option<ManagedMemory> {
         self.views[0].lock().unwrap().memory.clone()

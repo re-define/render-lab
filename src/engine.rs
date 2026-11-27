@@ -227,6 +227,9 @@ impl Engine {
     pub fn take_secondary_frame(&self) -> Option<FrameResult> {
         self.pipeline.completions().take(true)
     }
+    pub(crate) fn last_counter(&self, key: &str) -> Option<u64> {
+        self.pipeline.completions().counter(key)
+    }
     pub fn last_memory(&self) -> Option<crate::rhi::ManagedMemory> {
         self.pipeline.completions().primary_memory()
     }

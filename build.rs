@@ -14,6 +14,8 @@ fn main() {
         "ordinary_work.comp",
         "ordinary.mesh",
         "skin.comp",
+        "hair_solve.comp",
+        "hair_palette.comp",
         "outline_edges.comp",
         "visibility.frag",
         "classify.comp",

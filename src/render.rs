@@ -151,6 +151,7 @@ pub struct Snapshot {
     pub camera: Camera,
     pub extent: [u32; 2],
     pub(crate) temporal: Option<post::TemporalFrame>,
+    pub(crate) previous_deformation: Option<Arc<RenderScene>>,
 }
 impl Snapshot {
     pub fn new(
@@ -171,6 +172,7 @@ impl Snapshot {
             scene: self.scene.clone(),
             materials: self.materials.clone(),
             temporal: None,
+            previous_deformation: None,
             ray_caps: self.ray_caps,
             buffer_atomic64: self.buffer_atomic64,
             reference_draws: self.reference_draws,
@@ -528,7 +530,7 @@ pub(crate) fn build_frame_with_lighting(
     scene: impl FnOnce(&mut FrameGraph, SceneLayers) -> Result<()>,
     display: impl FnOnce(&mut FrameGraph, DisplayLayers) -> Result<()>,
 ) -> Result<FrameGraph> {
-    let mut g = FrameGraph::new(s.extent);
+    let mut g = FrameGraph::for_scene(s)?;
     g.display_extent = (s.output_extent() != s.extent).then(|| s.output_extent());
     let mut t = Targets {
         background: 0xff090d13,

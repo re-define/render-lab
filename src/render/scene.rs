@@ -288,6 +288,7 @@ impl SceneExtractor {
             camera,
             extent,
             temporal: None,
+            previous_deformation: None,
         })
     }
 

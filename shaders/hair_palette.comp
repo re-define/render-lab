@@ -1,0 +1,34 @@
+#version 460
+layout(local_size_x=64) in;
+struct Node { vec4 rest; vec4 shape; };
+struct Particle { vec4 pos; vec4 prev; };
+layout(set=0,binding=0,std430) readonly buffer Rest { Node nodes[]; };
+layout(set=0,binding=1,std430) readonly buffer History { Particle particles[]; };
+layout(set=0,binding=2,std430) writeonly buffer Pose { mat4 matrices[]; };
+
+layout(set=0,binding=3,std430) buffer Metric { uint peak; };
+layout(push_constant) uniform Params {layout(offset=16) uint measure;} pc;
+
+vec3 perpendicular(vec3 v) {
+    vec3 axis=abs(v.x)<abs(v.z) ? vec3(1,0,0) : vec3(0,0,1);
+    return normalize(cross(v,axis));
+}
+vec3 rotateBy(vec4 q,vec3 v){ return v+2.0*cross(q.xyz,cross(q.xyz,v)+q.w*v); }
+void main(){
+    uint i=gl_GlobalInvocationID.x;
+    uint j=i%14u, a=j==0u?i:i-1u, b=j==13u?i:i+1u;
+    if(pc.measure!=0u && j<13u){
+        float stretch=distance(particles[i].pos.xyz,particles[b].pos.xyz)/nodes[i].shape.x-1.0;
+        atomicMax(peak,uint(round(max(0.0,stretch)*1e6)));
+    }
+    vec3 u=normalize(nodes[b].rest.xyz-nodes[a].rest.xyz);
+    vec3 v=particles[b].pos.xyz-particles[a].pos.xyz;
+    vec4 q=vec4(0,0,0,1);
+    if(dot(v,v)>1e-16){
+        v=normalize(v);
+        float w=1.0+dot(u,v);
+        q=w>1e-6 ? normalize(vec4(cross(u,v),w)) : vec4(perpendicular(u),0);
+    }
+    matrices[i]=mat4(vec4(rotateBy(q,vec3(1,0,0)),0),vec4(rotateBy(q,vec3(0,1,0)),0),
+        vec4(rotateBy(q,vec3(0,0,1)),0),vec4(particles[i].pos.xyz-rotateBy(q,nodes[i].rest.xyz),1));
+}

@@ -1,0 +1,79 @@
+#version 460
+// One invocation owns a guide's ordered Gauss-Seidel constraints and multipliers.
+layout(local_size_x=8) in;
+struct Node { vec4 rest; vec4 shape; };
+struct Particle { vec4 pos; vec4 prev; };
+struct Step { mat4 head; vec4 force; };
+layout(set=0,binding=0,std430) readonly buffer Rest { Node nodes[]; };
+layout(set=0,binding=1,std430) readonly buffer Initial { Particle seed[]; };
+layout(set=0,binding=2,std430) buffer History { Particle particles[]; };
+layout(set=0,binding=3,std430) readonly buffer Input { Step steps[]; };
+layout(push_constant) uniform Params {
+    layout(offset=16) uint count;
+    uint reset;
+    vec2 shoulder;   // half axis and centre height
+    vec4 headSphere;
+    float shoulderRadius;
+    float dt;
+} pc;
+
+const int N=14;
+vec3 p[N], prev[N];
+float stretch[N], bend[N];
+
+void constrainPair(int a, int b, float length0, float alpha, inout float lambda) {
+    float wa = a<2 ? 0.0 : 1.0;
+    float wb = b<2 ? 0.0 : 1.0;
+    vec3 d = p[b]-p[a];
+    float len=length(d);
+    if (wa+wb==0.0 || len<1e-8) return;
+    float dl=(-(len-length0)-alpha*lambda)/(wa+wb+alpha);
+    lambda+=dl;
+    vec3 offset=d*(dl/len);
+    p[a]-=wa*offset;
+    p[b]+=wb*offset;
+}
+vec3 projectOut(vec3 q,vec3 center,float radius) {
+    vec3 d=q-center;
+    float ds=dot(d,d);
+    return ds<radius*radius ? center+(ds>1e-20 ? d*inversesqrt(ds) : vec3(0,1,0))*radius : q;
+}
+void main() {
+    uint base=gl_GlobalInvocationID.x*N;
+    for(int i=0;i<N;i++) {
+        Particle particle=pc.reset!=0u ? seed[base+i] : particles[base+i];
+        p[i]=particle.pos.xyz;
+        prev[i]=particle.prev.xyz;
+    }
+    float h2=pc.dt*pc.dt;
+    for(uint step=0u;step<pc.count;step++){
+        Step s=steps[step];
+        float wind=s.force.x, stiffness=s.force.y, time=s.force.z;
+        float soft=1.0-stiffness;
+        float bendAlpha=(0.000015+0.004*soft*soft*soft)/h2;
+        vec3 center=(s.head*vec4(pc.headSphere.xyz,1)).xyz;
+        for(int i=0;i<N;i++) {
+            vec3 old=p[i], goal=(s.head*vec4(nodes[base+i].rest.xyz,1)).xyz;
+            if(i<2) p[i]=goal;
+            else {
+                float tip=1.0-float(i)/float(N-1);
+                float gust=0.80+0.35*sin(2.7*time+3.0*old.y)+0.16*cos(4.4*time+4.0*old.z);
+                vec3 accel=vec3(0,-9.81,0)+wind*vec3(gust,0.10*gust,0.23*sin(time+old.x*2.0))
+                    +(goal-old)*stiffness*(20.0+120.0*tip*tip*tip);
+                p[i]=old+(old-prev[i])*exp(-2.8*pc.dt)+h2*accel;
+            }
+            prev[i]=old;
+            stretch[i]=0.0;
+            bend[i]=0.0;
+        }
+        for(int iter=0;iter<18;iter++){
+            for(int i=0;i<N-2;i++) constrainPair(i,i+2,nodes[base+i].shape.y,bendAlpha,bend[i]);
+            for(int i=1;i<N-1;i++) constrainPair(i,i+1,nodes[base+i].shape.x,0.0000006/h2,stretch[i]);
+            for(int i=2;i<N;i++) {
+                p[i]=projectOut(p[i],center,pc.headSphere.w);
+                p[i]=projectOut(p[i],vec3(clamp(p[i].x,-pc.shoulder.x,pc.shoulder.x),pc.shoulder.y,0),pc.shoulderRadius);
+            }
+        }
+    }
+    for(int i=0;i<N;i++) particles[base+i]=Particle(vec4(p[i],1),vec4(prev[i],1));
+}
