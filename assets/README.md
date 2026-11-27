@@ -16,6 +16,6 @@
 
 ## 动作与纹理数据
 
-`motion/source` 保存 39 段 SOMA 源动作。`motion/bank.json`、`poses.bin`、`search.json` 用于银狼检索和重定向，`motion/traversal` 存放另行生成的跳跃、翻越和钻行动作。生成器使用 NVIDIA Kimodo-SOMA-RP-v1.2。[项目](https://github.com/nv-tlabs/kimodo) · [模型说明及许可](https://huggingface.co/nvidia/Kimodo-SOMA-RP-v1.2) · [引擎中的使用方式](../docs/animation-physics.md)
+`motion/source` 保存 39 段 SOMA 源动作。`motion/bank.json`、`poses.bin`、`search.json` 用于银狼检索和重定向，`motion/traversal` 存放另行生成的跳跃、翻越和钻行动作。生成器使用 NVIDIA Kimodo-SOMA-RP-v1.2。[项目](https://github.com/nv-tlabs/kimodo) · [模型说明及许可](https://huggingface.co/nvidia/Kimodo-SOMA-RP-v1.2) · [引擎中的使用方式](../docs/algorithms/animation-physics.md)
 
 [texture](texture/) 和 [gaussian](gaussian/) 存放 Modern Hall 纹理的压缩实验数据。有关训练、解码路径和运行预设，见[实验目录](../docs/experiment-catalog.md)。

@@ -1,15 +1,15 @@
-# Render Lab 文档
+# Render Lab 手册
 
-第一次运行可从仓库首页的 `movement` 实验开始。要跟踪一帧从输入直到呈现，先看架构图，再按关心的模块阅读。[构建与运行](../README.md) · [架构图与一帧的数据流](architecture.md)
+第一次运行请看[构建与启动](../README.md)。已知场景名、想找命令或资产时，直接打开[实验目录](experiment-catalog.md)。
 
-| 想解决的问题 | 阅读入口 |
-| --- | --- |
-| 同一个实体谁能移动、何时更新，模块之间如何传递结果 | [世界、Move 与模块时钟](world-runtime.md) |
-| 哪些发丝参与动力学，如何对照侧风、头部运动与接触 | [毛发模拟实验](hair-simulation.md) |
-| 银狼怎样选动作、根据支撑反馈调整姿态并用 IK 触达目标 | [动画与物理](animation-physics.md) · [角色的一个物理子步](character-motion.md) |
-| 哪些 ECS 变化需要重新提取，哪些 GPU 数据可以跨帧复用 | [场景提取与资产发布](extraction.md) |
-| 三角簇、体素、材质、光追和时域后处理怎样进入 RDG 与 RHI | [渲染实现](rendering.md) |
-| 如何选择实验、资产和调试命令 | [实验目录](experiment-catalog.md) |
-| 如何测模拟、GPU 与窗口耗时，以及已有对照能说明什么 | [性能与复现](performance.md) |
+| 部分 | 适合带着什么问题来读 | 从哪里开始 |
+| --- | --- | --- |
+| 架构 | 一个物体由谁更新，哪些工作能并行，GPU 资源和历史在哪一帧退役？ | [一帧的数据流与模块图](architecture/README.md) |
+| 算法 | 给定同一份输入，怎样选择簇、计算光照、驱动骨骼或重建纹理？ | [按研究问题查算法](algorithms/README.md) |
+| 与虚幻引擎的差异及改进 | 两边解决了问题的哪一部分，哪些机制值得移植，怎样用实验判断取舍？ | [系统对照与验证顺序](unreal/README.md) |
 
-代码与文档修改走同一套验证流程。第三方资产的原作、许可与使用范围单独记录。[开发与验证](../CONTRIBUTING.md) · [资产署名](../assets/README.md)
+**追一帧森林。** 从[实体变化与场景提取](architecture/extraction.md)进入[植被的构建和光栅化](algorithms/cluster-voxels.md)，再看[直接光和间接光](algorithms/visibility-lighting.md)。GPU 时间线和窗口完成间隔的解释见[性能测量](architecture/performance.md)。
+
+**追一次银狼触地。** [角色子步协议](architecture/character-motion.md)说明谁能写根变换，[动作匹配](algorithms/animation-physics.md)说明怎样选姿，[物理骨链与末端约束](algorithms/physical-animation.md)说明怎样承重、落脚和扶栏。换角色时的组合能力见[UAF、Mover 与 Chaos 对照](unreal/animation-physics.md)。
+
+修改引擎时使用[开发与验证规范](../CONTRIBUTING.md)。使用仓库附带的模型、动作和环境贴图时查阅[资产来源与许可](../assets/README.md)。

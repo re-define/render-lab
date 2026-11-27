@@ -19,14 +19,14 @@ cargo run --release --locked -- --scene target/saved.json
 | `forest-karst` | 岩柱、河谷植物、太阳、ReSTIR 和缓存间接光。预设要求硬件光追，CLI 默认选择 TAA。 | `vegetation camera karst` 固定机位，分别输入 `restir gi direct`、`restir gi multi`。 |
 | `movement` | 三个共享网格的物体分别静止、水平移动、受重力落下。 | `object` 列出 ID，`object 3` 查看策略。`tick movement 30` 调整普通运动频率。 |
 | `motion` | 银狼骨架和烘焙的动作库，观察输入轨迹、姿态候选和转向。 | 用 IJKL 改方向，再用 `motionsearch kd`、`motionsearch scan` 对照查询。 |
-| `hair` | 程序化假发、头模与肩部胶囊；侧风、头部转动和造型刚度可以独立调节。 | `hair status` 查看最大伸长，`hair wind -8` 反转侧风。[毛发模拟研究与操作](hair-simulation.md) |
-| `silver-contact` | 银狼通过平台、栏杆和低矮障碍，用接触反馈修正脚掌和末端触点。 | `contact status` 查看状态，`contact limbs on` 打开局部物理动画，`contact grip off` 关闭机械撑栏。[子步与实验命令](character-motion.md) |
+| `hair` | 程序化假发、头模与肩部胶囊；侧风、头部转动和造型刚度可以独立调节。 | `hair status` 查看最大伸长，`hair wind -8` 反转侧风。[毛发模拟研究与操作](algorithms/hair-simulation.md) |
+| `silver-contact` | 银狼通过平台、栏杆和低矮障碍，用接触反馈修正脚掌和末端触点。 | `contact status` 查看状态，`contact limbs on` 打开局部物理动画，`contact grip off` 关闭机械撑栏。[子步与实验命令](architecture/character-motion.md) |
 | `silver-contact-duo` | 双角色障碍路线。两者共享可见网格，第二名角色采用不同的腕部关节链与指尖绑定。 | `control` 查询角色 ID，`control ID` 选择角色，`drive 0.25 0.8` 输入连续方向，`motionroot clip` 采用片段根运动，`contact mode free` 切到独立移动。 |
-| `water` | 程序化台阶上，计算着色器推进水量和流动状态，水面随模拟变化。 | `effect restart` 重新开始，`effect time 2` 指定观察时刻。 |
+| `water` | 程序化台阶上，计算着色器沿流线推进不同年龄的水团，再从相邻采样生成水面。 | `effect restart` 重新开始，`effect time 2` 指定观察时刻。 |
 | `destruction` | 程序化碎块和消融表面。比较相同几何在完整、破碎和消融阶段的轮廓。 | 依次输入 `effect restart`、`effect time 2.2`、`effect time 4.7`。 |
 | `confluence` | 同一 ECS 世界装配森林、流水、银狼、IBL 与多光源直接光。 | `feature water off`、`feature actor off`、`feature restir off` 分别关闭一层，相同命令改成 `on` 可恢复。 |
 
-几何树与材质、运动与碰撞各自有独立入口。林地样本由种子生成，截图对照时可固定风时间。银狼运动时钟与物理状态可通过 `save target/saved.json` 保存，再用 `load target/saved.json` 接续。[植物生成](../src/experiments/vegetation.rs) · [稠密河谷规模回归](../src/experiments/vegetation/river_forest.rs) · [特效实现](../src/experiments/effects.rs) · [角色求解](animation-physics.md)
+几何树与材质、运动与碰撞各自有独立入口。林地样本由种子生成，截图对照时可固定风时间。银狼运动时钟与物理状态可通过 `save target/saved.json` 保存，再用 `load target/saved.json` 接续。[植物生成](../src/experiments/vegetation.rs) · [稠密河谷规模回归](../src/experiments/vegetation/river_forest.rs) · [特效实现](../src/experiments/effects.rs) · [角色求解](algorithms/animation-physics.md)
 
 ## 材质、压缩、直接光与间接光
 

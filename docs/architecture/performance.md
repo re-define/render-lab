@@ -11,11 +11,11 @@
 | 整帧 GPU 跨度、pass 时长 | 整帧使用可对齐的 GPU 时间戳。每个 pass 在所属队列计时，查看区间并集与等待来源。 | GPU 花了多久，不同物理队列上的工作实际重叠多少？ |
 | worker 的 CPU-ms | 在采样窗口内取得各线程累计占用核心的时间，再除以完成帧数。 | 模拟、构图、录制的工作量怎样分布？多核并行会使总 CPU-ms 大于一帧的墙钟时间。 |
 
-分位数应来自同一组逐帧样本。整帧 P95 取自每一帧独立测得的 GPU 跨度。窗口帧率取自整段时间内的完成事件。交互窗口输入 `timeline target/frame.json` 导出最近一帧的队列时间线。启动时加入 `--benchmark 96` 会预热 60 个完成帧后输出 96 个样本的 JSON，其中 `frame_times` 给出逐帧事件，`stats` 给出汇总，`passes` 给出最后一帧的父依赖、队列、屏障与区间。[窗口基准实现](../src/ui/benchmark.rs) · [时间线导出](../src/rhi/timeline.rs)
+分位数应来自同一组逐帧样本。整帧 P95 取自每一帧独立测得的 GPU 跨度。窗口帧率取自整段时间内的完成事件。交互窗口输入 `timeline target/frame.json` 导出最近一帧的队列时间线。启动时加入 `--benchmark 96` 会预热 60 个完成帧后输出 96 个样本的 JSON，其中 `frame_times` 给出逐帧事件，`stats` 给出汇总，`passes` 给出最后一帧的父依赖、队列、屏障与区间。[窗口基准实现](../../src/ui/benchmark.rs) · [时间线导出](../../src/rhi/timeline.rs)
 
 ## 银狼人群
 
-**固定 CPU 工作量。** 500 名银狼、177,042 个实体、3,000 个蒙皮实例，16 个 worker。每个样本用 0.1 秒模拟时间触发六个 60 Hz 子步，再提取一次。预热 20 个样本，保留 96 个。计时区外把首末采样帧与独立全量提取逐实例核对根变换和调色板。[基准实现](../src/experiments/motion/silver/contact/crowd_profile.rs)
+**固定 CPU 工作量。** 500 名银狼、177,042 个实体、3,000 个蒙皮实例，16 个 worker。每个样本用 0.1 秒模拟时间触发六个 60 Hz 子步，再提取一次。预热 20 个样本，保留 96 个。计时区外把首末采样帧与独立全量提取逐实例核对根变换和调色板。[基准实现](../../src/experiments/motion/silver/contact/crowd_profile.rs)
 
 | 同机工作量 | 六子步模拟 P95 | 提取 P95 |
 | --- | ---: | ---: |
@@ -25,7 +25,7 @@
 
 最终复验的模拟与提取 P50 分别为 25.12 ms 和 7.51 ms，每样本读取 500 个姿态块、10,500 个脏关节局部变换，仍需检查 159,500 个调色板关节。交替对照的 P95 区间重叠，无法据此认定运动与时钟改造提高了 CPU 速度。
 
-**固定窗口与绘制路径。** 另一个基准使用 300 人、1920×1080、MAILBOX 和两个在途槽。场景按实际经过时间推进，预热 20 个完成帧，采样 96 帧。两组均运行于 `4b6ed7c`，只切换普通绘制路径。[绘制工作组织](../src/render/draw_list.rs) · [冻结姿态的像素回归](../src/experiments/motion/silver/contact/crowd_draw_test.rs)
+**固定窗口与绘制路径。** 另一个基准使用 300 人、1920×1080、MAILBOX 和两个在途槽。场景按实际经过时间推进，预热 20 个完成帧，采样 96 帧。两组均运行于 `4b6ed7c`，只切换普通绘制路径。[绘制工作组织](../../src/render/draw_list.rs) · [冻结姿态的像素回归](../../src/experiments/motion/silver/contact/crowd_draw_test.rs)
 
 | 指标 | 逐部件绘制 | GPU 生成绘制列表 |
 | --- | ---: | ---: |
@@ -77,11 +77,11 @@ Remove-Item Env:RENDER_LAB_PHYSICAL_LIMBS, Env:RENDER_LAB_NPCS
 cargo test --release --locked --lib profile_dynamic_collision_snapshot -- --ignored --nocapture
 ```
 
-[子步交换、开关和视频](character-motion.md) · [障碍场的动作精度对照](animation-physics.md) · [人群基准](../src/experiments/motion/silver/contact/crowd_profile.rs)
+[子步交换、开关和视频](character-motion.md) · [障碍场的动作精度对照](../algorithms/animation-physics.md) · [人群基准](../../src/experiments/motion/silver/contact/crowd_profile.rs)
 
 ## 岩柱森林的物理队列
 
-相同的 420 帧相机路径，原生 1080p、TAA、ReSTIR、硬件直接光阴影和多跳间接光。剔除开头 48 帧，统计 372 帧。两个在途槽，队列数在设备创建时确定。[相机轨迹和逐帧 CSV](../examples/forest_shadows/zoom.rs)
+相同的 420 帧相机路径，原生 1080p、TAA、ReSTIR、硬件直接光阴影和多跳间接光。剔除开头 48 帧，统计 372 帧。两个在途槽，队列数在设备创建时确定。[相机轨迹和逐帧 CSV](../../examples/forest_shadows/zoom.rs)
 
 | 配置 | GPU P50 / P95 | 完成间隔 P50 / P95 | 提交等待中位数，含 WSI | 资源屏障中位数 |
 | --- | ---: | ---: | ---: | ---: |
@@ -99,7 +99,7 @@ Remove-Item Env:RENDER_LAB_GPU_QUEUES
 
 ## 森林稀疏提取
 
-这项 CPU 基准使用 `vegetation-scale`，包含 2,665 棵树、12,580 丛草、17,939 个实体。每种输入轮换三次，每轮预热后计 200 个样本。每次都读取提交后的快照并核对树的变换和共享树皮，保留两份旧快照来覆盖跨帧读者。[提取基准与 CSV 字段](../examples/forest_extraction.rs)
+这项 CPU 基准使用 `vegetation-scale`，包含 2,665 棵树、12,580 丛草、17,939 个实体。每种输入轮换三次，每轮预热后计 200 个样本。每次都读取提交后的快照并核对树的变换和共享树皮，保留两份旧快照来覆盖跨帧读者。[提取基准与 CSV 字段](../../examples/forest_extraction.rs)
 
 | 操作 | 访问实体 | 更新实例 | 提取 P95 |
 | --- | ---: | ---: | ---: |
@@ -112,7 +112,7 @@ cargo run --release --locked --example forest_extraction > target/forest-extract
 cargo run --release --locked --example forest_scene_updates -- target/forest-uploads.csv
 ```
 
-第二条命令另外检查 GPU 表更新和动态上传字节，并与全量打包的图像进行对照。实际上传费用与实例提取次数分别记录。[上传验证](../examples/forest_scene_updates.rs)
+第二条命令另外检查 GPU 表更新和动态上传字节，并与全量打包的图像进行对照。实际上传费用与实例提取次数分别记录。[上传验证](../../examples/forest_scene_updates.rs)
 
 ## 稳定人群图的编译成本
 
@@ -123,7 +123,7 @@ cargo run --release --locked --example forest_scene_updates -- target/forest-upl
 | 关 | 4.61 / 5.48 | 1.34 / 1.70 | 6.07 / 6.98 | 3.58 / 3.79 | 17.43 / 29.69 |
 | 开 | 4.57 / 5.32 | 0.22 / 0.27 | 4.79 / 5.55 | 3.64 / 3.87 | 15.03 / 25.90 |
 
-本次平均吞吐从 71.52 提升到 79.66 个完成帧/秒。固定姿态的逐像素验证覆盖表面 ID、深度、运动和历史对应；其读回在独立用例中执行。[窗口采样](../src/experiments/motion/silver/contact/crowd_profile.rs) · [像素验证](../src/experiments/motion/silver/contact/crowd_draw_test.rs)
+本次平均吞吐从 71.52 提升到 79.66 个完成帧/秒。固定姿态的逐像素验证覆盖表面 ID、深度、运动和历史对应；其读回在独立用例中执行。[窗口采样](../../src/experiments/motion/silver/contact/crowd_profile.rs) · [像素验证](../../src/experiments/motion/silver/contact/crowd_draw_test.rs)
 
 ## 森林 RDG 与物理队列对照
 
@@ -136,7 +136,7 @@ Ryzen 7 9700X、RTX 5070、NVIDIA 621.14，1920×1080、MAILBOX、硬件光追�
 | 三队列、优先同队列 | 282 / 372 | 0.077 / 0.500 | 21.80 / 25.13 | 9 | 0.00 |
 | 三队列、优先最长下游依赖链 | 282 / 372 | 0.078 / 0.551 | 21.56 / 24.51 | 9 | 0.00 |
 
-在固定远景的 48 帧内，开启模板后 CPU 依赖编译 P95 从 0.452 ms 降到 0.094 ms。推近与返回阶段拓扑频繁变化，两段的命中率分别为 40% 和 35%。全路径的编译均值从 0.319 ms 降到 0.158 ms，P95 略升。自动策略保留这台设备上森林的单队列映射。单队列仍有来自其他提交或资源就绪状态的时间线等待。可在输出目录的 `timeline-120.json` 与 `timeline-400.json` 检查实际队列和完成链。[队列策略](../src/rhi/queues.rs) · [回放实现](../examples/forest_shadows/zoom.rs)
+在固定远景的 48 帧内，开启模板后 CPU 依赖编译 P95 从 0.452 ms 降到 0.094 ms。推近与返回阶段拓扑频繁变化，两段的命中率分别为 40% 和 35%。全路径的编译均值从 0.319 ms 降到 0.158 ms，P95 略升。自动策略保留这台设备上森林的单队列映射。单队列仍有来自其他提交或资源就绪状态的时间线等待。可在输出目录的 `timeline-120.json` 与 `timeline-400.json` 检查实际队列和完成链。[队列策略](../../src/rhi/queues.rs) · [回放实现](../../examples/forest_shadows/zoom.rs)
 
 ```powershell
 cargo run --release --locked --example forest_shadows -- target/forest-auto zoom 1 --size 1920x1080
@@ -152,4 +152,4 @@ Remove-Item Env:RENDER_LAB_RDG_PLAN_CACHE
 
 ## 仓库附带的数据
 
-[crowd-frame-metrics.csv](crowd-frame-metrics.csv) 保留更早一次银狼蒙皮批处理的采样汇总，列包括人数、测试版本、工作负载、样本数、P50、P95 与均值。`current` 是那次测量的对照版本标签。逐线程均值保存在 [npc-threads.csv](npc-threads.csv)，单位为每完成帧的 CPU 毫秒。复测时请另存提交号、驱动、开关、分辨率及各帧输出。
+[crowd-frame-metrics.csv](measurements/crowd-frame-metrics.csv) 保留更早一次银狼蒙皮批处理的采样汇总，列包括人数、测试版本、工作负载、样本数、P50、P95 与均值。`current` 是那次测量的对照版本标签。逐线程均值保存在 [npc-threads.csv](measurements/npc-threads.csv)，单位为每完成帧的 CPU 毫秒。复测时请另存提交号、驱动、开关、分辨率及各帧输出。
