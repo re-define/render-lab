@@ -35,6 +35,16 @@ pub(super) fn command(engine: &mut Engine, args: &str) -> Result<String> {
         Arc::make_mut(&mut engine.world).enable_linear_control(id, speed)?;
         return Ok(format!("Entity {id} linear control speed {speed} m/s"));
     }
+    if let ["impulse", x, y, z, location @ ..] = tail {
+        let point = match location {
+            [] => None,
+            ["at", px, py, pz] => Some(Vec3::new(px.parse()?, py.parse()?, pz.parse()?)),
+            _ => bail!("object ID impulse JX JY JZ [at PX PY PZ]"),
+        };
+        let j = Vec3::new(x.parse()?, y.parse()?, z.parse()?);
+        Arc::make_mut(&mut engine.world).apply_body_impulse(id, j, point)?;
+        return Ok(format!("Entity {id} · impulse {j:?} N·s"));
+    }
     let mut next_body = None;
     let next_policy = match tail {
         [] => {
@@ -42,11 +52,12 @@ pub(super) fn command(engine: &mut Engine, args: &str) -> Result<String> {
             let assets =
                 binding.and_then(|a| engine.world.entities.get(&a)?.geometry_assets.as_deref());
             return Ok(format!(
-                "{} ({id}) · {:?}/{:?} · linear {:?} · geometry assets {:?} · bounds {:?} · shadow mesh {:?}",
+                "{} ({id}) · {:?}/{:?} · linear {:?} · angular momentum {:?} · geometry assets {:?} · bounds {:?} · shadow mesh {:?}",
                 e.name,
                 policy.mobility,
                 policy.physics,
                 body,
+                engine.world.angular_body(id)?.map(|a| a.momentum),
                 binding,
                 assets.and_then(|a| a.local_bounds),
                 assets.and_then(|a| a.shadow_mesh)
@@ -86,7 +97,9 @@ pub(super) fn command(engine: &mut Engine, args: &str) -> Result<String> {
             }
             policy
         }
-        _ => bail!("object ID [static|movable off|query|simulated] or object ID velocity X Y Z"),
+        _ => bail!(
+            "object ID [static|movable off|query|simulated] or velocity X Y Z | impulse JX JY JZ [at PX PY PZ]"
+        ),
     };
     if next_body.is_some() {
         ensure!(

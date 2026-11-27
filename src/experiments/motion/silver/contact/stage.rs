@@ -258,7 +258,9 @@ fn evaluate_pose(
                 &mut scratch.clips,
             ),
             Operation::PhysicalLimbs => {
-                if let Some(layer) = &mut c.physical_pose {
+                if let Some(layer) = &mut c.physical_pose
+                    && layer.active()
+                {
                     Arc::make_mut(layer).apply(
                         r,
                         &mut pose,

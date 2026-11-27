@@ -176,3 +176,57 @@ fn deleting_the_selected_actor_releases_control_across_id_reuse_and_save() -> Re
     assert_eq!(controls.target(&World::load(&path)?), Some(replacement));
     Ok(())
 }
+
+#[test]
+fn eccentric_impulse_changes_both_momenta_and_survives_reload() -> Result<()> {
+    let mut world = movement_lab::scene()?;
+    let ids = world.entities.component_owners(LINEAR_BODY).to_vec();
+    let id = ids[2];
+    let center = world.entities[&id].local.w_axis.truncate();
+    for &other in &ids[..2] {
+        assert!(world.apply_body_impulse(other, Vec3::Y, None).is_err());
+    }
+    world.apply_body_impulse(id, Vec3::X, None)?;
+    assert_eq!(world.angular_body(id)?.unwrap().momentum, Vec3::ZERO);
+    world.apply_body_impulse(id, Vec3::Y * 2., Some(center + Vec3::X * 0.5))?;
+    assert_eq!(
+        world.linear_body(id)?.unwrap().momentum,
+        Vec3::new(1., 2., 0.)
+    );
+    assert_eq!(world.angular_body(id)?.unwrap().momentum, Vec3::Z);
+    // A translation-only body can take a central impulse. Reject unrepresentable torque atomically.
+    world.set_motion_policy(ids[1], MotionPolicy::DYNAMIC)?;
+    world.apply_body_impulse(ids[1], Vec3::Z, None)?;
+    let momentum = world.linear_body(ids[1])?.unwrap().momentum;
+    let at = world.entities[&ids[1]].local.w_axis.truncate() + Vec3::X;
+    assert!(world.apply_body_impulse(ids[1], Vec3::Z, Some(at)).is_err());
+    assert_eq!(world.linear_body(ids[1])?.unwrap().momentum, momentum);
+    let before = serde_json::to_value(&world)?;
+    for point in [Vec3::NAN, Vec3::splat(f32::MAX)] {
+        assert!(
+            world
+                .apply_body_impulse(id, Vec3::Y * 2., Some(point))
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&world)?, before);
+    }
+    let dir = tempfile::tempdir()?;
+    let save = dir.path().join("impulse.json");
+    world.save(&save)?;
+    let mut loaded = Arc::new(World::load(&save)?);
+    let mut running = Arc::new(world);
+    advance(&mut running, 4, 1. / 60., 1)?;
+    advance(&mut loaded, 2, 1. / 30., 4)?;
+    assert_eq!(running.entities[&id].local, loaded.entities[&id].local);
+    assert!(
+        running.entities[&id]
+            .local
+            .to_scale_rotation_translation()
+            .1
+            .z
+            .abs()
+            > 0.1
+    );
+    assert!(running.entities[&id].local.w_axis.x > center.x);
+    Ok(())
+}

@@ -1,62 +1,18 @@
 //! Translation in parent coordinates. Distance is measured in metres and time in seconds.
-use super::{AnalogMove, MovementDriver, RootMotionRequest, SolvedRoot};
+mod control;
+mod integrate;
 use crate::{
-    engine::{
-        FixedDomain, Schedule,
-        SimulationData::{Component, LocalTransformsById},
-        SimulationSystem, SystemAccess, SystemContext, TransformBindings, TransformTargets,
-    },
-    physics::{ANGULAR_BODY, AngularBody, Particle},
-    scene::{Id, MOTION_POLICY, Mobility, MotionPolicy, PhysicsParticipation, World},
+    physics::{ANGULAR_BODY, AngularBody},
+    scene::{Id, MOTION_POLICY, MotionPolicy, PhysicsParticipation, World},
 };
 use anyhow::{Context, Result, ensure};
-use glam::{Vec2, Vec3};
+pub use control::{CONTROL, DRIVER, LinearControl};
+use glam::Vec3;
+pub use integrate::register;
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
 
 pub const CLOCK: &str = "movement";
 pub const LINEAR_BODY: &str = "engine.motion.linear_body";
-
-/// Opt-in parent-space planar controls. Bodies with only LINEAR_BODY retain authored motion.
-pub const CONTROL: &str = "engine.motion.linear_control";
-#[derive(Clone, Copy, Serialize, Deserialize)]
-pub struct LinearControl {
-    pub speed: f32,
-    #[serde(default)]
-    engaged: bool,
-}
-pub const DRIVER: MovementDriver = MovementDriver {
-    component: CONTROL,
-    camera_follows: |_, _| true,
-    active: |world, id| {
-        Ok(world
-            .typed_component::<LinearControl>(id, CONTROL)?
-            .context("missing linear controller")?
-            .engaged)
-    },
-    apply: drive,
-};
-
-fn drive(world: &mut World, id: Id, input: AnalogMove) -> Result<()> {
-    let mut controller = *world
-        .typed_component::<LinearControl>(id, CONTROL)?
-        .context("missing linear controller")?;
-    let mut body = world
-        .linear_body(id)?
-        .context("linear control requires a body")?;
-    let velocity = Vec2::new(input.side, input.forward).clamp_length_max(1.0) * controller.speed;
-    body.target_velocity.x = velocity.x;
-    body.target_velocity.z = velocity.y;
-    if world.motion_policy(id, MotionPolicy::KINEMATIC)?.physics == PhysicsParticipation::Simulated
-    {
-        body.momentum.x = velocity.x * body.mass;
-        body.momentum.z = velocity.y * body.mass;
-    }
-    controller.engaged = velocity != Vec2::ZERO;
-    world.set_linear_body(id, body)?;
-    world.set_typed_component(id, CONTROL, controller);
-    Ok(())
-}
 
 /// Parameters and current momentum survive save/load. Kinematic velocity and gravity are independent.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -91,33 +47,6 @@ impl LinearBody {
 }
 
 impl World {
-    pub fn disable_linear_control(&mut self, id: Id) -> Result<()> {
-        if let Some(control) = self.typed_component::<LinearControl>(id, CONTROL)? {
-            if control.engaged {
-                drive(self, id, AnalogMove::default())?;
-            }
-            self.remove_typed_component(id, CONTROL);
-            if self.control_selection() == Some(Some(id)) {
-                self.select_control_target(None);
-            }
-        }
-        Ok(())
-    }
-
-    pub fn enable_linear_control(&mut self, id: Id, speed: f32) -> Result<()> {
-        ensure!(
-            speed.is_finite() && speed > 0.,
-            "control speed must be finite and positive"
-        );
-        self.linear_body(id)?
-            .context("linear control requires a body")?;
-        let engaged = self
-            .typed_component::<LinearControl>(id, CONTROL)?
-            .is_some_and(|c| c.engaged);
-        self.set_typed_component(id, CONTROL, LinearControl { speed, engaged });
-        Ok(())
-    }
-
     pub fn linear_body(&self, id: Id) -> Result<Option<LinearBody>> {
         Ok(self
             .typed_component::<LinearBody>(id, LINEAR_BODY)?
@@ -210,105 +139,4 @@ impl World {
         }
         Ok(ordinary)
     }
-}
-
-struct Integrate;
-impl SimulationSystem for Integrate {
-    fn access(&self) -> SystemAccess {
-        SystemAccess {
-            name: "Linear motion",
-            reads: &[
-                Component(LINEAR_BODY),
-                Component(ANGULAR_BODY),
-                Component(MOTION_POLICY),
-                LocalTransformsById,
-            ],
-            writes: &[
-                Component(LINEAR_BODY),
-                Component(ANGULAR_BODY),
-                LocalTransformsById,
-            ],
-        }
-    }
-    fn transform_targets(&self, bindings: &TransformBindings<'_>) -> Result<TransformTargets> {
-        let ids = bindings.component_owners(LINEAR_BODY)?;
-        Ok(TransformTargets {
-            reads: ids.to_vec(),
-            writes: ids.to_vec(),
-        })
-    }
-    fn run(&self, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
-        if dt == 0. {
-            return Ok(());
-        }
-        let ids = cx.component_owners(LINEAR_BODY)?;
-        cx.for_each_parallel(ids, |&id, cx| {
-            let policy = cx.motion_policy(id, MotionPolicy::KINEMATIC)?;
-            if policy.mobility == Mobility::Static {
-                return Ok(());
-            }
-            let local = cx.local(id)?.context("missing linear transform")?;
-            let mut body = *cx
-                .component::<LinearBody>(id, LINEAR_BODY)?
-                .context("missing body")?;
-            let mut desired = local;
-            desired.w_axis += (body.target_velocity * dt).extend(0.);
-            let simulated = if policy.physics == PhysicsParticipation::Simulated {
-                let mut particle = Particle {
-                    position: local.w_axis.truncate(),
-                    momentum: body.momentum,
-                    mass: body.mass,
-                };
-                particle.advance(body.acceleration, dt);
-                ensure!(
-                    particle.position.is_finite() && particle.momentum.is_finite(),
-                    "non-finite linear motion on entity {id}"
-                );
-                if body.momentum != particle.momentum {
-                    body.momentum = particle.momentum;
-                    cx.set_bound_state(id, LINEAR_BODY, body)?;
-                }
-                let rotation =
-                    if let Some(angular) = cx.component::<AngularBody>(id, ANGULAR_BODY)? {
-                        let mut angular = angular.into_owned();
-                        let previous = angular.momentum;
-                        ensure!(
-                            local.determinant().is_finite() && local.determinant() != 0.,
-                            "singular angular body transform {id}"
-                        );
-                        let current = local.to_scale_rotation_translation().1;
-                        let next = angular.advance(current, dt)?;
-                        if angular.momentum != previous {
-                            cx.set_bound_state(id, ANGULAR_BODY, angular)?;
-                        }
-                        Some(next)
-                    } else {
-                        None
-                    };
-                Some(SolvedRoot {
-                    position: particle.position,
-                    rotation,
-                })
-            } else {
-                None
-            };
-            let resolved =
-                RootMotionRequest::new(desired)?.resolve_body(policy, local, simulated)?;
-            if local != resolved {
-                cx.set_pose([(id, resolved)])?;
-            }
-            Ok(())
-        })
-    }
-}
-
-pub fn register(schedule: &mut Schedule) -> Result<()> {
-    schedule.add_fixed_system(
-        FixedDomain {
-            name: CLOCK,
-            step: Duration::from_secs_f64(1. / 60.),
-            max_steps: 8,
-        },
-        Arc::new(Integrate),
-    )
 }

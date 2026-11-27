@@ -26,6 +26,11 @@ pub fn command(engine: &mut Engine, arg: &str) -> Result<String> {
         .typed_component::<Contact>(id, SETTING)?
         .context("selected entity has no contact controller")?;
     match arg.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["limbs"] => {
+            return Ok(physical_pose::PhysicalPose::describe(
+                c.physical_pose.as_deref(),
+            ));
+        }
         [] | ["status"] => {
             if c.source.is_empty() {
                 return Ok("Waiting for the first contact substep".into());
@@ -143,6 +148,9 @@ fn edit_controller(engine: &mut Engine, id: Id, mut c: Contact, words: &[&str]) 
             set_actor_goal(Arc::make_mut(&mut engine.world), id, 0, 0)?;
         }
         ["hand", v @ ("on" | "off")] => c.hand_ik = *v == "on",
+        ["limbs", limb, args @ ..] if !args.is_empty() => {
+            physical_pose::PhysicalPose::edit(&mut c.physical_pose, limb, args)?
+        }
         ["limbs", value] => physical_pose::PhysicalPose::configure(&mut c.physical_pose, value)?,
         ["grip", "off"] => c.grip_fraction = 0.,
         ["grip", "on"] => c.grip_fraction = default_grip_fraction(),

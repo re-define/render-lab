@@ -48,6 +48,15 @@ pub fn scene() -> Result<World> {
         )?;
         world.set_motion_policy(id, policy)?;
     }
+    // Principal moments of the unit-radius solid octahedron at 1 kg.
+    world.set_angular_body(
+        falling,
+        crate::physics::AngularBody {
+            inertia: Vec3::splat(0.2),
+            momentum: Vec3::ZERO,
+            torque: Vec3::ZERO,
+        },
+    )?;
     world.enable_linear_control(walker, 1.5)?;
     world.validate()?;
     Ok(world)

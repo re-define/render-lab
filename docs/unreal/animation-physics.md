@@ -19,4 +19,4 @@ Mover 将运动模式及其状态封装为可组合的 Actor 移动模块，并�
 
 Chaos 提供通用刚体、关节、物理动画、布娃娃和破碎等机制。它的破碎资产可以包含分层碎片、连接关系和损伤阈值。Render Lab 角色的实际根运动由胶囊、盒碰撞与支撑求解，局部肢体用带柔度的骨链约束调整姿态；碎块实验用预生成的 Voronoi 单元和按时间计算的位姿。这两类本地输出可以分别检验根与四肢反馈、几何破碎与着色，现阶段没有共享的一套全身多刚体约束求解器。[Epic Chaos Physics](https://dev.epicgames.com/documentation/unreal-engine/physics-in-unreal-engine?application_version=5.8) · [角色骨链](../algorithms/physical-animation.md) · [碎块算法](../algorithms/effects-textures.md)
 
-可先把身体的碰撞形状、关节局部框架和角度限制做成可绑定资产，挑一条触达中的手臂验证。固定动作与根运动，检查手掌误差、关节超限、支撑冲量和重载后连续性，再决定是否扩到全身。另一项独立实验是录制同一段移动平台输入，回退到早期子步重新模拟，逐步比较根姿态、支撑 ID 和触地序号。这样可以分别评估角色约束和历史数据的完备程度。[接触回归](../../src/experiments/motion/silver/contact/exchange_tests.rs) · [碰撞历史](../../src/experiments/motion/silver/contact/collision/history.rs)
+银狼的右肘和双膝已经支持按链配置屈曲上下限、姿态驱动柔度和阻尼。下一步可为关节补充两端的局部框架和轴向扭转限制，用同一段触达动作比较腕部误差、关节角及平台反作用力。[已实现的约束与测量](../algorithms/physical-animation.md) 另一项独立实验是录制同一段移动平台输入，回退到早期子步重新模拟，逐步比较根姿态、支撑 ID 和触地序号。这样可以分别评估角色约束和历史数据的完备程度。[接触回归](../../src/experiments/motion/silver/contact/exchange_tests.rs) · [碰撞历史](../../src/experiments/motion/silver/contact/collision/history.rs)

@@ -36,3 +36,14 @@ flowchart TD
 速度、重力、法线和目标变换都以角色父节点为坐标系。碰撞索引在世界空间组织，查询后将候选转换回角色坐标。角色站在移动平台时，动画查询使用实际速度减去脚下支撑点的速度。角色顶到墙时，阻挡法线限制继续朝墙内的预测；沿墙方向仍可用。移除接触驱动后，角色继承实际速度；恢复驱动时，物理体从当前位姿和速度继续。序号与控制状态随场景保存，候选接触面在加载后的第一个物理子步重新查询。[交换类型](../../src/movement/character.rs) · [动作匹配](../../src/experiments/motion/silver.rs) · [模式交接](../../src/experiments/motion/silver/contact/modes.rs)
 
 支撑反作用、局部骨链积分和手掌 IK 的约束顺序见[支撑冲量、物理骨链与末端约束](../algorithms/physical-animation.md)。
+
+## 修改动画或物理时从哪里入手
+
+| 想改变的行为 | 输入、职责与输出 |
+| --- | --- |
+| 角色建场与动作库读取 | 建场绑定骨架和初始动作。动作库读取器校验采样、重建片段根增量并装载搜索索引。[骨架绑定](../../src/experiments/motion/silver/setup.rs) · [动作库](../../src/experiments/motion/silver/bank.rs) |
+| 输入预测与姿态播放 | 预测器将控制输入和物理观察变为未来轨迹及检索特征。播放模块选择样本、应用惯性化，输出基础局部姿态与期望根变换。[预测](../../src/experiments/motion/silver/prediction.rs) · [播放](../../src/experiments/motion/silver/playback.rs) |
+| 姿态图 | 资产描述片段和节点连线。编译器验证依赖和遮罩，把资产变成可共享的求值指令。[资产](../../src/animation.rs) · [编译与指令](../../src/animation/program.rs) |
+| 角色与平台 | 接触模块从候选盒体生成支撑面和胶囊扫掠结果。单角色求解器计算实际根运动、接触冲量和对平台的增量。调度层按共用平台分组，汇总所有角色的增量后只提交一次。[接触几何](../../src/experiments/motion/silver/contact/dynamics/contacts.rs) · [根求解](../../src/experiments/motion/silver/contact/dynamics/root.rs) · [平台运动](../../src/experiments/motion/silver/contact/dynamics/platform.rs) · [成组提交](../../src/experiments/motion/silver/contact/dynamics.rs) |
+| 物理骨链 | 通用求解器只处理目标位置、重力、接触面及约束参数。银狼适配层绑定三条链，读取求解位置并按权重写回骨架。[驱动与限位](../../src/physics/articulation/drive.rs) · [银狼骨链绑定](../../src/experiments/motion/silver/contact/physical_pose.rs) |
+| 普通刚体 | 控制模块产生期望平移，积分系统按运动策略计算实际根位姿。外部冲量独立修改线动量与角动量，下一次固定更新用新动量积分。[控制](../../src/movement/linear/control.rs) · [积分](../../src/movement/linear/integrate.rs) · [冲量](../../src/physics/impulse.rs) |

@@ -4,9 +4,14 @@
 
 ## 支撑、握持与局部物理动画
 
-撑栏时先在动作事件窗口内用动画姿态检查手是否能到达栏杆，得到下一步可用的承重比例。求解器再检查支撑实体、碰撞层和角色是否离地，计算该步向上的冲量。手部 IK 单独负责把手掌贴上栏杆。实验可固定机械承重开关，只切换手部 IK，逐步比较腕部姿态、根高度和手部冲量。[撑栏接触](../../src/experiments/motion/silver/contact/traversal.rs) · [角色求解器](../../src/experiments/motion/silver/contact/dynamics.rs) · [成对回放测试](../../src/experiments/motion/silver/contact/exchange_tests.rs)
+撑栏时先在动作事件窗口内用动画姿态检查手是否能到达栏杆，得到下一步可用的承重比例。求解器再检查支撑实体、碰撞层和角色是否离地，计算该步向上的冲量。手部 IK 单独负责把手掌贴上栏杆。实验可固定机械承重开关，只切换手部 IK，逐步比较腕部姿态、根高度和手部冲量。[撑栏接触](../../src/experiments/motion/silver/contact/traversal.rs) · [角色根求解](../../src/experiments/motion/silver/contact/dynamics/root.rs) · [成对回放测试](../../src/experiments/motion/silver/contact/exchange_tests.rs)
 
-`contact limbs on` 打开局部物理动画，`contact limbs 0.5` 混合一半，`contact limbs off` 返回默认姿态。右臂和两条腿各有一条两段骨链。肩或大腿根跟随动作，其余两个节点受重力、阻尼、骨长约束和带柔度的姿态目标驱动，并与查询到的可行走表面接触。每个内部时间步最多 1/120 秒，用八轮迭代求解。默认姿态图把模拟方向转回骨骼局部旋转后，再施加精确手脚 IK。自定义图可调整这些操作的执行顺序。[姿态图](pose-graphs.md)局部状态可存档续算。目前骨链之间独立，角色质心由胶囊控制器求解，全身倒地、骨骼互撞、关节角限位和骨链对平台的反作用力都超出本实现范围。[骨链积分](../../src/physics/articulation.rs) · [姿态混合](../../src/experiments/motion/silver/contact/physical_pose.rs) · [XPBD 约束方法](https://matthias-research.github.io/pages/publications/XPBD.pdf)
+`contact limbs on` 打开局部物理动画，`contact limbs 0.5` 混合一半，`contact limbs off` 返回默认姿态。右臂和两条腿各有一条两段骨链。肩或大腿根跟随动作，其余两个节点受重力、阻尼、骨长约束和带柔度的姿态目标驱动，并与查询到的可行走表面接触。每个内部时间步最多 1/120 秒，用八轮迭代求解。右臂、右腿和左腿分别保存驱动柔度（m/N）、速度阻尼（每秒）和可选屈曲范围。默认柔度 0.008、阻尼 5、角度不限。旧存档采用这组默认值。关闭物理混合会清掉模拟位置和速度，自定义参数仍随角色保存。[驱动参数](../../src/physics/articulation/drive.rs) · [骨链积分](../../src/physics/articulation.rs)
+
+屈曲角是近端骨骼方向和远端骨骼方向的夹角，完全伸直为 0°。每轮在骨长修正之后检查夹角，超过范围时把远端方向投回允许的锥面，保留当时的远端骨长。共线时先参考上一子步的弯曲方向，再参考动画目标。在同一轮中，接触面投影随后执行，接触与限位冲突时可能产生残差。该模型约束弯曲幅度；铰链轴、扭转和全身布娃娃仍需更完整的关节模型。[角度投影](../../src/physics/articulation/drive.rs)
+
+配置随角色保存。默认姿态图先混合物理结果，再执行手脚 IK，后者可改变最终关节角。控制台输入 `contact limbs` 显示的是各条物理骨链的实际角度。要观察限位对显示骨架的直接影响，可使用以下设置。在 60 Hz、90 个子步的银狼回归中，手脚 IK 关闭，没有限制时发布的右肘角为 1.97°–11.48°，设为 80°–90° 后为 80.00°–90.00°。两组根变换逐步相同。[骨架回归](../../src/experiments/motion/silver/contact/physical_pose/tests.rs) · [姿态图](pose-graphs.md)
+
 
 同一机位分别录制 `contact limbs off` 与 `contact limbs on` 的翻栏，保持手脚 IK 和机械撑栏设置一致。画面左侧为默认动画，右侧为三条骨链全部混合。两组各为 30 fps、63 帧。[翻栏并排录像](../../captures/silver-physical-limbs.mp4)
 
@@ -21,6 +26,8 @@ cargo run --release --locked -- --experiment silver-contact
 | `contact action vault`，`contact hand off` | 保留机械撑栏，观察手腕脱离视觉目标时的根轨迹。 |
 | `contact hand on`，`contact grip off`，再运行 `contact action vault` | 保留手掌对齐，观察缺少向上支撑冲量的表现。 |
 | `contact limbs on`，`contact feet off`，`contact hand off` | 关闭末端覆盖，观察重力和姿态驱动产生的骨骼运动。 |
+| `contact limbs arm limit 80 90`，`contact limbs` | 将右肘物理屈曲限定在 80°–90°，查看求解角度。腿链名为 `right-leg` 和 `left-leg`。 |
+| `contact limbs arm drive 0.02 8`，`contact limbs arm limit off` | 修改右臂柔度和阻尼，再移除角限位。 |
 | `motionroot controller` 或 `motionroot clip` | 切换所选角色的平面根运动来源。 |
 | `contact mode free` 或 `contact mode contact` | 切换独立移动与物理接触，沿用已选角色与运动状态。 |
 | `schedule profile on`，随后 `schedule profile` | 查看调度、提交、撤销准备与写入计数。姿态字节数只统计矩阵载荷。 |

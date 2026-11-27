@@ -76,6 +76,8 @@ cargo test --release --locked --lib ibl_hot_switch_changes_submitted_frames_at_f
 
 渲染用途单独绑定。普通刚体实例的 `geometry_assets` 可引用一个共享资产实体，保存源网格、保守的网格局部 AABB、投影网格。剔除用实例变换后的边界，阴影可以使用简化代理，GI 命中从视觉几何读取材质和 UV。风动或蒙皮对象沿其姿态或簇边界剔除。[派生几何的校验](../../src/scene/geometry_assets.rs) · [渲染端消费方式](../algorithms/visibility-lighting.md)
 
+普通可模拟刚体支持一次性的冲量。命令 `object ID impulse JX JY JZ` 作用在质心，附加 `at PX PY PZ` 时指定父坐标系中的作用点，位置单位为米，冲量单位为 N·s。线动量增加 J，角动量增加 (P−质心) × J。无角惯量的物体仍可接受作用线通过质心的冲量。静止物体、运动学物体或无法表达的力矩会报告错误。两种动量均在校验成功后写入。在新建的 `movement` 实验中，右侧下落物体有角惯量，可在开始时用 `object 6 impulse 0 2 0 at 3.5 2 0` 同时产生上冲和绕 Z 轴旋转；`object 6` 可查看动量。[场景](../../src/experiments/movement_lab.rs) · [冲量 API](../../src/physics/impulse.rs) · [重载与动量回归](../../tests/movement_runtime.rs)
+
 ## Tick 怎样决定先后和并行
 
 整个场景使用一条世界模拟时间线，单位为秒。交互窗口把两次界面回调的墙钟差限制在 0.1 秒以内，暂停时交给模拟的增量为零。离屏录制使用指定帧率的步长。`World::time_seconds()` 和 `SystemContext::time_seconds()` 在系统执行期间给出本次更新的截止时刻，系统收到的 `dt` 是本次更新覆盖的区间。在调度器返回后，世界时间等于本次已接收的总时间边界。渲染准入失败时模拟仍可推进。[窗口时间输入](../../src/ui.rs) · [主线程准入](../../src/engine.rs)

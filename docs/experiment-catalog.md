@@ -17,10 +17,10 @@ cargo run --release --locked -- --scene target/saved.json
 | `vegetation-scale` | 放大到林地规模，共享树干、树冠、草丛网格和材质。 | `vegetation wind 0` 固定风，再调 `vegetation pixels 1` 观察选簇变化。 |
 | `river-forest` | 稠密河谷，生成器回归检查至少两万棵树、二十万丛草，并保留水道和河岸。 | `vegetation camera river` 看河道，`vegetation camera grass` 检查地表。 |
 | `forest-karst` | 岩柱、河谷植物、太阳、ReSTIR 和缓存间接光。预设要求硬件光追，CLI 默认选择 TAA。 | `vegetation camera karst` 固定机位，分别输入 `restir gi direct`、`restir gi multi`。 |
-| `movement` | 三个共享网格的物体分别静止、水平移动、受重力落下。 | `object` 列出 ID，`object 3` 查看策略。`tick movement 30` 调整普通运动频率。 |
+| `movement` | 三个共享网格的物体分别静止、水平移动、受重力落下。 | `object` 列出 ID，`object 3` 查看策略。初始状态输入 `object 6 impulse 0 2 0 at 3.5 2 0` 可以观察右侧物体受冲量并旋转。`tick movement 30` 调整普通运动频率。 |
 | `motion` | 银狼骨架和烘焙的动作库，观察输入轨迹、姿态候选和转向。 | 用 IJKL 改方向，再用 `motionsearch kd`、`motionsearch scan` 对照查询。 |
 | `hair` | 程序化假发、头模与肩部胶囊；侧风、头部转动和造型刚度可以独立调节。 | `hair status` 查看最大伸长，`hair wind -8` 反转侧风。[毛发模拟研究与操作](algorithms/hair-simulation.md) |
-| `silver-contact` | 银狼通过平台、栏杆和低矮障碍，用接触反馈修正脚掌和末端触点。 | `contact graph upper` 切换上半身混合，`contact graph default` 恢复；`contact status` 查看状态，`contact limbs on` 打开局部物理动画，`contact grip off` 关闭机械撑栏。[子步与实验命令](architecture/character-motion.md) |
+| `silver-contact` | 银狼通过平台、栏杆和低矮障碍，用接触反馈修正脚掌和末端触点。 | `contact graph upper` 切换上半身混合，`contact graph default` 恢复；`contact status` 查看状态，`contact limbs on` 打开局部物理动画，`contact limbs arm limit 80 90` 设置肘部屈曲范围，`contact grip off` 关闭机械撑栏。[子步与实验命令](architecture/character-motion.md) |
 | `silver-contact-duo` | 双角色障碍路线。两者共享可见网格，第二名角色采用不同的腕部关节链与指尖绑定。 | `control` 查询角色 ID，`control ID` 选择角色，`drive 0.25 0.8` 输入连续方向，`motionroot clip` 采用片段根运动，`contact mode free` 切到独立移动。 |
 | `water` | 程序化台阶上，计算着色器沿流线推进不同年龄的水团，再从相邻采样生成水面。 | `effect restart` 重新开始，`effect time 2` 指定观察时刻。 |
 | `destruction` | 程序化碎块和消融表面。比较相同几何在完整、破碎和消融阶段的轮廓。 | 依次输入 `effect restart`、`effect time 2.2`、`effect time 4.7`。 |

@@ -1,6 +1,7 @@
 //! Rigid motion, collision geometry and pose constraints in SI units. The caller owns the fixed clock.
 mod angular;
 pub mod articulation;
+mod impulse;
 pub use angular::{ANGULAR_BODY, AngularBody};
 pub(crate) mod collision;
 mod support;

@@ -29,7 +29,7 @@ const HELP: &str = concat!(
     " · toon outline/width/light/threshold/sdf/view · texture neural/original/stats",
     " · gaussian tile/bvh/compact-tile/compact-bvh/scan/original/stats",
     " · gi off/ssgi/probes/ray/view/camera · shadow hard/pcf/pcss/ray/size/bias/view/camera",
-    " · object [ID [static|movable off|query|simulated] | velocity X Y Z | drive SPEED/off] · rt view/camera",
+    " · object [ID [static|movable off|query|simulated] | velocity X Y Z | drive SPEED/off | impulse JX JY JZ [at PX PY PZ]] · rt view/camera",
     " · restir uniform/ris/reuse/reference/denoise/source/lights/candidates/samples/ev/camera/history-stats",
     " · ibl ev/yaw/view/sky · effect restart/time SECONDS",
     " · rays hardware/software/normals/distance/off",

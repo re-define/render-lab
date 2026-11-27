@@ -1,42 +1,36 @@
 use super::*;
-use crate::physics::{SupportFace, articulation::LimbIsland};
+use crate::physics::{
+    SupportFace,
+    articulation::{LimbDrive, LimbIsland},
+};
 
 /// Partial physical animation. The fixed root of each island follows its animation
 /// socket, so this layer does not compete with the controller for root ownership.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub(super) struct PhysicalPose {
     weight: f32,
     limbs: Option<[LimbIsland; 3]>,
+    #[serde(default, skip_serializing_if = "default_drives")]
+    drives: [LimbDrive; 3],
+}
+
+mod controls;
+fn default_drives(drives: &[LimbDrive; 3]) -> bool {
+    *drives == [LimbDrive::default(); 3]
 }
 
 impl PhysicalPose {
-    pub fn configure(layer: &mut Option<Arc<Self>>, arg: &str) -> Result<()> {
-        let weight = match arg {
-            "off" => 0.,
-            "on" => 1.,
-            other => other.parse()?,
-        };
-        ensure!(
-            (0.0..=1.0).contains(&weight),
-            "limb blend weight must be in 0..=1"
-        );
-        if weight == 0. {
-            *layer = None;
-        } else if let Some(current) = layer {
-            Arc::make_mut(current).weight = weight;
-        } else {
-            *layer = Some(Arc::new(Self {
-                weight,
-                limbs: None,
-            }));
-        }
-        Ok(())
+    pub fn active(&self) -> bool {
+        self.weight > 0.
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
             (0.0..=1.0).contains(&self.weight),
             "invalid physical pose weight"
         );
+        for drive in self.drives {
+            drive.validate()?;
+        }
         Ok(())
     }
     pub fn reset(&mut self) {
@@ -56,11 +50,15 @@ impl PhysicalPose {
         let limbs = self
             .limbs
             .get_or_insert_with(|| targets.map(LimbIsland::new));
-        for (([a, b, c], goal), limb) in chains.into_iter().zip(targets).zip(limbs) {
-            let solved = limb.advance(goal, gravity, faces, dt)?;
+        for (i, (([a, b, c], goal), limb)) in chains.into_iter().zip(targets).zip(limbs).enumerate()
+        {
+            let solved = limb.advance_with_drive(goal, gravity, faces, dt, self.drives[i])?;
             pose.aim(a, b, goal[1].lerp(solved[1], self.weight));
             pose.aim(b, c, goal[2].lerp(solved[2], self.weight));
         }
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;
