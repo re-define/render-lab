@@ -9,15 +9,21 @@ pub(super) fn register_motion(systems: &mut CharacterSystems, bank: Arc<SilverMa
     });
 }
 
-pub(super) fn register_ik(systems: &mut CharacterSystems) {
-    systems.register(|actors| Feedback(actors.values().cloned().collect()));
+pub(super) fn register_display_pose(systems: &mut CharacterSystems, bank: Arc<SilverMatcher>) {
+    systems.register(move |actors| DisplayPose {
+        actors: actors.values().cloned().collect(),
+        bank: bank.clone(),
+    });
 }
 
 struct Prepare {
     actors: Vec<Arc<Stage>>,
     bank: Arc<SilverMatcher>,
 }
-struct Feedback(Vec<Arc<Stage>>);
+struct DisplayPose {
+    actors: Vec<Arc<Stage>>,
+    bank: Arc<SilverMatcher>,
+}
 
 impl Stage {
     pub(super) fn state(&self, cx: &SystemContext<'_>) -> Result<Contact> {
@@ -171,7 +177,7 @@ impl SimulationSystem for Prepare {
     }
 }
 
-impl SimulationSystem for Feedback {
+impl SimulationSystem for DisplayPose {
     fn order(&self) -> SystemOrder {
         SystemOrder {
             key: Some(SETTING),
@@ -180,14 +186,14 @@ impl SimulationSystem for Feedback {
     }
     fn access(&self) -> SystemAccess {
         SystemAccess {
-            name: "Foot placement and fingertip IK",
+            name: "Character display pose graph",
             reads: &[Component(SETTING), Component(RESOLVED), LocalTransformsById],
             writes: &[Component(SETTING), LocalTransformsById],
         }
     }
     fn bound_transforms(&self) -> Option<TransformTargets> {
         let mut targets = TransformTargets::default();
-        for s in &self.0 {
+        for s in &self.actors {
             targets.reads.extend_from_slice(&s.rig.ids);
             if let Some(rail) = &s.rail {
                 targets.reads.extend(rail.reads());
@@ -200,22 +206,28 @@ impl SimulationSystem for Feedback {
         Some(targets)
     }
     fn run(&self, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
-        cx.for_each_parallel(&self.0, |s, cx| feedback(s, cx, dt))
+        cx.for_each_parallel_init(&self.actors, rig::PoseBuffers::default, |scratch, s, cx| {
+            evaluate_pose(s, cx, dt, &self.bank, scratch)
+        })
     }
 }
 
-fn feedback(s: &Stage, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
+fn evaluate_pose(
+    s: &Stage,
+    cx: &mut SystemContext<'_>,
+    dt: f32,
+    bank: &SilverMatcher,
+    scratch: &mut rig::PoseBuffers,
+) -> Result<()> {
     let r = &s.rig;
     let mut c = s.state(cx)?;
-    let mut pose = r.pose(cx, &c.source)?;
+    let mut pose = r.pose(cx, &c.source, scratch)?;
     if let (Some(binding), Some(play)) = (&s.action_rig, c.play) {
         binding.apply(&mut pose, c.section, play);
     }
     let solved = cx
         .component::<ResolvedMotion>(s.actor, RESOLVED)?
         .context("missing resolved motion for pose feedback")?;
-    let airborne = solved.support.is_none();
-    let boxes = &solved.surfaces;
     // Determine physical eligibility from the authored pose before applying any optional visual IK.
     let rail_contact =
         if let (traversal::Section::Rail, Some(play), Some(rail)) = (c.section, c.play, &s.rail) {
@@ -226,9 +238,63 @@ fn feedback(s: &Stage, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
     c.palm_load = rail_contact.map_or(0., |(play, rail)| {
         traversal::grip_load(r, &pose, play, rail)
     });
-    if let Some(layer) = &mut c.physical_pose {
-        Arc::make_mut(layer).apply(r, &mut pose, solved.gravity, boxes, dt)?;
+    let target = target_point(s.target.relative(|id| local(cx, id))?);
+    if s.program.uses_clips {
+        c.graph_seconds += f64::from(dt);
     }
+    for op in s.program.operations() {
+        use crate::animation::Operation;
+        match op {
+            Operation::Blend(layer) => {
+                pose_graph::blend(layer, bank, s, &mut pose, c.graph_seconds)
+            }
+            Operation::PhysicalLimbs => {
+                if let Some(layer) = &mut c.physical_pose {
+                    Arc::make_mut(layer).apply(
+                        r,
+                        &mut pose,
+                        solved.gravity,
+                        &solved.surfaces,
+                        dt,
+                    )?;
+                }
+            }
+            Operation::FootPlacement => place_feet(r, &mut c, &mut pose, &solved, dt),
+            Operation::HandIk => reach_hand(r, &mut c, &mut pose, rail_contact, target, dt),
+        }
+    }
+    if !s.program.has_feet {
+        c.feet = Default::default();
+        c.pelvis = 0.;
+    }
+    if !s.program.has_hand {
+        c.reach = 0.;
+    }
+    if !s.program.has_limbs
+        && let Some(layer) = &mut c.physical_pose
+    {
+        Arc::make_mut(layer).reset();
+    }
+    c.error_m = pose.world[r.finger]
+        .transform_point3(r.fingertip)
+        .distance(target);
+    cx.publish_pose(
+        s.actor,
+        r.published_joints.clone(),
+        r.corrected.iter().map(|&i| pose.local[i]).collect(),
+    )?;
+    cx.set_bound_state(s.actor, SETTING, c)
+}
+
+fn place_feet(
+    r: &Rig,
+    c: &mut Contact,
+    pose: &mut rig::Pose<'_>,
+    solved: &ResolvedMotion,
+    dt: f32,
+) {
+    let airborne = solved.support.is_none();
+    let boxes = &solved.surfaces;
     let facing = pose.rotation(0);
     let mut goals = [None; 2];
     let mut height = 0.;
@@ -305,7 +371,17 @@ fn feedback(s: &Stage, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
     } else {
         c.pelvis = 0.;
     }
-    let target = target_point(s.target.relative(|id| local(cx, id))?);
+}
+
+fn reach_hand(
+    r: &Rig,
+    c: &mut Contact,
+    pose: &mut rig::Pose<'_>,
+    rail_contact: Option<(traversal::Playback, Mat4)>,
+    target: Vec3,
+    dt: f32,
+) {
+    let facing = pose.rotation(0);
     let [shoulder, _, wrist] = r.arm;
     let from = pose.position(shoulder);
     let tip = pose.world[r.finger].transform_point3(r.fingertip);
@@ -313,7 +389,7 @@ fn feedback(s: &Stage, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
     if c.hand_ik
         && let Some((play, rail)) = rail_contact
     {
-        traversal::brace(r, &mut pose, play, rail);
+        traversal::brace(r, pose, play, rail);
     }
     let desire = if c.hand_ik
         && c.play.is_none()
@@ -333,15 +409,6 @@ fn feedback(s: &Stage, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
         let elbow_pole = animated_pole.lerp(facing * Vec3::new(-0.55, -1., -0.3), c.reach);
         pose.solve(r.arm, wrist_goal, elbow_pole, swing * pose.rotation(wrist));
     }
-    c.error_m = pose.world[r.finger]
-        .transform_point3(r.fingertip)
-        .distance(target);
-    cx.publish_pose(
-        s.actor,
-        r.published_joints.clone(),
-        r.corrected.iter().map(|&i| pose.local[i]).collect(),
-    )?;
-    cx.set_bound_state(s.actor, SETTING, c)
 }
 
 #[cfg(test)]

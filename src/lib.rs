@@ -1,3 +1,4 @@
+pub mod animation;
 pub mod console;
 pub mod engine;
 pub mod experiments;

@@ -155,11 +155,22 @@ impl<'w> SystemContext<'w> {
         items: &[T],
         f: impl Fn(&T, &mut SystemContext<'w>) -> Result<()> + Sync,
     ) -> Result<()> {
+        self.for_each_parallel_init(items, || (), |(), item, cx| f(item, cx))
+    }
+
+    /// Each Rayon job reuses private scratch across its items. Only staged world edits
+    /// survive a job; errors discard them with the same semantics as for_each_parallel.
+    pub(crate) fn for_each_parallel_init<T: Sync, S>(
+        &mut self,
+        items: &[T],
+        init: impl Fn() -> S + Sync + Send,
+        f: impl Fn(&mut S, &T, &mut SystemContext<'w>) -> Result<()> + Sync,
+    ) -> Result<()> {
         use rayon::prelude::*;
         if items.len() <= 1 {
             let checkpoint = self.changes.len();
             if let Some(one) = items.first()
-                && let Err(err) = f(one, self)
+                && let Err(err) = f(&mut init(), one, self)
             {
                 self.changes.truncate(checkpoint);
                 return Err(err);
@@ -169,9 +180,9 @@ impl<'w> SystemContext<'w> {
         let (world, access, targets) = (self.world, self.access, self.targets);
         let batches = items
             .par_iter()
-            .map(|item| {
+            .map_init(init, |scratch, item| {
                 let mut child = SystemContext::new(world, access, targets);
-                f(item, &mut child)?;
+                f(scratch, item, &mut child)?;
                 Ok(child.finish())
             })
             .collect::<Result<Vec<_>>>()?;

@@ -93,6 +93,22 @@ struct Index {
     bones: Vec<String>,
     clips: Vec<Entry>,
 }
+type ClipRanges = Vec<(std::ops::Range<usize>, String)>;
+impl Index {
+    fn clip_ranges(&self) -> Result<ClipRanges> {
+        let mut clips = vec![];
+        let mut offset: usize = 0;
+        for clip in &self.clips {
+            ensure!(clip.frames > LOOKAHEAD, "motion clip too short");
+            let end = offset
+                .checked_add(clip.frames)
+                .context("motion frame overflow")?;
+            clips.push((offset..end, clip.name.clone()));
+            offset = end;
+        }
+        Ok(clips)
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 struct State {
     #[serde(default)]
@@ -290,6 +306,7 @@ struct Pose {
     turn_step: f32,
 }
 pub struct SilverMatcher {
+    channels: Vec<String>,
     search: search::Index,
     poses: Vec<Pose>,
     clips: Vec<(std::ops::Range<usize>, String)>,
@@ -302,16 +319,8 @@ impl SilverMatcher {
             "unknown motion bank format"
         );
         let width = 28 + 4 * index.bones.len();
-        let mut clips = vec![];
-        let mut offset: usize = 0;
-        for clip in index.clips {
-            ensure!(clip.frames > LOOKAHEAD, "motion clip too short");
-            let end = offset
-                .checked_add(clip.frames)
-                .context("motion frame overflow")?;
-            clips.push((offset..end, clip.name));
-            offset = end;
-        }
+        let clips = index.clip_ranges()?;
+        let offset = clips.last().map_or(0, |(r, _)| r.end);
         ensure!(
             offset > 0 && Some(DATA.len()) == offset.checked_mul(width * 4),
             "invalid motion bank length"
@@ -360,6 +369,7 @@ impl SilverMatcher {
         }
         let search = search::Index::load(raw_features, &clips)?;
         Ok(Self {
+            channels: index.bones,
             poses,
             clips,
             search,

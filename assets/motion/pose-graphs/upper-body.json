@@ -1,0 +1,42 @@
+{
+  "output": "hand",
+  "nodes": {
+    "authored": {
+      "op": "input"
+    },
+    "limbs": {
+      "op": "physical_limbs",
+      "input": "upper_body"
+    },
+    "feet": {
+      "op": "foot_placement",
+      "input": "limbs"
+    },
+    "hand": {
+      "op": "hand_ik",
+      "input": "feet"
+    },
+    "upper_clip": {
+      "op": "clip",
+      "clip": "run_41",
+      "speed": 1.0
+    },
+    "upper_body": {
+      "op": "masked_blend",
+      "input": "authored",
+      "overlay": "upper_clip",
+      "weight": 0.85,
+      "mask": {
+        "Chest_06": 0.22,
+        "Right shoulder_058": 0.65,
+        "Right arm_059": 1.0,
+        "Right elbow_061": 1.0,
+        "Right wrist_063": 0.65,
+        "Left shoulder_083": 0.65,
+        "Left arm_084": 1.0,
+        "Left elbow_086": 1.0,
+        "Left wrist_088": 0.65
+      }
+    }
+  }
+}

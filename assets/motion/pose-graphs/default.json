@@ -1,0 +1,20 @@
+{
+  "output": "hand",
+  "nodes": {
+    "authored": {
+      "op": "input"
+    },
+    "limbs": {
+      "op": "physical_limbs",
+      "input": "authored"
+    },
+    "feet": {
+      "op": "foot_placement",
+      "input": "limbs"
+    },
+    "hand": {
+      "op": "hand_ik",
+      "input": "feet"
+    }
+  }
+}

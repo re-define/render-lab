@@ -17,6 +17,10 @@ pub fn command(engine: &mut Engine, arg: &str) -> Result<String> {
         modes::switch(Arc::make_mut(&mut engine.world), id, active)?;
         return Ok(format!("Character {id} mode {}", mode.trim()));
     }
+    let (verb, rest) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
+    if verb == "graph" {
+        return pose_graph::command(Arc::make_mut(&mut engine.world), id, rest.trim());
+    }
     let c = engine
         .world
         .typed_component::<Contact>(id, SETTING)?

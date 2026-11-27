@@ -175,33 +175,43 @@ impl Rig {
             palm_frame: semantics.palm.frame()?,
         })
     }
-    pub fn pose(&self, cx: &SystemContext<'_>, source: &[Mat4]) -> Result<Pose<'_>> {
-        let local = self
-            .ids
-            .iter()
-            .enumerate()
-            .map(|(i, &id)| match self.source_for_joint[i] {
-                Some(slot) => source
-                    .get(slot)
-                    .copied()
-                    .context("missing sampled base pose"),
-                None => cx.local(id)?.context("missing bound contact joint"),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut p = Pose {
+    pub fn pose<'a>(
+        &'a self,
+        cx: &SystemContext<'_>,
+        source: &[Mat4],
+        scratch: &'a mut PoseBuffers,
+    ) -> Result<Pose<'a>> {
+        scratch.local.clear();
+        scratch.world.clear();
+        scratch.local.reserve(self.ids.len());
+        scratch.world.reserve(self.ids.len());
+        for (i, &id) in self.ids.iter().enumerate() {
+            let m = match self.source_for_joint[i] {
+                Some(slot) => *source.get(slot).context("missing sampled base pose")?,
+                None => cx.local(id)?.context("missing bound contact joint")?,
+            };
+            scratch.local.push(m);
+            scratch
+                .world
+                .push(self.parents[i].map_or(m, |parent| scratch.world[parent] * m));
+        }
+        Ok(Pose {
             rig: self,
-            local,
-            world: vec![Mat4::IDENTITY; self.ids.len()],
-        };
-        p.forward();
-        Ok(p)
+            local: &mut scratch.local,
+            world: &mut scratch.world,
+        })
     }
 }
 
+#[derive(Default)]
+pub(super) struct PoseBuffers {
+    local: Vec<Mat4>,
+    world: Vec<Mat4>,
+}
 pub(super) struct Pose<'a> {
     rig: &'a Rig,
-    pub local: Vec<Mat4>,
-    pub world: Vec<Mat4>,
+    pub local: &'a mut [Mat4],
+    pub world: &'a mut [Mat4],
 }
 impl Pose<'_> {
     pub(super) fn forward(&mut self) {
@@ -353,10 +363,12 @@ mod tests {
     fn limb_updates_match_full_forward_kinematics() -> Result<()> {
         let world = scene()?;
         let rig = Rig::bind(&world, actor(&world).unwrap(), &children(&world))?;
+        let mut local: Vec<_> = rig.ids.iter().map(|id| world.entities[id].local).collect();
+        let mut world_matrices = vec![Mat4::IDENTITY; rig.ids.len()];
         let mut pose = Pose {
             rig: &rig,
-            local: rig.ids.iter().map(|id| world.entities[id].local).collect(),
-            world: vec![Mat4::IDENTITY; rig.ids.len()],
+            local: &mut local,
+            world: &mut world_matrices,
         };
         pose.forward();
         let mut updated = 0;
@@ -372,7 +384,7 @@ mod tests {
                 Vec3::Z,
                 pose.rotation(tip),
             );
-            let partial = pose.world.clone();
+            let partial = pose.world.to_vec();
             pose.forward();
             assert_eq!(partial, pose.world);
             updated += chain

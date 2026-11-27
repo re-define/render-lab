@@ -520,7 +520,7 @@ mod tests {
                 let dynamics = stage("Character momentum and support impulses");
                 assert!(stage("Rotating support drives") < dynamics, "{cmd}");
                 assert!(stage("Locomotion and traversal intent") < dynamics, "{cmd}");
-                assert!(dynamics < stage("Foot placement and fingertip IK"), "{cmd}");
+                assert!(dynamics < stage("Character display pose graph"), "{cmd}");
             } else {
                 assert!(contact.is_empty(), "{cmd}");
             }

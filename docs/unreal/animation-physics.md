@@ -4,12 +4,12 @@
 
 | 问题 | 本引擎 | UE 5.8 UAF |
 | --- | --- | --- |
-| 谁定义一套角色行为 | 实验装配注册选姿、根动力学和反馈系统。角色配置资产指定片段、骨架通道、动作窗口及目标偏移。更换一套阶段连接需要修改 Rust 装配或系统。 | 作者将逻辑与数据保存为动画图资产。运行时可从一份图分配多个实例，按角色提供变量和绑定。[图资产与实例分配](https://dev.epicgames.com/documentation/unreal-engine/API/Plugins/UAFAnimGraph/UUAFAnimGraph?application_version=5.8) |
-| 姿态怎样算出来 | 固定子步内计算预测轨迹、归一化检索、采样和惯性化。接触路径用实际根运动修正骨架，最后发布一份局部姿态。阶段内的运算顺序由 Rust 函数决定。 | Anim Graph 提供可组合的 Trait 行为。姿态求值程序由栈式 Evaluation VM 执行，带有参考姿态、骨架绑定、LOD 和曲线过滤等上下文。Pose Search、Warping、Control Rig 均有独立集成。[Trait](https://dev.epicgames.com/documentation/unreal-engine/API/Plugins/UAFAnimGraph/FTrait?application_version=5.8) · [姿态求值 VM](https://dev.epicgames.com/documentation/unreal-engine/API/Plugins/UAFAnimGraph/FEvaluationVM) |
-| 两个角色共享什么 | 共享动作库、PCA/KD 索引和网格。播放游标、移动速度、脚锁和接触历史由各角色的 ECS 组件持有。 | 同类 Trait 的行为实现可被多个 worker 并发调用。只读参数由实例共享，混合权重等可变数据按 Trait 实例存放。[共享数据与实例数据](https://dev.epicgames.com/documentation/unreal-engine/API/Plugins/UAFAnimGraph/FTrait?application_version=5.8) |
+| 谁定义一套角色行为 | 实验装配注册选姿、根动力学和反馈系统。角色配置资产指定片段、骨架通道、动作窗口及目标偏移。角色引用的姿态图资产决定片段遮罩、骨链、足部和手部 IK 的组合，世界阶段由 Rust 装配。 | 作者将逻辑与数据保存为动画图资产。运行时可从一份图分配多个实例，按角色提供变量和绑定。[图资产与实例分配](https://dev.epicgames.com/documentation/unreal-engine/API/Plugins/UAFAnimGraph/UUAFAnimGraph?application_version=5.8) |
+| 姿态怎样算出来 | 固定子步内计算预测轨迹、归一化检索、采样和惯性化。接触路径用实际根运动修正骨架，最后发布一份局部姿态。显示阶段按已编译的图指令组合旋转、物理反馈和 IK。 | Anim Graph 提供可组合的 Trait 行为。姿态求值程序由栈式 Evaluation VM 执行，带有参考姿态、骨架绑定、LOD 和曲线过滤等上下文。Pose Search、Warping、Control Rig 均有独立集成。[Trait](https://dev.epicgames.com/documentation/unreal-engine/API/Plugins/UAFAnimGraph/FTrait?application_version=5.8) · [姿态求值 VM](https://dev.epicgames.com/documentation/unreal-engine/API/Plugins/UAFAnimGraph/FEvaluationVM) |
+| 两个角色共享什么 | 共享动作库、PCA/KD 索引、编译后的姿态程序和网格。基础动作游标、叠加层时钟、移动速度、脚锁和接触历史由各角色的 ECS 组件持有。 | 同类 Trait 的行为实现可被多个 worker 并发调用。只读参数由实例共享，混合权重等可变数据按 Trait 实例存放。[共享数据与实例数据](https://dev.epicgames.com/documentation/unreal-engine/API/Plugins/UAFAnimGraph/FTrait?application_version=5.8) |
 | 动画怎样接入 Move 和物理 | 系统声明读写集、目标实体和阶段先后。动画通过同一子步的 ProposedMotion 与 ResolvedMotion 和根运动求解器交换输入输出。足部、掌部与共享支撑约束有明确的角色语义。 | UAF 定义模块事件、外部系统依赖和线程安全约定，并提供 Mover UAF 等插件。角色怎样采用物理反馈仍取决于接入的模块与图。[模块 API](https://dev.epicgames.com/documentation/unreal-engine/API/Plugins/UAF?application_version=5.8) · [UAF 集成列表](https://dev.epicgames.com/documentation/unreal-engine/API/PluginIndex/UAF?application_version=5.8) |
 
-例如，要让一类 NPC 继续用 Motion Matching 驱动下半身，同时让上半身在指定时间窗叠加另一段动作，当前可以复用检索、蒙皮和物理反馈，但需要实现遮罩混合并将其接在既定姿态阶段。UAF 提供描述这类组合的图和分层扩展。两者最直接的架构差距在角色内部的组合粒度。将来若引入姿态图，可以保留现有世界调度器及根运动交换，将采样、惯性化、分层和 IK 提取为带类型输入输出的节点。毛发 GPU 求解属于渲染变形阶段，独立消费头部运动。[银狼阶段实现](../../src/experiments/motion/silver/contact/stage.rs) · [子步交换类型](../../src/movement/character.rs) · [毛发 GPU 管线](../algorithms/hair-simulation.md)
+银狼可以通过 JSON 图继续用 Motion Matching 驱动基础动作，同时在给定时间窗为上半身混合另一段动作。图绑定只读片段、逐通道权重和求值顺序。角色保留自己的图时钟和物理状态，最后一次性发布姿态。UAF 则公开了可扩展的 Trait、求值 VM 和分层插件。Render Lab 当前支持一条显示姿态链和只读片段分支。采样基础动作与惯性化仍封装在角色的准备阶段，尚不能由图作者替换；扩充节点种类也需要改 Rust。下一步可用第二种基础姿态源检验公共的节点和骨架绑定接口。[本引擎姿态图](../algorithms/pose-graphs.md) · [UE 分层插件](https://dev.epicgames.com/documentation/unreal-engine/API/PluginIndex/UAFLayering?application_version=5.8) · [子步交换类型](../../src/movement/character.rs)
 
 ## Mover 与 Chaos 分别提供什么
 

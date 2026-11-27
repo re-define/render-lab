@@ -150,6 +150,29 @@ cargo run --release --locked --example forest_shadows -- target/forest-uncached 
 Remove-Item Env:RENDER_LAB_RDG_PLAN_CACHE
 ```
 
+## 银狼姿态图的 CPU 开销
+
+对照版本为 `bf95a88`。在 Ryzen 7 9700X 上用 Release 模式和最多 16 个 worker 运行同一人群工作负载。每个配置独立运行五次，按不同顺序交错；每次预热 20 帧、测 96 帧。每个采样帧模拟 0.1 秒，共六个固定子步，再提取一次 1920×1080 视图。表内单位为毫秒，前三个数据列均取五次 P95 的中位数。提交计时属于模拟的一部分。此基准只执行 CPU 模拟与快照提取。[原始各轮分位数](measurements/silver-pose-graph.csv) · [基准程序](../../src/experiments/motion/silver/contact/crowd_profile.rs)
+
+| 角色数 | 配置 | 模拟 P95 | 提交 P95 | 提取 P95 | 五轮模拟 P95 范围 |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | 旧版固定顺序 | 0.43 | 0.03 | 0.03 | 0.41–0.45 |
+| 1 | 默认图 | 0.43 | 0.03 | 0.03 | 0.41–0.44 |
+| 1 | 九通道上半身图 | 0.43 | 0.03 | 0.03 | 0.42–0.47 |
+| 500 | 旧版固定顺序 | 25.51 | 9.13 | 7.80 | 24.39–29.90 |
+| 500 | 默认图 | 25.85 | 8.91 | 7.73 | 24.45–30.74 |
+| 500 | 九通道上半身图 | 28.36 | 9.97 | 7.63 | 24.31–29.72 |
+
+500 人的三组模拟 P95 区间有重叠。这组数据可以用来估算启用分层时的总预算，尚不足以归因出稳定的整段加速。另一项同机位的像素对照和双人姿态回归用于检查动作正确性。[姿态图与录像](../algorithms/pose-graphs.md)
+
+```powershell
+$env:RENDER_LAB_SIM_PROFILE = '1'
+$env:RENDER_LAB_NPCS = '500'
+$env:RENDER_LAB_POSE_GRAPH = 'upper'
+cargo test --release --locked --lib silver_crowd_extraction_profile -- --ignored --nocapture --test-threads=1
+Remove-Item Env:RENDER_LAB_POSE_GRAPH, Env:RENDER_LAB_NPCS, Env:RENDER_LAB_SIM_PROFILE
+```
+
 ## 仓库附带的数据
 
 [crowd-frame-metrics.csv](measurements/crowd-frame-metrics.csv) 保留更早一次银狼蒙皮批处理的采样汇总，列包括人数、测试版本、工作负载、样本数、P50、P95 与均值。`current` 是那次测量的对照版本标签。逐线程均值保存在 [npc-threads.csv](measurements/npc-threads.csv)，单位为每完成帧的 CPU 毫秒。复测时请另存提交号、驱动、开关、分辨率及各帧输出。

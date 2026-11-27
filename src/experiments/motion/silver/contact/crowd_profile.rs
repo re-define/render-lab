@@ -207,6 +207,12 @@ fn silver_crowd_extraction_profile() -> Result<()> {
         .num_threads(std::thread::available_parallelism()?.get().min(16))
         .build()?;
     let (mut world, mut schedule) = population(count, &pool)?;
+    if let Ok(graph) = std::env::var("RENDER_LAB_POSE_GRAPH") {
+        let world = Arc::make_mut(&mut world);
+        for id in world.entities.component_owners(SETTING).to_vec() {
+            pose_graph::command(world, id, &graph)?;
+        }
+    }
     if std::env::var("RENDER_LAB_PHYSICAL_LIMBS").as_deref() == Ok("1") {
         let world = Arc::make_mut(&mut world);
         for id in world.entities.component_owners(SETTING).to_vec() {

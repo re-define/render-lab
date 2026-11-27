@@ -13,6 +13,7 @@ mod exchange_tests;
 mod fixture;
 mod physical_pose;
 mod population;
+mod pose_graph;
 mod rig;
 mod stage;
 #[cfg(test)]
@@ -64,6 +65,7 @@ pub(in crate::experiments) const MODULE: SceneModule = SceneModule {
 };
 
 fn hydrate_contact(w: &mut World) -> Result<()> {
+    w.hydrate_components::<crate::animation::PoseGraph>(pose_graph::ASSET)?;
     w.hydrate_components::<Contact>(SETTING)?;
     w.hydrate_components::<dynamics::Body>(dynamics::BODY)?;
     w.hydrate_components::<dynamics::Spring>(dynamics::SPRING)?;
@@ -166,6 +168,10 @@ impl PoseBinding {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Contact {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    graph: Option<Id>,
+    #[serde(default, skip_serializing_if = "pose_graph::at_start")]
+    graph_seconds: f64,
     #[serde(default)]
     collider_schema: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -209,6 +215,7 @@ fn default_grip_fraction() -> f32 {
 }
 
 struct Stage {
+    program: Arc<crate::animation::PoseProgram>,
     binding: Arc<PoseBinding>,
     actor: Id,
     rig: Rig,
@@ -232,23 +239,35 @@ type CharacterSystems = crate::engine::BoundSystems<Actors>;
 
 pub(super) fn register(w: &World, schedule: &mut Schedule, bank: Arc<SilverMatcher>) -> Result<()> {
     let mut systems = CharacterSystems::default();
-    stage::register_motion(&mut systems, bank);
+    stage::register_motion(&mut systems, bank.clone());
     dynamics::register(&mut systems, schedule)?;
     collision::register(w, schedule)?;
-    stage::register_ik(&mut systems);
-    let cached = std::sync::Mutex::new((None::<(Arc<()>, u64)>, Actors::new()));
+    stage::register_display_pose(&mut systems, bank.clone());
+    struct Bindings {
+        topology: Option<(Arc<()>, u64)>,
+        actors: Actors,
+        programs: pose_graph::Programs,
+    }
+    let cached = std::sync::Mutex::new(Bindings {
+        topology: None,
+        actors: Actors::new(),
+        programs: pose_graph::Programs::new(&bank)?,
+    });
     systems.install(schedule, character_clock(), w, SETTING, move |w| {
         let topology = w.entities.hierarchy_revision();
         let mut prior = cached.lock().expect("character binding cache");
+        prior.programs.refresh(w);
         let mut actors = Actors::new();
         let children = std::cell::OnceCell::new();
         for &actor in w.entities.component_owners(SETTING) {
             let contact = w
                 .typed_component::<Contact>(actor, SETTING)?
                 .context("missing contact")?;
-            if prior.0.as_ref().is_some_and(|(source, rev)| {
+            let program = prior.programs.resolve(w, contact.graph, &bank)?;
+            if prior.topology.as_ref().is_some_and(|(source, rev)| {
                 *rev == topology && Arc::ptr_eq(source, w.entities.hierarchy_source())
-            }) && let Some(stage) = prior.1.get(&actor)
+            }) && let Some(stage) = prior.actors.get(&actor)
+                && Arc::ptr_eq(&program, &stage.program)
                 && stage
                     .binding
                     .matches(player(w, actor)?.as_ref(), contact.as_ref())
@@ -265,26 +284,50 @@ pub(super) fn register(w: &World, schedule: &mut Schedule, bank: Arc<SilverMatch
             }
             actors.insert(
                 actor,
-                Arc::new(bind_actor(
+                Arc::new(bind_program(
+                    program,
                     w,
                     actor,
                     children.get_or_init(|| rig::children(w)),
                 )?),
             );
         }
-        *prior = (
-            Some((w.entities.hierarchy_source().clone(), topology)),
-            actors.clone(),
-        );
-        let versions = [w.binding_version(PLAYER), w.binding_version(SETTING)];
+        prior.topology = Some((w.entities.hierarchy_source().clone(), topology));
+        prior.actors = actors.clone();
+        let versions = [
+            w.binding_version(PLAYER),
+            w.binding_version(SETTING),
+            w.binding_version(pose_graph::ASSET),
+        ];
         let current = move |w: &World| {
-            Ok(versions == [w.binding_version(PLAYER), w.binding_version(SETTING)])
+            Ok(versions
+                == [
+                    w.binding_version(PLAYER),
+                    w.binding_version(SETTING),
+                    w.binding_version(pose_graph::ASSET),
+                ])
         };
         Ok((actors, Box::new(current)))
     })
 }
 
+#[cfg(test)]
 fn bind_actor(w: &World, actor: Id, children: &BTreeMap<Id, Vec<Id>>) -> Result<Stage> {
+    let bank = SilverMatcher::load()?;
+    let graph = w
+        .typed_component::<Contact>(actor, SETTING)?
+        .context("missing contact")?
+        .graph;
+    let program = pose_graph::Programs::new(&bank)?.resolve(w, graph, &bank)?;
+    bind_program(program, w, actor, children)
+}
+
+fn bind_program(
+    program: Arc<crate::animation::PoseProgram>,
+    w: &World,
+    actor: Id,
+    children: &BTreeMap<Id, Vec<Id>>,
+) -> Result<Stage> {
     let c = w
         .typed_component::<Contact>(actor, SETTING)?
         .context("missing contact state")?;
@@ -296,6 +339,10 @@ fn bind_actor(w: &World, actor: Id, children: &BTreeMap<Id, Vec<Id>>) -> Result<
     w.typed_component::<dynamics::Body>(actor, dynamics::BODY)?
         .context("missing character body")?
         .validate()?;
+    ensure!(
+        c.graph_seconds.is_finite() && c.graph_seconds >= 0.,
+        "invalid saved pose graph time"
+    );
     if let Some(layer) = &c.physical_pose {
         layer.validate()?;
     }
@@ -343,6 +390,7 @@ fn bind_actor(w: &World, actor: Id, children: &BTreeMap<Id, Vec<Id>>) -> Result<
         course: c.course,
     });
     Ok(Stage {
+        program,
         binding,
         actor,
         rig,
@@ -394,6 +442,8 @@ pub fn scene() -> Result<World> {
         actor,
         SETTING,
         Contact {
+            graph: None,
+            graph_seconds: 0.,
             collider_schema: 1,
             source_binding: None,
             finger: None,

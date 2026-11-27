@@ -25,7 +25,7 @@ const HELP: &str = concat!(
     " · lodview on/off · vegetation auto/triangles/voxels/pixels/wind/time/view/camera",
     " · hair status/wind/stiffness/head/view/reset",
     " · control [ENTITY] · drive SIDE FORWARD · motion SPEED TURN [STRAFE] · motionroot controller/clip · motionsearch kd/scan · motionbudget N/off · record PATH · stoprecord",
-    " · contact status/physics/auto/manual/target/hand/grip/limbs/feet/view/action · contact mode free/contact · contact gravity G · contact impulse J · contact spin DEG/S",
+    " · contact status/physics/auto/manual/target/hand/grip/limbs/feet/view/action/graph · contact mode free/contact · contact gravity G · contact impulse J · contact spin DEG/S",
     " · toon outline/width/light/threshold/sdf/view · texture neural/original/stats",
     " · gaussian tile/bvh/compact-tile/compact-bvh/scan/original/stats",
     " · gi off/ssgi/probes/ray/view/camera · shadow hard/pcf/pcss/ray/size/bias/view/camera",
