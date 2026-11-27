@@ -36,28 +36,30 @@ impl Rows {
     }
     pub fn resize_words(&mut self, words: usize) {
         assert_eq!(self.stride, 4);
-        if self.len == words {
+        self.resize_records(words);
+    }
+    pub fn resize_records(&mut self, len: usize) {
+        if self.len == len {
             return;
         }
         let pages = Arc::make_mut(&mut self.pages);
-        let count = words.div_ceil(self.records_per_page);
+        let count = len.div_ceil(self.records_per_page);
         pages.truncate(count);
-        let full = self.records_per_page * 4;
+        let full = self.records_per_page * self.stride;
         let existing = pages.len();
         if let Some(last) = pages.last_mut() {
-            let records =
-                (words - (existing - 1) * self.records_per_page).min(self.records_per_page);
-            if last.len() != records * 4 {
+            let records = (len - (existing - 1) * self.records_per_page).min(self.records_per_page);
+            if last.len() != records * self.stride {
                 let mut bytes = last.to_vec();
-                bytes.resize(records * 4, 0);
+                bytes.resize(records * self.stride, 0);
                 *last = bytes.into();
             }
         }
         while pages.len() < count {
-            let n = (words * 4 - pages.len() * full).min(full);
+            let n = (len * self.stride - pages.len() * full).min(full);
             pages.push(vec![0; n].into());
         }
-        self.len = words;
+        self.len = len;
     }
     /// Replace a word-aligned range. Unchanged pages keep their identity across snapshots.
     pub fn write_words(&mut self, offset: usize, bytes: &[u8]) -> usize {

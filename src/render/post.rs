@@ -110,6 +110,7 @@ pub(crate) fn resolve(
 
 pub(crate) struct TemporalFrame {
     key: u64,
+    color_key: u64,
     pub jitter: [f32; 2],
     pub(crate) jitter_delta: [f32; 2],
     pub(super) output_extent: [u32; 2],
@@ -123,10 +124,6 @@ pub(crate) struct TemporalFrame {
 }
 
 impl TemporalFrame {
-    pub(crate) fn standard_taa(&self) -> bool {
-        self.mode == Mode::Taa && self.debug == DebugView::Off
-    }
-
     pub(crate) fn generation_key(&self) -> u64 {
         self.key
     }
@@ -149,7 +146,8 @@ impl TemporalFrame {
             .binary_search_by_key(&instance.id, |i| i.id)
             .ok()?;
         let prior = &scene.instances[index];
-        if prior.mesh != instance.mesh
+        if prior.incarnation != instance.incarnation
+            || prior.mesh != instance.mesh
             || !current.meshes[&instance.mesh].same_motion_geometry(&scene.meshes[&prior.mesh])
             || prior.palette.is_some() != instance.palette.is_some()
         {
@@ -266,8 +264,15 @@ impl Sequence {
         } else {
             [0.; 2]
         };
+        let key = 0x5441410000000000 | (self.generation & 0x000000ffffffffff);
+        let color_revision = technique.color_revision(&view.scene);
+        let reset_color =
+            previous.is_none_or(|prior| technique.color_revision(&prior.scene) != color_revision);
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&(key, color_revision), &mut hash);
         view.temporal = Some(TemporalFrame {
-            key: 0x5441410000000000 | (self.generation & 0x000000ffffffffff),
+            key,
+            color_key: std::hash::Hasher::finish(&hash),
             jitter,
             jitter_delta: previous.map_or([0.; 2], |old| {
                 [old.jitter[0] - jitter[0], old.jitter[1] - jitter[1]]
@@ -275,7 +280,7 @@ impl Sequence {
             output_extent,
             mode,
             debug: settings.view,
-            reset: previous.is_none(),
+            reset: reset_color,
             previous_camera: previous.map_or(camera, |prior| prior.camera),
             previous_scene: previous.map(|prior| prior.scene.clone()),
             stationary_camera,

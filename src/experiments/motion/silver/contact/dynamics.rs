@@ -11,7 +11,7 @@ pub(super) fn register(systems: &mut CharacterSystems, schedule: &mut Schedule) 
         let mut platforms = BTreeMap::<Id, Vec<Arc<Stage>>>::new();
         for actor in actors.values() {
             platforms
-                .entry(actor.plate)
+                .entry(actor.binding.plate)
                 .or_default()
                 .push(actor.clone());
         }
@@ -243,7 +243,7 @@ impl SimulationSystem for Integrate {
     fn bound_transforms(&self) -> Option<TransformTargets> {
         let mut targets = TransformTargets::default();
         for group in &self.0 {
-            targets.writes.push(group[0].plate);
+            targets.writes.push(group[0].binding.plate);
             for s in group {
                 targets.reads.extend_from_slice(&s.supports);
                 targets.reads.push(s.actor);
@@ -254,7 +254,7 @@ impl SimulationSystem for Integrate {
     }
     fn run(&self, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
         cx.for_each_parallel(&self.0, |group, cx| {
-            let id = group[0].plate;
+            let id = group[0].binding.plate;
             let mut plate = cx.local(id)?.context("missing spring plate")?;
             let mut spring = *cx
                 .component::<Spring>(id, SPRING)?
@@ -323,13 +323,13 @@ impl SimulationSystem for Integrate {
                 if root != result.before {
                     cx.set_pose([(s.actor, root)])?;
                 }
-                cx.set_typed_component(s.actor, BODY, result.body)?;
-                cx.set_typed_component(s.actor, SETTING, result.contact)?;
+                cx.set_bound_state(s.actor, BODY, result.body)?;
+                cx.set_bound_state(s.actor, SETTING, result.contact)?;
             }
             if spring_active {
                 cx.set_pose([(id, plate)])?;
             }
-            cx.set_typed_component(id, SPRING, spring)
+            cx.set_bound_state(id, SPRING, spring)
         })
     }
 }
@@ -362,7 +362,7 @@ fn solve(
     let mut floors = Vec::with_capacity(s.supports.len());
     if policy.physics != PhysicsParticipation::Off {
         for &id in &s.supports {
-            if id == s.plate {
+            if id == s.binding.plate {
                 floors.extend(plate);
             } else {
                 let support_policy = cx.motion_policy(id, MotionPolicy::FIXED_COLLIDER)?;
@@ -396,7 +396,7 @@ fn solve(
         }
         // The plate has its own vertical degree of freedom.
         if spring_active
-            && floor.id == s.plate
+            && floor.id == s.binding.plate
             && let Some(plate) = plate
         {
             floor.velocity.y = plate.velocity.y;
@@ -429,7 +429,7 @@ fn solve(
         .support
         .and_then(|id| floors.iter().find(|f| f.id == id))
         .map_or(Vec3::ZERO, |f| f.velocity_at(body.particle.position));
-    if spring_active && body.support == Some(s.plate) {
+    if spring_active && body.support == Some(s.binding.plate) {
         base.y = 0.;
     }
     if body.support.is_some() {
@@ -451,7 +451,7 @@ fn solve(
         // A single push at takeoff. The authored span sets desired forward launch speed.
         let dv = Vec3::Z * speed - (body.particle.velocity() - base) * Vec3::new(1., 0., 1.);
         let impulse = dv * mass + Vec3::Y * (body.jump_impulse * scale);
-        if spring_active && body.support == Some(s.plate) {
+        if spring_active && body.support == Some(s.binding.plate) {
             plate_velocity_delta -= impulse.y / PLATE_MASS;
         }
         body.particle.impulse(impulse);
@@ -517,7 +517,7 @@ fn solve(
         }
     }
     if let Some((fraction, surf, at)) = contact {
-        let movable = spring_active && surf.id == s.plate;
+        let movable = spring_active && surf.id == s.binding.plate;
         let inv_mass = if movable { 1. / PLATE_MASS } else { 0. };
         let impulse = body.particle.contact(
             surf.normal,
@@ -560,7 +560,7 @@ fn solve(
             .and_then(|id| floors.iter().find(|s| s.id == id))
             .map_or(Vec3::ZERO, |s| s.velocity_at(body.particle.position))
     };
-    if spring_active && body.support == Some(s.plate) {
+    if spring_active && body.support == Some(s.binding.plate) {
         body.base_velocity.y = 0.;
     }
     body.previous_faces.clear();

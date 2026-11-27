@@ -53,8 +53,9 @@ impl Targets {
                         continue;
                     }
                     let value = self.material_value(s, m.map_or(&fallback, Arc::as_ref))?;
-                    let row: [u32; 16] =
-                        bytemuck::pod_read_unaligned(&bytemuck::bytes_of(&value)[64..]);
+                    let row: [u32; 16] = bytemuck::pod_read_unaligned(
+                        &bytemuck::bytes_of(&value)[SurfaceInstance::MATERIAL_OFFSET..],
+                    );
                     rows.set(slot, &row);
                 }
                 *cache = Some(MaterialTable {
@@ -105,7 +106,7 @@ impl Targets {
             s.scene.routes.model_slots[&i.id].try_into()?
         };
         let flags = std::mem::take(&mut instance.tex[3]);
-        let payload = &bytemuck::bytes_of(&instance)[64..];
+        let payload = &bytemuck::bytes_of(&instance)[SurfaceInstance::MATERIAL_OFFSET..];
         let extra = if payload == self.material_rows(s)?.record(slot) {
             u32::MAX
         } else {
@@ -149,15 +150,10 @@ impl Targets {
             .as_ref()
             .map(|p| (p.shade, p.count))
             .unwrap_or_else(|| {
-                let r = g.resource(
-                    "Surface instances",
-                    Storage::Buffer {
-                        bytes: count as usize * size_of::<ShadeItem>(),
-                        initial: None,
-                    },
-                );
-                g.prefer_local_buffer(r);
-                (r, 0)
+                (
+                    g.local_buffer("Surface instances", count as usize * size_of::<ShadeItem>()),
+                    0,
+                )
             });
         let access = if base == 0 {
             Access::ComputeWrite

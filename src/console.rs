@@ -20,10 +20,10 @@ mod object;
 
 const HELP: &str = concat!(
     "fit · pause · rdg · timeline FILE.json · hud on/off · post off/taa/dlss/dlaa/reset/status",
-    " · post view motion/reprojection/off · stats · schedule · tick [MODULE HZ/frame/default] · memory idle/alloc/driver [NAME or #OWNER]",
+    " · post view motion/reprojection/off · stats · schedule [profile on/off] · tick [MODULE HZ/frame/default] · memory idle/alloc/driver [NAME or #OWNER]",
     " · light list/point/sun/move/aim/power/color/enable/angular-radius · import/save/load PATH · lod PIXELS",
     " · lodview on/off · vegetation auto/triangles/voxels/pixels/wind/time/view/camera",
-    " · control [ENTITY] · motion SPEED TURN [STRAFE] · motionsearch kd/scan · record PATH · stoprecord",
+    " · control [ENTITY] · motion SPEED TURN [STRAFE] · motionsearch kd/scan · motionbudget N/off · record PATH · stoprecord",
     " · contact status/physics/auto/manual/target/hand/feet/view/action · contact gravity G · contact impulse J · contact spin DEG/S",
     " · toon outline/width/light/threshold/sdf/view · texture neural/original/stats",
     " · gaussian tile/bvh/compact-tile/compact-bvh/scan/original/stats",
@@ -103,8 +103,17 @@ impl Console {
                 return Ok(engine.schedule.describe_clocks());
             }
             "schedule" => {
-                ensure!(arg.is_empty(), "schedule takes no arguments");
-                return Ok(engine.schedule.describe());
+                match arg {
+                    "" => return Ok(engine.schedule.describe()),
+                    "profile on" => engine.schedule.set_profiling(true),
+                    "profile off" => engine.schedule.set_profiling(false),
+                    "profile" => (),
+                    _ => anyhow::bail!("schedule [profile [on|off]]"),
+                }
+                return Ok(engine.schedule.tick_profile().map_or_else(||"Simulation profiling off".into(), |p| format!(
+                    "Last tick (ms): binding {:.3}, worker evaluation {:.3}, commit {:.3}, rollback preparation {:.3}, rollback {:.3}",
+                    p.binding.as_secs_f64()*1e3,p.evaluate.as_secs_f64()*1e3,p.commit.as_secs_f64()*1e3,p.capture_undo.as_secs_f64()*1e3,p.rollback.as_secs_f64()*1e3
+                )));
             }
             "record" => {
                 ensure!(self.recording.is_none(), "a recording is already running");
@@ -260,6 +269,26 @@ impl Console {
             "rt" => return lighting::command(engine, lighting::Kind::Rt, arg),
             "ibl" => return ibl::command(engine, arg),
             "restir" => return restir::command(engine, arg),
+            "motionbudget" => {
+                if !arg.is_empty() {
+                    let limit = if arg == "off" {
+                        None
+                    } else {
+                        Some(
+                            arg.parse()
+                                .context("motionbudget requires a positive actor count or off")?,
+                        )
+                    };
+                    engine
+                        .extraction
+                        .set_visual_pose_budget(limit, motion::silver::cosmetic_pose);
+                }
+                return Ok(format!(
+                    "Visual pose budget {:?}; {} cosmetic actors held at the last snapshot",
+                    engine.extraction.visual_pose_budget(),
+                    engine.extraction.held_visual_actors()
+                ));
+            }
             "motionsearch" => motion::silver::set_search(Arc::make_mut(&mut engine.world), arg)?,
             "motion" => {
                 let values: Vec<f32> = arg

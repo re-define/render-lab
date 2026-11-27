@@ -47,6 +47,13 @@ pub(super) const MOVEMENT: MovementDriver = MovementDriver {
     active: |world, id| Ok(player(world, id)?.move_root),
     apply: |world, id, intent| set_actor_goal(world, id, intent.side, intent.forward),
 };
+pub(crate) fn cosmetic_pose(w: &World, actor: Id) -> bool {
+    w.entities.get(&actor).is_some_and(|e| {
+        e.components.contains_key(PLAYER) && !e.components.contains_key(contact::SETTING)
+    }) && w
+        .motion_policy(actor, MotionPolicy::KINEMATIC)
+        .is_ok_and(|p| p.physics == PhysicsParticipation::Off)
+}
 pub const PLAYER: &str = "lab.silver_wolf.motion";
 const INDEX: &str = include_str!("../../../assets/motion/bank.json");
 const DATA: &[u8] = include_bytes!("../../../assets/motion/poses.bin");
@@ -514,7 +521,7 @@ impl SimulationSystem for SilverMatcher {
                 .context("missing Silver Wolf motion player")?
                 .into_owned();
             self.publish_locomotion(id, &mut p, cx, dt)?;
-            cx.set_typed_component(id, PLAYER, p)
+            cx.set_bound_state(id, PLAYER, p)
         })
     }
 }

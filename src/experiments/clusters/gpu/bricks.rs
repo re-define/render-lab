@@ -18,18 +18,6 @@ const METRICS: &[&str] = &[
     "Recovered brick DDA calls",
 ];
 
-fn local(g: &mut FrameGraph, name: &str, bytes: usize) -> Resource {
-    let r = g.resource(
-        name,
-        Storage::Buffer {
-            bytes,
-            initial: None,
-        },
-    );
-    g.prefer_local_buffer(r);
-    r
-}
-
 /// Seed once from complete opaque triangle depth, then resolve the combined brick list.
 pub(super) struct SoftwareRaster {
     winners: Resource,
@@ -40,11 +28,7 @@ pub(super) struct SoftwareRaster {
 impl SoftwareRaster {
     pub fn new(g: &mut FrameGraph, t: &Targets, ranges: Resource, compare: bool) -> Self {
         let [w, h] = g.extent;
-        let winners = local(
-            g,
-            "Voxel depth and hit handles",
-            w as usize * h as usize * 8,
-        );
+        let winners = g.local_buffer("Voxel depth and hit handles", w as usize * h as usize * 8);
         g.pass_in(
             PassPhase::Raster,
             "Final voxel brick visibility seed",
@@ -101,8 +85,8 @@ impl SoftwareRaster {
         let [w, h] = g.extent;
         let pixels = w as usize * h as usize;
         let grid = [w.div_ceil(8), h.div_ceil(8), 1];
-        let ids = local(g, "Resolved voxel visibility", pixels * 8);
-        let depth = local(g, "Resolved voxel depth", pixels * 4);
+        let ids = g.local_buffer("Resolved voxel visibility", pixels * 8);
+        let depth = g.local_buffer("Resolved voxel depth", pixels * 4);
         let sample = Access::ComputeSample;
         g.pass_in(
             PassPhase::Raster,
@@ -126,7 +110,7 @@ impl SoftwareRaster {
         );
         if let Some(metrics) = self.metrics {
             // Replay the identical combined list against the same opaque triangles.
-            let before = local(g, "Pre-brick visibility IDs", pixels * 8);
+            let before = g.local_buffer("Pre-brick visibility IDs", pixels * 8);
             g.pass(
                 "Save opaque IDs for raster comparison",
                 Op::ReadPixels {

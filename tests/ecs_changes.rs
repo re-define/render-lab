@@ -133,7 +133,11 @@ fn hierarchy_light_and_structural_edits_match_a_cold_extractor() -> Result<()> {
         ..Default::default()
     });
     let next = extract(&mut extractor, &world)?;
-    assert_eq!(next.scene.stats.entities_visited, world.entities.len());
+    assert_eq!(
+        next.scene.stats.entities_visited,
+        if added == lamp { 1 } else { 2 }
+    );
+    assert!(!next.scene.stats.full_rebuild);
     assert!(next.scene.lights().is_empty());
     assert!(next.scene.instances().iter().any(|i| i.id == added));
 

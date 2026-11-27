@@ -28,6 +28,7 @@ fn main() {
         "gi12_trace.comp",
         "gi12_cache.comp",
         "gi12_probe.comp",
+        "gi12_uncached.comp",
         "gi12_resolve.comp",
         "gi12_store.comp",
         "restir_surface.comp",

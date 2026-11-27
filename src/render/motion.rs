@@ -149,14 +149,10 @@ impl Table {
         );
         let previous_addresses = graph.address_table(self.addresses);
         let [width, height] = snapshot.extent;
-        let samples = graph.resource(
+        let samples = graph.local_buffer(
             "Visibility motion and history correspondence",
-            Storage::Buffer {
-                bytes: width as usize * height as usize * 24,
-                initial: None,
-            },
+            width as usize * height as usize * 24,
         );
-        graph.prefer_local_buffer(samples);
         use Access::{ComputeRead as R, ComputeSample as S, ComputeWrite as W};
         graph.pass_in(
             PassPhase::Motion,

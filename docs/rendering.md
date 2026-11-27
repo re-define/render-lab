@@ -1,71 +1,65 @@
-# 从几何到呈现
+# 一帧如何从几何得到画面
 
-## 可见性和几何
+渲染线程为每个视图调用 `Technique::build`。默认可见性管线先确定每个像素看见的表面和三角形，再由该表面的材质选择着色程序。普通网格、簇网格和过程水面可以出现在同一机位。需要研究主射线或纹理解码的实验也可注册专用技术。每种技术用同一个 `FrameGraph` 交付输出。[渲染入口](../src/render.rs) · [实验目录](experiment-catalog.md) · [世界快照的来源](extraction.md)
 
-渲染线程接收不可变快照。几何路由根据资产是否带簇层级、蒙皮和轮廓需求决定可使用的准备器。普通网格与簇网格都能写入主视图的可见性和深度；蒙皮 compute 读取骨骼调色板、权重及绑定姿态顶点，生成本帧表面。需要上一帧位置时，另一路 GPU 蒙皮使用上一已渲染姿态。材质解析使用像素所属表面的实例、三角形及材质索引进行分箱，分别运行相应的材质程序。独立主射线或纹理研究预设可以提供专用渲染技术。[几何与变形](../src/render/geometry.rs) · [可见性](../src/render/visibility.rs) · [材质表](../src/render/materials.rs)
+## 几何、剔除与可见性
 
-角色蒙皮按源网格、姿态缓冲页、当前或历史位置组成工作列表。引用同一份骨骼矩阵的部件共享调色板；每个部件单独携带模型矩阵供零权重顶点使用。GPU dispatch 的 Z 维分配给实例，输出地址表把每个部件导向独立的变形流。RDG 将地址表所指的各输出显式登记为写入，可见性、运动向量和光追加速结构都能取得正确的生产者依赖。普通绘制保留原有顺序，重叠三角形的深度相等时仍使用原来的覆盖规则。[批量蒙皮与 GPU 回归](../src/render/geometry/skin.rs) · [计算着色器](../shaders/skin.comp)
-
-植物的三角簇和体素砖参与同一层级构建；节点记录空间范围和选层误差。视锥筛选后，GPU 遍历候选节点和簇，结合屏幕误差、遮挡和前帧 Hi-Z 选择集合。首次光栅后建立中间深度层级，复查可能被错剔的三角簇。末尾的体素光栅消费压紧的砖列表，测试砖内占用和像素深度。比较轮廓、遮挡与 overdraw 时应固定风相位、相机和选层阈值。[构建与砖编码](../src/experiments/clusters/bvh/voxels.rs) · [簇调度](../src/experiments/clusters/gpu.rs) · [植被建场](../src/experiments/vegetation.rs)
-
-## 普通网格的每视图绘制列表
-
-银狼等普通不透明网格在首次走普通绘制路径时计算一次绑定空间包围盒，和顶点数一起缓存在网格资产上。材质和表面在剔除前登记，取得供可见性、着色、运动和光追共同使用的编号。每个视图独立组合投影矩阵、逐部件顶点地址和面地址，保留原来的表面次序。刚体和蒙皮可以共用可见性管线，后续仍按材质选择 PBR 或卡通着色。描边壳、边四边形、专用水面及簇光栅由各自的管线绘制。[几何准备](../src/render/geometry.rs) · [绘制列表](../src/render/draw_list.rs) · [卡通路径](../src/experiments/cartoon/renderer.rs)
-
-1. CPU 将相邻兼容部件分包。每包最多 256 个表面和 32,768 个 mesh workgroup，单个超大网格回退到原有二维 mesh dispatch。少于 16 个表面时走直接绘制，省去两次 compute 调度。
-2. GPU 每个表面用一组 64 个线程测试当前视锥。刚体检查包围盒八角，蒙皮检查本帧已变形的顶点。只要样本表明物体不能被同一裁剪面排除，就能提前接受。完全在视锥外的蒙皮须检查完全部顶点才能拒绝。普通列表只做视锥剔除，遮挡由后续深度测试决定；森林簇的 Hi-Z 选择仍由其专用管线处理。[视锥剔除](../shaders/ordinary_cull.comp)
-3. 第二个 compute 对包内组数做保序前缀和，写出每个表面的结束位置和 Vulkan 间接绘制参数。一个间接调用对应一次动态渲染作用域。每个 mesh 工作组从结束位置反查所属表面，并行输出最多 32 个三角形。像素写回原表面号与该表面索引流中的三角号。共面的三角形保持原顺序，离开主视锥的表面仍可参与阴影求交。[间接参数](../shaders/ordinary_work.comp) · [mesh 着色器](../shaders/ordinary.mesh) · [Vulkan 录制](../src/rhi/record.rs)
-
-将环境变量 `RENDER_LAB_REFERENCE_DRAWS` 设为 `1` 可强制原路径，移除此变量恢复自动分包。1080p 的 300 人窗口对照在同一优化构建和 RTX 5070 上各预热 20 帧、记录 96 个完成帧，普通网格从 1,824 次直接绘制合为 10 次间接绘制，整图 pass 数从 1,843 降至 49。GPU 整帧 P50/P95 从 8.60/9.06 ms 降至 3.62/3.82 ms，渲染前端构图与编译 P95 从 6.31 降至 5.04 ms。测量帧的已绑定设备本地内存从 347,731,840 增至 347,742,064 字节。窗口按实时时钟推进。逐像素对照另用相同相机和角色姿态，比较整张表面与三角 ID、D32 深度和每像素 24 字节的运动与历史对应数据。合成小场景检验部分遮挡、共面覆盖和视锥外投影候选。[GPU 对照](../src/experiments/motion/silver/contact/crowd_draw_test.rs) · [窗口基准](../src/experiments/motion/silver/contact/crowd_profile.rs)
-
-## 实验组合与颜色
-
-场景创建、加载和运行时切换都会读取同一组 ECS 设置并注册贡献者。簇管线和普通表面共享可见性缓冲。每个特殊表面路由声明自己接受哪些实例以及如何绘制，同一实例被两个路由认领会在构图时报出双方的名称。卡通模块能接管普通表面的材质与轮廓准备，流水模块只认领自己变形的表面，并将反射所需的顶点和面记录交给后续阶段。[装配](../src/experiments/composition.rs) · [水面路由](../src/experiments/effects.rs) · [卡通路由](../src/experiments/cartoon.rs)
-
-混合管线的颜色依次经过以下阶段。
-
-| 阶段 | 读写约定 |
+| 输入 | 从快照到可见性缓冲 |
 | --- | --- |
-| 材质与环境背景 | 材质在注册时声明显示格式和可选的线性 HDR 着色器。混合场景使用线性 RGBA32F，构图时检查目标颜色与材质输出是否匹配。IBL 背景先填充无几何覆盖的像素。 |
-| 场景反射与大气 | 河流通过渲染分辨率的可见性和深度读取岸边辐射亮度，只写水面。大气随后混合雾色。已有 IBL 背景时，植被保留其天空。 |
-| 重建与显示 | TAA 或 DLSS 读取场景颜色、深度与运动。常规 HDR 输出只做一次色调映射，转换到显示分辨率的 BGRA8。图像描边和调试轨迹最后绘制，按显示像素映射回可见性或深度的渲染像素。桌面 HUD 在窗口合成时覆盖画面。 |
+| 普通网格 | 为每个表面登记实例、材质与索引。少于 16 个兼容表面时直接绘制。大批次先在 GPU 测试每个表面的视锥，再按原顺序生成间接 mesh draw；单包上限为 256 个表面、32,768 个工作组。共面覆盖顺序和表面编号都得以保留。[绘制列表](../src/render/draw_list.rs) · [视锥测试](../shaders/ordinary_cull.comp) |
+| 蒙皮网格 | Compute 按姿态页和源网格分组，以每个实例的权重和骨矩阵生成顶点流。可见性、运动和加速结构共享相应的变形结果。普通刚体用包围盒剔除，蒙皮批次用当帧已变形的位置判断视锥。[GPU 蒙皮](../src/render/geometry/skin.rs) |
+| 森林簇 | 构建时以一组子簇为单位准备三角或体素替代，比较误差。运行时先筛实例视锥，GPU 通过全局列表分发 BVH 节点和候选簇，按投影误差选择层级。上一帧 Hi-Z 先筛遮挡，画出可见三角簇后用新深度复查被挡候选。末尾处理压紧的体素砖；compute 路径对候选像素遍历砖内占用并按深度竞争，另有 mesh 路径可作对照。[DAG 构建](../src/experiments/clusters/bvh/voxels.rs) · [剔除](../src/experiments/clusters/gpu.rs) · [体素光栅](../src/experiments/clusters/gpu/bricks.rs) |
+| 特殊几何 | 水面先发布本帧及需要的历史位置，随后进入可见性和反射；法线外扩、退化四边形描边可提交附加几何。组合场景装配时检查各路由认领的实例，避免一个表面重复绘制。[场景组合](../src/experiments/composition.rs) · [水面](../src/experiments/effects.rs) · [描边](../src/experiments/cartoon/renderer.rs) |
 
-独立的显示格式实验仍可使用仅输出 BGRA8 的材质。法线外扩和退化四边形描边写入几何可见性，按显示像素执行的阶段仅处理图像描边。[材质格式](../src/render/materials.rs) · [帧阶段](../src/render.rs) · [水面反射](../shaders/river_reflections.comp) · [图像描边](../shaders/outline_image.comp)
+## 着色、光照与时域重建
 
-组合回归覆盖森林、流水、角色、IBL 和 ReSTIR 的开关及存档重载。辐射亮度测试将流水移到相机外，逐字节比较同机位 128×80 帧的 RGBA32F，覆盖关闭、恢复存档和重新开启流水三种状态，其中包含超过 1 的高光。银狼与河流的独立测试核对 TAA 和 DLSS 两张帧图中的阶段顺序、绑定和输出分辨率，DLSS 在此项测试中只构图。[回归与执行条件](../src/experiments/composition.rs)
+表面和三角 ID 指向这一帧的表面表、几何流及材质槽。GPU 先按材质程序统计像素、分配区间、散射像素索引，再间接运行各材质的着色器。PBR 和卡通材质因此可以共享同一次可见性绘制。组合场景在线性 HDR 中做环境背景、河流反射与大气。需要显示空间输入的图像描边、调试轨迹在重建与色调映射之后绘制。[材质程序](../src/render/materials.rs) · [可见性解析与分箱](../src/render/visibility.rs) · [阶段装配](../src/render.rs)
 
-在 RTX 5070 上用实际 NGX 运行混合场景，输出尺寸为 320×180。GPU 时间线记录到 DLSS Quality 重建、写回帧颜色、色调映射和调试叠加。抓帧包含 28,644 种 RGB 颜色。[DLSS Quality 实机画面](../captures/confluence-hdr-dlss-quality.png)
+可见性解析向照明阶段提供 ID、深度、表面表、地址表、相机和按需生成的运动向量。仓库内的实验通过 `experiments::light_stack` 注册照明阶段，每个阶段声明自己读取的信号和唯一输出。外部 crate 可实现公开的 `Technique`，目前阶段注册接口的可见范围限于内置实验。装配器先检查重复写入、必需输入缺失与依赖环，再按依赖顺序建立 RDG pass。RDG 仍根据实际资源访问安排执行与同步。材质按自己声明的绑定顺序接收最终信号。[阶段接口与验证](../src/experiments/light_stack/stages.rs) · [材质绑定](../src/experiments/light_stack.rs)
 
-## 光照、射线与时域数据
+| 阶段 | 读入 | 产出与可替换实现 |
+| --- | --- | --- |
+| 表面重建 | 可见性、光源、射线几何与运动 | 每像素世界位置、法线、深度、实例标识、有效历史像素与求交资源。存在独立阴影代理时，间接光按视觉几何求最近命中。 |
+| 直接光采样 | 重建表面与光源表 | 原始直接辐亮度和候选储层。可用均匀、RIS、时空 ReSTIR 或分层参考采样。[直接光](../src/experiments/restir/graph.rs) |
+| 直接光解析 | 表面与原始直接光 | 最终直接光。可选无滤波、两轮空间 à-trous、或带时间矩的 SVGF 加三轮 à-trous。无滤波时仍提交下一帧采样所需的时钟和储层。[降噪与历史提交](../src/experiments/light_stack/denoise.rs) |
+| 漫反射间接光 | 重建表面、光源与命中材质 | 可独立选择关闭、无缓存单跳、带缓存单跳、带缓存双跳。无缓存模式每个 8×8 像素块发出八条半球探针射线，在命中 UV 计算辐亮度，再按深度与法线插值。缓存模式使用 131,072 个世界空间单元与上一帧探针；双跳还把第二次命中的贡献延迟发布。[间接光](../src/experiments/light_stack/diffuse_gi.rs) · [探针命中](../shaders/gi12_trace.glsl) |
+| 环境光 | HDR 环境图和相机 | 漫射辐照度、预滤镜面与 BRDF 表，可同以上直接光和间接光组合。[IBL](../src/experiments/ibl.rs) |
 
-ReSTIR DI 从光源集合产生重要性采样候选，在配置允许时合并时空邻域的储层，然后针对选中的样本求遮挡。间接光路径采集探针或缓存的辐射亮度；GI 最近命中使用命中材质定义和插值 UV。IBL 为 PBR 提供环境漫反射和预滤镜面数据。SVGF 利用运动、深度、法线和历史统计复用光照，再执行空间滤波。[ReSTIR](../src/experiments/restir.rs) · [间接漫反射](../src/experiments/restir/diffuse_gi.rs) · [IBL](../src/experiments/ibl.rs)
+在 `mixed` 场景使用 `restir gi direct|uncached|single|multi` 选择间接光，使用 `restir denoise off|spatial|svgf` 选择直接光滤波。旧存档沿用原有模式，缺少 `gi` 字段时只计算直接光。切换照明输出会重置最终颜色历史，各视图仍有独立的运动历史。主视图支持 TAA、DLSS 或 DLAA，次离屏视图可使用 TAA。[配置与命令](../src/experiments/restir.rs) · [运动输入](../src/render/motion.rs) · [后处理](../src/render/post.rs)
 
-前端分别查询 KHR 光追管线、内联 ray query 与 NV 簇加速结构能力。静态 BLAS 可按几何版本跨帧槽共享，动态几何随姿态更新。硬件射线消费 TLAS、命中表与材质属性；软件路径用计算着色器遍历 BVH。森林的簇光追额外处理屏幕外可投影的候选与风动姿态。支持某扩展和某实验实际选中该后端是两个不同的指标，应同时检查场景设置和 pass 报告。[射线前端](../src/render/rays.rs) · [KHR 后端](../src/rhi/ray.rs) · [NV 簇](../src/rhi/clusters.rs)
+**照明阶段的 GPU 对照。** RTX 5070，`mixed` 固定机位 320×180，IBL 同时开启，32 个点光源、分层参考直接光、软件 BVH，每档预热 4 帧后测 14 帧。下表为整帧 GPU 时间，包含可见性、材质与输出。样本较少，P95 落在本组最慢一帧。
 
-刚体、骨骼和过程变形的运动输入从渲染历史获得。TAA、DLSS 和时域光照共享屏幕运动，但分别持有自己的历史与有效性条件；相机剪切、尺寸变化和切换模式会影响这些历史。后处理前端声明需要的颜色、深度与运动，后端产生最终颜色。NGX 是可选本机集成，构建时由 `RENDER_LAB_NGX_SDK`、Vulkan 头文件和运行时 DLL 决定可用性。[运动输入](../src/render/motion.rs) · [后处理](../src/render/post.rs) · [NGX 构建](../build.rs)
+| 间接光与直接光滤波 | GPU P50 | GPU P95 |
+| --- | ---: | ---: |
+| 关闭间接光，关闭滤波 | 2.508 ms | 2.679 ms |
+| 单跳缓存，关闭滤波 | 3.039 ms | 3.268 ms |
+| 无缓存单跳，关闭滤波 | 2.832 ms | 3.728 ms |
+| 无缓存单跳，两轮空间滤波 | 2.829 ms | 3.064 ms |
 
-## RDG 和 RHI
-
-1. 每个 pass 声明操作、分类和资源访问。编译器跟踪读写依赖、布局变化和历史资源。可共用一次同步的访问被合并。逻辑队列映射到设备可用的物理队列；跨物理队列依赖生成时间线等待，同一队列按提交次序执行。[RDG](../src/rdg.rs) · [帧图](../src/render/frame_graph.rs)
-2. RHI 为当前帧槽准备持久资源、瞬态缓冲和描述符堆，通过独立录制器把计划分发给 worker。队列提交信号和等待经合并后发出。资源按用途、生命周期和内存类型分配；复用和退役以相关时间线完成为条件。[RHI 执行](../src/rhi/mod.rs) · [内存分配](../src/rhi/allocator.rs) · [瞬态分配](../src/rhi/transient.rs)
-3. 窗口使用 Vulkan 交换链，优先 MAILBOX，并依据设备可用模式选择。取得图像与呈现使用 WSI 信号量。GPUI HUD 由桌面合成叠在视口之上。离屏捕获与视频编码显式读回 GPU 图像。[呈现](../src/rhi/present.rs) · [HUD](../src/ui/hud.rs) · [编码](../src/recording.rs)
-
-用 `timeline target/frame.json` 导出最近帧的物理队列与等待来源。整帧 GPU 跨度取公共时间域内的最早开始和最晚结束；单 pass 时长之和可能包含重叠。CPU 的 `rhi_ms` 从准备持续到退役，也可能跨越其他帧。对照 CPU 占用、帧完成间隔和 GPU 跨度时请注明各自口径。[帧报告](../src/rhi/frame.rs) · [时间线导出](../src/rhi/timeline.rs)
-
-物理队列提交、命令缓冲和逻辑 pass 各有独立的粒度。同一提交内按 worker 数和负载拆成最多 32 个逻辑步骤的录制块，遇到提交边界或 NGX 调用会分开。每块独立录制、保留逐 pass 的起止查询，退役时整块读取。报告中的 `recording_chunks` 是实际使用的命令缓冲数，`timeline_signals` 是物理队列提交数；逐 pass 的分类、依赖和 GPU 计时仍可在时间线中查看。[录制规划](../src/rhi/queues.rs) · [命令录制](../src/rhi/record.rs)
-
-### 区间访问结构缓存实验
-
-应用设置环境变量 `RENDER_LAB_RDG_RANGE_CACHE=1` 后，编译器在带字节区间的帧图之间共享上一种结构的映射。当物理资源数、分段缓冲尺寸、逐 pass 缓冲区间及展开地址表后的读写绑定都完全相等时，可以复用逻辑区间和绑定到区间的映射。着色参数和上传内容仍来自本帧。每次编译均验证操作、初始化状态和访问类型，重新计算依赖顺序、外部副作用和屏障。切换场景或改变区间即可触发重建。缓存默认关闭，保留一个受大小限制的结构。[实现与基准](../src/rdg/range_cache.rs)
-
-运行 `cargo test --release --locked --lib range_topology_compile_profile -- --ignored --nocapture` 可对照 CPU 编译耗时。合成图包含 32 个缓冲，每个缓冲有 8 个部分重叠的区间操作和 1 个整缓冲导出，共 288 个 pass。各预热 16 次后交替采集 96 次。在本机，区间绑定展开 P50/P95 由 47.40/56.10 降到 1.60/2.50 微秒，完整 `Graph::compile` 由 187.70/243.00 降到 152.80/191.40 微秒。该指标覆盖 CPU 上的编译，不含帧图搭建、帧输出裁剪和 GPU 执行。
+切回只算直接光时得到相同的像素。另在 `restir` 固定机位用 64 灯、32 个参考样本，预热两帧后与拆分前的可执行程序逐像素比较。直接光、缓存单跳和缓存双跳的三张 320×180 截图分别有 0 个变化像素。将直接光切为无缓存单跳后有 42,109 个像素变化。可用 `cargo test --release --locked --lib experiments::light_stack -- --include-ignored --nocapture --test-threads=1` 重跑混合场景测试及三种求交后端的命中校验。[GPU 测试](../src/experiments/light_stack/diffuse_gi/tests.rs)
 
 ## 绑定预计算包围盒与阴影代理
 
-普通刚体实例可以在 `Instance::geometry_assets` 中引用一个共享资产实体。该资产保存 `source_mesh`、网格局部坐标的 `local_bounds`，以及可选的 `shadow_mesh`。代理的顶点须和源网格处于同一局部空间。加载、创建绑定和替换资产时按用途验证；已烘焙的 AABB 必须包含所有源顶点，所有用它的实例共享同一份局部数据。父级变换、旋转、非等比缩放经实例完整模型矩阵应用一次。蒙皮、风动及簇路径保留其姿态或簇边界，绑定刚体产品时有明确错误。[场景类型和校验](../src/scene/geometry_assets.rs)
+一个普通刚体实例可引用共享的 `GeometryAssets`。其中的局部 AABB 必须包围源网格全部顶点；实例的模型矩阵负责变换包围盒。投影代理与视觉网格使用同一局部坐标。可见性与 GI 采用视觉网格，直接光任意命中可查询代理。没有单独代理时，两种用途可以共享加速数据。蒙皮、风动和簇几何按自身变形或层级处理边界和阴影。[绑定校验](../src/scene/geometry_assets.rs) · [表面准备](../src/render/geometry.rs)
 
-提取时分别保存实例的资产 ID 与共享资产表。替换资产内容只写共享表项，上一帧可继续持有旧表；重绑实例只更新该实例页。普通网格批量视锥剔除直接投影已烘焙 AABB 的八角。省略包围盒时沿用共享网格的延迟计算。小批次继续走常规绘制。[实例提取](../src/render/scene/incremental.rs) · [GPU 剔除](../shaders/ordinary_cull.comp)
+前端区分 KHR 光追管线、内联 ray query、NV 簇加速结构三项设备能力。软件遍历读取 BVH 与三角流，硬件求交读取 BLAS 和 TLAS；同一帧内视觉与遮挡可以复用相同几何的 BLAS。静态几何可按版本跨帧槽共享，动态几何随姿态更新。森林启用 Mega Geometry 时还要把屏幕外可能投影进来的簇加入候选集。选择何种后端要结合设备能力、场景设置和实际 pass。[求交前端](../src/render/rays/scene.rs) · [KHR 后端](../src/rhi/ray.rs) · [森林簇光追](../src/experiments/clusters/gpu/mega.rs)
 
-多光源大厅的四个球共享 360 个三角形的可见网格和 48 个三角形的投影网格。ReSTIR 直接光的任意命中可查询代理，GI 的最近命中从视觉网格取得材质和 UV。软件后端按用途缓存静态 BVH。原生 RT 管线和内联查询仅在两种几何确实不同且需要 GI 时构建两棵 TLAS，相同网格的 BLAS 在同一帧可以复用。代理切换使照明的时域历史失效。旧存档和未绑定实例使用原有视觉几何。[实验入口](../src/experiments/restir/scene.rs) · [求交场景](../src/render/rays/scene.rs)
+## RDG、Vulkan 与呈现
 
-在 160×100 的离屏验证中，刻意将大厅球体的代理放大，软件 BVH、KHR 管线和内联查询三条路径各有 4,730 个最终直接光像素发生变化，两张可见性缓冲的所有实例和三角形 ID 逐字节相同。独立对照还验证软件 GI 的视觉三角流在替换代理前后完全一致，原生后端的 GI pass 继续引用 360 面视觉 BLAS。扩大一个视锥外实例的局部界时，24 个实例中的间接工作组由 20 增至 21，光栅结果仍一致。[代理回归](../src/experiments/restir/geometry_assets_tests.rs) · [剔除回归](../src/experiments/motion/silver/contact/crowd_draw_test.rs)
+1. **声明资源。** 每个 pass 指定操作、分类、队列及资源访问。缓冲可以声明字节区间，例如一个 Hi-Z mip；图像以整个资源追踪。普通 GPU 临时输出用 `Graph::local_buffer` 声明逻辑字节数和设备本地内存偏好。带初始内容的输入、历史和可复用 scratch 各有对应声明。[RDG](../src/rdg.rs) · [区间访问](../src/rdg/ranges.rs)
+2. **编译依赖。** 编译器从资源读写、字节区间、图像布局和显式前驱生成顺序与屏障。主视图和次视图各保存最近一份拓扑。命中需要操作类型、队列、资源类型与初值状态、直接绑定、间接地址表和区间边界等调度输入一致。着色器、间接参数和加速结构输入仍用当帧命令校验。随后从当帧呈现、读回、历史写入和外部副作用追溯活跃 pass，再决定实际分配与提交。[调度模板](../src/rdg/schedule_cache.rs) · [活跃性裁剪](../src/rdg/liveness.rs)
+3. **录制与提交。** RHI 使用退役帧槽准备资源和描述符堆，安排 worker 用独立的录制器录制命令。逻辑队列按设备配置映射到同一通用队列族的物理队列。同一队列内用屏障约束有依赖的阶段和内存访问。跨物理队列的依赖合并到时间线信号量，已被等待覆盖的普通缓冲读可以省去相应屏障。图像布局转换、主机可见性和别名边界仍有各自的同步要求。[帧槽](../src/rhi/slot.rs) · [录制](../src/rhi/record.rs) · [队列与等待](../src/rhi/queues.rs)
+4. **显示与读回。** 窗口帧在 GPU 端写入交换链呈现，优先 MAILBOX，设备不支持该模式时使用 FIFO。离屏输出、截图和录像按需读回。比较异步调度应使用对齐后的队列时间线、跨队列等待和整帧跨度；相互重叠的 pass 时长直接相加会重复计算。[交换链](../src/rhi/present.rs) · [GPU 时间线](../src/rhi/timeline.rs) · [性能与复现](performance.md)
+
+### 调度策略与复测
+
+默认优先延续上一逻辑队列。设置 `RENDER_LAB_RDG_ORDER=critical` 会优先调度下游依赖链较长的就绪 pass，链长按 pass 个数计算。物理队列映射由 RHI 在裁剪之后决定。完全串行的图可以使用一条队列，另外保留 RTX 5070 上经过 1080p 森林回放校准的组合。设置 `RENDER_LAB_GPU_QUEUES=1|2|3` 可以固定同机 A/B 所用队列数。设置 `RENDER_LAB_RDG_PLAN_CACHE=0` 可以单独关闭调度模板。基准逐帧记录构图、依赖编译、缓存命中、映射可用队列数、实际收到提交的队列数、时间线等待和 GPU 跨度。[物理队列映射](../src/rhi/queues.rs) · [森林镜头回放](../examples/forest_shadows/zoom.rs)
+
+## 验证入口
+
+以下测试需要 Vulkan 设备。第一项在同一机位比较视觉 ID、代理阴影与 GI 几何，覆盖软件 BVH、KHR 管线和内联查询；第二项用相同模拟输入核对两个相机各自的 TAA 历史。普通网格合批的逐像素 ID、深度与运动对照，以及森林体素与 GPU 性能的运行条件，分别见[普通绘制回归](../src/experiments/motion/silver/contact/crowd_draw_test.rs)和[性能记录](performance.md)。
+
+```powershell
+cargo test --release --locked --lib rigid_derived_assets_change_shadows_but_preserve_visual_and_gi_geometry -- --ignored --nocapture
+cargo test --release --locked --test offscreen_views -- --ignored
+```

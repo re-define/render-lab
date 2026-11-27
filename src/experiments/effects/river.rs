@@ -1,6 +1,6 @@
 //! A continuous channel shared by terrain carving, plant placement and the GPU water grid.
 use super::*;
-use crate::rdg::{Access, Dispatch, Op, PassPhase, Resource, Shader, Storage};
+use crate::rdg::{Access, Dispatch, Op, PassPhase, Resource, Shader};
 const LANES: u32 = 33;
 const ROWS: u32 = 1201;
 pub(super) const VERTICES: usize = (LANES * ROWS) as usize;
@@ -95,14 +95,7 @@ fn surface(
             32,
         )
     };
-    let output = g.resource(
-        name,
-        Storage::Buffer {
-            bytes: stride * VERTICES,
-            initial: None,
-        },
-    );
-    g.prefer_local_buffer(output);
+    let output = g.local_buffer(name, stride * VERTICES);
     let (old, model) = previous.unwrap_or((time, Mat4::IDENTITY));
     let dz = (END - START) / (ROWS - 1) as f32;
     let mut params = bytemuck::bytes_of(&[LANES, ROWS]).to_vec();

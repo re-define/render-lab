@@ -39,16 +39,10 @@ pub(super) fn run(directory: &Path) -> Result<()> {
                     &format!("light angular-radius {sun} {radius}"),
                 )?;
                 let image = frame(&mut engine, 0., EXTENT)?;
-                let mut rgba = image.pixels;
-                for pixel in rgba.chunks_exact_mut(4) {
-                    pixel.swap(0, 2);
-                }
-                image::save_buffer(
+                render_lab::recording::save_capture(
                     directory.join(format!("{view}-{disk}-{backend}.png")),
-                    &rgba,
-                    EXTENT[0],
-                    EXTENT[1],
-                    image::ColorType::Rgba8,
+                    image.extent,
+                    image.pixels,
                 )?;
             }
         }

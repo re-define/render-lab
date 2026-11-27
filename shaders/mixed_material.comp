@@ -23,7 +23,7 @@ layout(set=0,binding=11,std430) readonly buffer PointLightControls {
 layout(binding=12,std430) readonly buffer Indirect { vec4 indirectLight[]; };
 vec3 shadeLighting(uint pixel, vec3 albedo, vec3 position, vec3 n, vec3 v, Instance obj) {
     if(obj.params.w==1.0) return albedo*4.0;
-    vec3 bounce=directControls.w>0. ? indirectLight[pixel].rgb*directControls.x : vec3(0);
+    vec3 bounce=pixel<indirectLight.length() ? indirectLight[pixel].rgb*(directControls.x>0. ? directControls.x : 1.) : vec3(0);
     vec3 lighting=directControls.x>0.0 ? direct[pixel].color.rgb*directControls.x : vec3(0);
 #ifdef CEL
     float energy=luma(lighting);

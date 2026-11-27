@@ -720,7 +720,11 @@ impl Backend {
                     if !b.table.as_ref().is_some_and(|t| t.identical(table)) {
                         let old = b.table.take();
                         let n = b.mapped(|p| Ok(table.upload(old.as_ref(), p)))? as u64;
-                        table_bytes += n;
+                        if plan.skin_pages.contains(&resource) {
+                            skin_pose_bytes += n;
+                        } else {
+                            table_bytes += n;
+                        }
                         dynamic_bytes += n;
                         b.table = Some(table.clone());
                     }
@@ -735,9 +739,6 @@ impl Backend {
                     if !b.uploaded.as_ref().is_some_and(|last| last.ptr_eq(&source)) {
                         b.mapped(|p| {
                             dynamic_bytes += data.len() as u64;
-                            if plan.skin_pages.contains(&resource) {
-                                skin_pose_bytes += data.len() as u64;
-                            }
                             p[..data.len()].copy_from_slice(data);
                             if !graph.append_lists.contains(&Resource(i)) {
                                 p[data.len()..].fill(0);
@@ -1033,13 +1034,12 @@ impl Backend {
         {
             self.surface = Some(present::Surface::new(&self.gpu, hwnd)?);
         }
-        let queue_count = if !self.gpu.explicit_queue_count
-            && plan.graph.serial_profile == Some((&self.gpu.name, plan.graph.extent))
-        {
-            1
-        } else {
-            self.gpu.queues.len()
-        };
+        let queue_count = queues::queue_count_for_frame(
+            &self.gpu.name,
+            self.gpu.queues.len(),
+            self.gpu.explicit_queue_count,
+            &plan,
+        );
         plan.commands.queue_limit = queue_count;
         queues::remove_semaphore_covered_reads(&mut plan.commands, queue_count);
         let reuse = transient::Reuse::plan(&mut plan, queue_count);
@@ -1123,13 +1123,18 @@ impl Backend {
         let batches =
             self.timelines
                 .submit(&self.gpu, &plan, recorders, &layout, &slot.resources, image)?;
-        let mut starts = batches
+        let starts = batches
             .iter()
             .enumerate()
             .filter(|(i, b)| *i == 0 || !Arc::ptr_eq(b, &batches[i - 1]));
-        let (submits, timeline_waits) = starts
-            .by_ref()
-            .fold((0, 0), |(n, w), (_, b)| (n + 1, w + b.waits.len()));
+        let mut queue_mask = 0u32;
+        let mut submits = 0;
+        let mut timeline_waits = 0;
+        for (_, batch) in starts {
+            queue_mask |= 1 << batch.queue;
+            submits += 1;
+            timeline_waits += batch.waits.len();
+        }
         for (step, batch) in plan.steps.iter().zip(&batches) {
             if let Op::BuildBlas { output, .. } = plan.graph.passes[step.index].op
                 && let Physical::StaticBlas {
@@ -1179,6 +1184,9 @@ impl Backend {
             extract_ms: plan.extract_ms,
             build_ms: plan.build_ms,
             compile_ms: plan.compile_ms,
+            rdg_template_hit: plan.template_hit,
+            physical_queue_limit: plan.queue_limit,
+            physical_queues: queue_mask.count_ones() as usize,
             culled_passes: plan.culled_passes,
             pipeline_creations: uploads.pipelines,
             pipeline_create_ms: uploads.pipeline_ms,
@@ -1262,7 +1270,7 @@ impl Backend {
         let mut clock_origin = None;
         let mut span = [0i64; 2];
         let period_ms = f64::from(self.gpu.limits.timestamp_period) * 1e-6;
-        let aligned = self.gpu.common_clock || plan.queue_limit == 1;
+        let aligned = self.gpu.common_clock || profile.physical_queues == 1;
         let mut timestamps = [[0_u64; 2]; queues::MAX_STEPS_PER_COMMAND];
         for (r, range) in recorders.iter().zip(&layout.chunks) {
             let times = &mut timestamps[..range.len()];
@@ -1426,7 +1434,6 @@ impl Backend {
         profile.recording_workers = workers.len();
         profile.recording_chunks = recorders.len();
         profile.overlapping_recordings = peak as usize;
-        profile.physical_queues = plan.queue_limit;
         profile.dependency_edges = plan.steps.iter().map(|s| s.parents.len()).sum();
         profile.resource_barriers = plan.steps.iter().map(|s| s.barriers.len()).sum();
         profile.barrier_calls = barriers[0];

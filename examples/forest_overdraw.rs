@@ -195,16 +195,10 @@ fn main() -> Result<()> {
             if i == warm + samples - 1
                 && let Some(dir) = &capture
             {
-                let mut rgba = frame.pixels.clone();
-                for pixel in rgba.chunks_exact_mut(4) {
-                    pixel.swap(0, 2);
-                }
-                image::save_buffer(
+                render_lab::recording::save_capture(
                     dir.join(format!("{stage}.png")),
-                    &rgba,
-                    extent[0],
-                    extent[1],
-                    image::ColorType::Rgba8,
+                    frame.extent,
+                    frame.pixels.clone(),
                 )?;
             }
             let arrival = backend.as_deref() == Some("compare") && stage > 0 && i == 0;

@@ -1,4 +1,5 @@
 //! Deterministic moving-character comparison against direct lighting from every light.
+mod support;
 use anyhow::{Context, Result, ensure};
 use glam::{Mat4, Vec3};
 use render_lab::{
@@ -95,16 +96,11 @@ fn capture(
 ) -> Result<()> {
     ensure!(engine.tick(dt, extent)?, "frame was not queued");
     let start = Instant::now();
-    let frame = loop {
-        if let Some(frame) = engine.take_frame() {
-            break frame.map_err(anyhow::Error::msg)?;
-        }
-        ensure!(
-            start.elapsed() < Duration::from_secs(90),
-            "GPU frame timed out"
-        );
-        std::thread::sleep(Duration::from_micros(200));
-    };
+    let frame = support::wait_frame(
+        engine,
+        start + Duration::from_secs(90),
+        Duration::from_micros(200),
+    )?;
     if index == 16 {
         println!(
             "{}; {:?}; {:?}",
@@ -124,16 +120,10 @@ fn capture(
     if !save {
         return Ok(());
     }
-    let mut rgba = frame.pixels;
-    for pixel in rgba.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
-    image::save_buffer(
+    render_lab::recording::save_capture(
         output.join(format!("{index:03}.png")),
-        &rgba,
-        extent[0],
-        extent[1],
-        image::ColorType::Rgba8,
+        frame.extent,
+        frame.pixels,
     )?;
     Ok(())
 }

@@ -1034,3 +1034,59 @@ fn rotating_deck_restores_a_low_frequency_clock_without_reversing_its_drive() ->
     assert_eq!(clock.pending_seconds, 0.);
     Ok(())
 }
+
+#[test]
+fn legacy_spring_is_restored_once_and_a_missing_plate_is_rejected() -> Result<()> {
+    let world = scene()?;
+    let actor = actor(&world).unwrap();
+    let plate = world
+        .typed_component::<Contact>(actor, SETTING)?
+        .unwrap()
+        .plate;
+    let mut raw = serde_json::to_value(world)?;
+    let actors = &mut raw["entities"];
+    let contact = actors[actor.to_string()]["components"]
+        .as_object_mut()
+        .unwrap();
+    contact.remove(dynamics::BODY);
+    contact.get_mut(SETTING).unwrap()["velocity"] = serde_json::json!(0.75);
+    actors[plate.to_string()]["components"]
+        .as_object_mut()
+        .unwrap()
+        .remove(dynamics::SPRING);
+    let mut legacy: World = serde_json::from_value(raw.clone())?;
+    hydrate_contact(&mut legacy)?;
+    assert_eq!(
+        legacy
+            .typed_component::<dynamics::Spring>(plate, dynamics::SPRING)?
+            .unwrap()
+            .velocity,
+        0.75
+    );
+    assert!(
+        legacy
+            .typed_component::<dynamics::Body>(actor, dynamics::BODY)?
+            .is_some()
+    );
+    let mut migrated: World = serde_json::from_value(serde_json::to_value(legacy)?)?;
+    hydrate_contact(&mut migrated)?;
+    assert_eq!(
+        migrated
+            .typed_component::<dynamics::Spring>(plate, dynamics::SPRING)?
+            .unwrap()
+            .velocity,
+        0.75
+    );
+    raw["entities"]
+        .as_object_mut()
+        .unwrap()
+        .remove(&plate.to_string());
+    let mut broken: World = serde_json::from_value(raw)?;
+    assert!(
+        hydrate_contact(&mut broken)
+            .unwrap_err()
+            .to_string()
+            .contains("missing contact plate")
+    );
+    Ok(())
+}

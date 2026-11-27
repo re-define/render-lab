@@ -18,60 +18,69 @@ pub(super) enum Change {
 }
 
 impl Change {
-    pub(super) fn apply(self, world: &mut World, undo: Option<&mut Vec<Edit>>) {
-        match self {
+    fn capture_undo(&self, world: &World) -> Option<Edit> {
+        Some(match self {
             Self::Pose(pose) => {
-                if let Some(undo) = undo {
-                    let previous = pose.previous(world);
-                    undo.push(Box::new(move |world| previous.apply(world)));
-                }
-                pose.apply(world);
+                let old = pose.previous(world);
+                Box::new(move |w| old.apply(w))
             }
-            Self::PublishedPose(owner, joints, locals) => {
-                if let Some(undo) = undo {
-                    let previous = joints
-                        .joints()
-                        .iter()
-                        .filter_map(|id| world.entities.get(id).map(|row| (*id, row.local)))
-                        .collect::<Vec<_>>();
-                    undo.push(Box::new(move |world| {
-                        for (id, local) in previous {
-                            let _ = world.set_local(id, local);
-                        }
-                    }));
-                }
-                world.entities.publish_pose(owner, joints, locals);
+            Self::PublishedPose(_, layout, _) => {
+                let old: Vec<_> = layout
+                    .joints()
+                    .iter()
+                    .filter_map(|id| world.entities.get(id).map(|e| (*id, e.local)))
+                    .collect();
+                Box::new(move |w| {
+                    for (id, local) in old {
+                        let _ = w.set_local(id, local);
+                    }
+                })
             }
-            Self::Component(id, key, edit) => {
-                // A preceding whole-world command in this batch may have removed the entity.
-                if !world.entities.contains_key(&id) {
-                    return;
-                }
-                if let Some(undo) = undo {
-                    undo.push(Box::new(world.restore_component_on_rollback(id, key)));
-                }
-                edit(world);
+            Self::Component(id, key, _) => {
+                world.entities.get(id)?;
+                Box::new(world.restore_component_on_rollback(*id, key))
             }
+            Self::Resource(key, _) => {
+                let key = *key;
+                let old = world.simulation_resources.get(key).cloned();
+                Box::new(move |w| match old {
+                    Some(old) => {
+                        w.simulation_resources.insert(key, old);
+                    }
+                    None => {
+                        w.simulation_resources.remove(key);
+                    }
+                })
+            }
+            Self::Whole(_) => {
+                let old = world.clone();
+                Box::new(move |w| *w = old)
+            }
+        })
+    }
+    pub(super) fn apply(self, world: &mut World, undo: Option<&mut Vec<Edit>>) {
+        self.apply_timed(world, undo, None);
+    }
+    pub(super) fn apply_timed(
+        self,
+        world: &mut World,
+        undo: Option<&mut Vec<Edit>>,
+        capture: Option<&mut std::time::Duration>,
+    ) {
+        if let Some(undo) = undo {
+            super::timed(capture, || undo.extend(self.capture_undo(world)));
+        }
+        match self {
+            Self::Pose(pose) => pose.apply(world),
+            Self::PublishedPose(owner, layout, locals) => {
+                world.entities.publish_pose(owner, layout, locals)
+            }
+            Self::Component(id, _, edit) if world.entities.contains_key(&id) => edit(world),
+            Self::Component(..) => (),
             Self::Resource(key, value) => {
-                let old = world.simulation_resources.insert(key, value);
-                if let Some(undo) = undo {
-                    undo.push(Box::new(move |world| match old {
-                        Some(value) => {
-                            world.simulation_resources.insert(key, value);
-                        }
-                        None => {
-                            world.simulation_resources.remove(key);
-                        }
-                    }));
-                }
+                world.simulation_resources.insert(key, value);
             }
-            Self::Whole(edit) => {
-                if let Some(undo) = undo {
-                    let previous = world.clone();
-                    undo.push(Box::new(move |world| *world = previous));
-                }
-                edit(world);
-            }
+            Self::Whole(edit) => edit(world),
         }
     }
 }
@@ -257,6 +266,21 @@ impl<'w> SystemContext<'w> {
             Box::new(move |world| {
                 world.set_typed_component(id, key, value);
             }),
+        ));
+        Ok(())
+    }
+    /// Write dynamic state from a bound system whose rig, fixtures and owner stay unchanged.
+    pub(crate) fn set_bound_state<T: Serialize + Send + Sync + 'static>(
+        &mut self,
+        id: Id,
+        key: &'static str,
+        value: T,
+    ) -> Result<()> {
+        self.check_component_target(id, key)?;
+        self.changes.push(Change::Component(
+            id,
+            key,
+            Box::new(move |world| world.set_bound_state(id, key, value)),
         ));
         Ok(())
     }

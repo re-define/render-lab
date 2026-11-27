@@ -1,4 +1,5 @@
 //! Measure native CLAS reuse and forced rebuilds on identical deterministic forest paths.
+mod support;
 use anyhow::{Context, Result, ensure};
 use render_lab::{console::Console, engine::Engine, experiments, rhi::Frame};
 use std::{
@@ -12,16 +13,11 @@ use std::{
 fn render(engine: &mut Engine) -> Result<Frame> {
     ensure!(engine.tick(0., [800, 500])?, "forest render queue full");
     let start = Instant::now();
-    loop {
-        if let Some(frame) = engine.take_frame() {
-            return frame.map_err(anyhow::Error::msg);
-        }
-        ensure!(
-            start.elapsed() < Duration::from_secs(120),
-            "forest GPU frame timed out"
-        );
-        std::thread::sleep(Duration::from_micros(200));
-    }
+    support::wait_frame(
+        engine,
+        start + Duration::from_secs(120),
+        Duration::from_micros(200),
+    )
 }
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);

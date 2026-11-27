@@ -9,6 +9,10 @@ pub(super) struct Declarations {
     pub(super) split: BTreeSet<Resource>,
 }
 impl Declarations {
+    pub(super) fn slice_count(&self) -> usize {
+        self.passes.values().map(Vec::len).sum()
+    }
+
     pub(super) fn remap_passes(&mut self, live: &[bool], remap: &[usize]) {
         self.passes = std::mem::take(&mut self.passes)
             .into_iter()
@@ -18,6 +22,17 @@ impl Declarations {
     }
 }
 impl Graph {
+    // Only split buffers use their size to determine dependency interval boundaries.
+    pub(super) fn range_sizes(&self) -> impl Iterator<Item = usize> + '_ {
+        self.subranges
+            .split
+            .iter()
+            .map(|r| match self.resources[r.0].1 {
+                Storage::Buffer { bytes, .. } => bytes,
+                _ => 0,
+            })
+    }
+
     /// Narrow one compute buffer binding to disjoint byte intervals with its actual read/write modes.
     pub fn buffer_ranges(
         &mut self,

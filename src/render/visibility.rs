@@ -118,22 +118,8 @@ pub(crate) fn resolve(
     // Classification and scattering contend on these counters for every
     // visible pixel. Keep atomics and the scattered pixel list on the GPU heap.
     g.prefer_local_buffer(bins);
-    let args = g.resource(
-        "Shading dispatches",
-        Storage::Buffer {
-            bytes: 16 * models.len(),
-            initial: None,
-        },
-    );
-    let list = g.resource(
-        "Visible pixel list",
-        Storage::Buffer {
-            bytes: 4 * count,
-            initial: None,
-        },
-    );
-    g.prefer_local_buffer(args);
-    g.prefer_local_buffer(list);
+    let args = g.local_buffer("Shading dispatches", 16 * models.len());
+    let list = g.local_buffer("Visible pixel list", 4 * count);
     let classify = |shader, destination| Op::Compute {
         program: Dispatch {
             shader: Shader::Compute(shader),

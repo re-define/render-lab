@@ -1,13 +1,60 @@
 use super::*;
 
 /// Stable for the lifetime of one structural layout. Transform and material edits share it.
+#[derive(Clone)]
 pub(crate) struct GeometryRoutes {
-    pub model_slots: BTreeMap<Id, usize>,
+    free_models: BTreeSet<usize>,
+    pub(super) model_capacity: usize,
+    material_uses: Vec<usize>,
+    pub model_slots: ModelSlots,
     pub(crate) material_slots: BTreeMap<MaterialId, usize>,
     pub ordinary: Vec<usize>,
-    pub groups: BTreeMap<MeshId, Vec<usize>>,
+    pub groups: Arc<BTreeMap<MeshId, Vec<usize>>>,
     pub bindings: Arc<[u8]>,
     pub materials: Vec<Option<MaterialId>>,
+}
+/// The main table and clustered bindings can span the whole forest. Tail edits copy
+/// only deviations from the immutable table, which is compacted as the edits grow.
+#[derive(Clone)]
+pub(crate) struct ModelSlots {
+    base: Arc<BTreeMap<Id, usize>>,
+    edits: BTreeMap<Id, Option<usize>>,
+}
+impl ModelSlots {
+    fn table(&self) -> std::borrow::Cow<'_, BTreeMap<Id, usize>> {
+        if self.edits.is_empty() {
+            return std::borrow::Cow::Borrowed(&self.base);
+        }
+        let mut table = self.base.as_ref().clone();
+        for (&id, &value) in &self.edits {
+            if let Some(slot) = value {
+                table.insert(id, slot);
+            } else {
+                table.remove(&id);
+            }
+        }
+        std::borrow::Cow::Owned(table)
+    }
+    fn set(&mut self, id: Id, value: Option<usize>) {
+        if self.base.get(&id).copied() == value {
+            self.edits.remove(&id);
+        } else {
+            self.edits.insert(id, value);
+        }
+        if self.edits.len() > 256.max(self.base.len() / 4) {
+            self.base = Arc::new(self.table().into_owned());
+            self.edits.clear();
+        }
+    }
+}
+impl std::ops::Index<&Id> for ModelSlots {
+    type Output = usize;
+    fn index(&self, id: &Id) -> &usize {
+        match self.edits.get(id) {
+            Some(value) => value.as_ref().expect("live model slot"),
+            None => &self.base[id],
+        }
+    }
 }
 impl RenderInstance {
     pub(crate) fn gpu_model(&self) -> [u32; 20] {
@@ -49,6 +96,33 @@ fn stable_slots<K: Copy + Ord>(
     slots
 }
 impl GeometryRoutes {
+    pub(super) fn push_ordinary(&mut self, index: usize, row: &RenderInstance) -> usize {
+        let slot = self.free_models.pop_first().unwrap_or_else(|| {
+            let slot = self.model_capacity;
+            self.model_capacity += 1;
+            slot
+        });
+        self.model_slots.set(row.id, Some(slot));
+        self.ordinary.push(index);
+        if let Some(id) = row.material {
+            let m = self.material_slots[&id];
+            self.material_uses[m] += 1;
+            self.materials[m] = Some(id);
+        }
+        slot
+    }
+    pub(super) fn pop_ordinary(&mut self, row: &RenderInstance) {
+        self.ordinary.pop();
+        self.free_models.insert(self.model_slots[&row.id]);
+        self.model_slots.set(row.id, None);
+        if let Some(id) = row.material {
+            let m = self.material_slots[&id];
+            self.material_uses[m] -= 1;
+            if self.material_uses[m] == 0 {
+                self.materials[m] = None;
+            }
+        }
+    }
     pub(super) fn new(
         instances: &[Arc<RenderInstance>],
         meshes: &BTreeMap<MeshId, Arc<MeshAsset>>,
@@ -66,7 +140,7 @@ impl GeometryRoutes {
         }
         let model_slots = stable_slots(
             instances.iter().map(|i| i.id),
-            prior.map(|p| &p.model_slots),
+            prior.map(|p| p.model_slots.table()).as_deref(),
             0,
         );
         let material_slots = stable_slots(
@@ -75,8 +149,10 @@ impl GeometryRoutes {
             1,
         );
         let mut materials = vec![None; 1 + material_slots.values().max().copied().unwrap_or(0)];
+        let mut material_uses = vec![0; materials.len()];
         for i in instances {
             if let Some(id) = i.material {
+                material_uses[material_slots[&id]] += 1;
                 materials[material_slots[&id]] = Some(id);
             }
         }
@@ -107,11 +183,28 @@ impl GeometryRoutes {
                     .context("plant joint index overflow")?;
             }
         }
+        let model_capacity = model_slots.values().max().map_or(0, |slot| slot + 1);
+        let mut occupied = vec![false; model_capacity];
+        for &slot in model_slots.values() {
+            occupied[slot] = true;
+        }
+        let free_models = occupied
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, used)| (!used).then_some(i))
+            .collect();
+        let model_slots = ModelSlots {
+            base: Arc::new(model_slots),
+            edits: BTreeMap::new(),
+        };
         Ok(Self {
+            free_models,
+            model_capacity,
+            material_uses,
             model_slots,
             material_slots,
             ordinary,
-            groups,
+            groups: Arc::new(groups),
             bindings: bytemuck::cast_slice(&bindings).into(),
             materials,
         })

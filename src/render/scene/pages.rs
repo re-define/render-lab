@@ -31,6 +31,25 @@ impl InstancePages {
             ..Self::default()
         }
     }
+    pub(super) fn push(&mut self, row: Arc<RenderInstance>) {
+        self.layout = Arc::new(());
+        self.flat.take();
+        if self.len.is_multiple_of(PAGE) {
+            self.pages.push(Default::default());
+        }
+        Arc::make_mut(self.pages.last_mut().unwrap()).push(row);
+        self.len += 1;
+    }
+    pub(super) fn pop(&mut self) {
+        self.layout = Arc::new(());
+        self.flat.take();
+        let page = Arc::make_mut(self.pages.last_mut().unwrap());
+        page.pop();
+        if page.is_empty() {
+            self.pages.pop();
+        }
+        self.len -= 1;
+    }
     pub(crate) fn same_layout(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.layout, &other.layout)
     }

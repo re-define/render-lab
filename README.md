@@ -1,18 +1,28 @@
 # Render Lab
 
-Render Lab 是用 Rust 编写的 Windows / Vulkan 1.4 实验引擎。可以用同一套角色、材质和相机比较几何、光照、动画、物理和纹理压缩算法。银狼障碍场演示了动作匹配、固定步长动力学、手脚 IK 与 GPU 蒙皮如何一起工作。岩柱森林把簇几何、体素、风动、重采样光照和流水放进同一视图。
+用于实时渲染、动画与物理研究的 Rust 引擎，运行于 Windows x64 和 Vulkan 1.4。可以在银狼障碍场研究动作匹配与接触 IK，在岩柱森林研究三角簇、体素和硬件光追，也可以将流水、角色和不同照明技术装配到同一个场景。[实验目录](docs/experiment-catalog.md) · [引擎架构图](docs/architecture.md)
 
-## 运行
+## 构建与运行
 
-在仓库根目录使用 MSVC Rust 工具链，安装 Vulkan SDK 并让 `glslc` 位于 PATH。设备需要 Vulkan 1.4、描述符堆扩展、mesh shader、动态渲染、同步 2、时间线信号量与交换链。光追扩展和 NGX 能力由设备初始化另行探测。[构建脚本](build.rs) · [设备选择](src/rhi/device.rs)
+在仓库根目录使用 x64 MSVC Rust 工具链，安装 Vulkan SDK，使 `glslc` 位于 PATH，或用 `GLSLC` 指定编译器。图形设备需要 Vulkan 1.4、`VK_EXT_descriptor_heap`、mesh shader、缓冲设备地址、时间线信号量、动态渲染与同步 2；窗口使用交换链。后端单独检测光追管线、内联查询和 NV 簇加速。DLSS/DLAA 另外需要在构建时配置 NGX SDK，并在运行时通过能力检测。[构建脚本](build.rs) · [设备选择](src/rhi/device.rs)
 
 ```powershell
 cargo run --release --locked -- --list-experiments
+cargo run --release --locked -- --experiment movement
 cargo run --release --locked -- --experiment silver-contact
 cargo run --release --locked -- --experiment forest-karst
-cargo run --release --locked -- --experiment clusters --command "lodview on"
 ```
 
-WASD 平移相机，视口内按住右键转向，F 重新取景。控制台输入 `help` 查看参数，`schedule` 查看模拟依赖，`rdg` 查看渲染图。用 `--benchmark 240` 对窗口呈现采样。用 `--capture target/frame.png` 保存一帧。安装 FFmpeg 后，`--record target/run.mp4 --size 1920x1080 --fps 60 --duration 10` 按指定时间推进并录制。录像时长与窗口吞吐量的测量方法见[性能与复现](docs/performance.md)。
+`movement` 用同一张网格展示固定、运动学与受重力驱动的物体。控制台输入 `object` 查看实体，`tick` 查看模块时钟，`tick movement 30` 可现场改变运动频率。WASD 移动相机，视口内按住鼠标右键转向，F 重新取景。按 Enter 或 / 打开控制台，输入 `help` 查看命令，`schedule` 查看系统调度，`rdg` 切换渲染图面板。[世界与运动](docs/world-runtime.md) · [输入实现](src/ui/input.rs) · [控制台](src/console.rs)
 
-[文档索引](docs/README.md) · [全部实验](docs/experiment-catalog.md) · [开发和测试](CONTRIBUTING.md) · [资产署名](assets/README.md) · [银狼实机录像](captures/silver-contact.mp4)
+## 捕获与测量
+
+```powershell
+cargo run --release --locked -- --experiment movement --capture target/movement.png --size 640x360
+cargo run --release --locked -- --experiment silver-contact --record target/contact.mp4 --fps 30 --duration 5
+cargo run --release --locked -- --experiment forest-karst --benchmark 240
+```
+
+录像需要 PATH 中的 FFmpeg，或通过 `RENDER_LAB_FFMPEG` 指定。离屏录像按固定时间推进；窗口基准记录完成的帧。两种运行方式的数值应分别解读。[性能与复现](docs/performance.md) · [已有银狼录像](captures/silver-contact.mp4)
+
+[文档索引](docs/README.md) · [开发与验证](CONTRIBUTING.md) · [第三方资产与许可](assets/README.md)

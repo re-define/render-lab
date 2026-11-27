@@ -3,13 +3,21 @@ use super::*;
 /// Reverse edges needed to propagate a change without walking all scene entities.
 #[derive(Default)]
 pub(super) struct Dependencies {
-    pub skin_users: BTreeMap<Id, Vec<Id>>,
-    pub skin_layouts: Vec<(Id, usize)>,
+    pub light_count: usize,
+    pub pose_nodes: std::collections::HashMap<usize, transforms::SkinUsers>,
+    pub skins: Vec<SkinDependency>,
     pub components: BTreeMap<&'static str, ComponentOwner>,
 }
 
+/// Rebuilt together with the transform topology and the ordered instance table.
+pub(super) struct SkinDependency {
+    pub id: Id,
+    pub joint_count: usize,
+    pub instances: Vec<usize>,
+}
+
 impl RenderScene {
-    fn instance_index(&self, id: Id) -> Option<usize> {
+    pub(super) fn instance_index(&self, id: Id) -> Option<usize> {
         self.instances
             .binary_search_by_key(&id, |instance| instance.id)
             .ok()
@@ -55,19 +63,29 @@ impl Visits {
         self.rows.extend(ids);
     }
     fn count(&self, transforms: &TransformCache) -> usize {
-        let subtree_count: usize = self.subtrees.iter().map(|r| r.len()).sum();
+        let subtree_count: usize = self.subtrees.iter().map(|r| transforms.live_count(r)).sum();
         subtree_count
             + self
                 .rows
                 .iter()
                 .filter(|id| {
-                    let slot = transforms.slots[id];
+                    let Some(&slot) = transforms.slots.get(id) else {
+                        return true;
+                    };
                     let i = self.subtrees.partition_point(|r| r.end <= slot);
                     self.subtrees.get(i).is_none_or(|r| slot < r.start)
                 })
                 .count()
     }
 }
+/// World edits with transform-dependent render outputs.
+#[derive(Default)]
+struct TransformEdits {
+    locals: Vec<(usize, u64, Mat4)>,
+    lights: BTreeSet<Id>,
+    rebound: Vec<usize>,
+}
+
 #[derive(Default)]
 struct DirtyJoints {
     count: usize,
@@ -84,7 +102,8 @@ impl SceneExtractor {
         let previous = self.previous.as_ref().expect("cursor requires a snapshot");
         let edits: BTreeSet<_> = edits.collect();
         let mut poses = poses.peekable();
-        if edits.is_empty()
+        if !self.pending_visual
+            && edits.is_empty()
             && poses.peek().is_none()
             && previous.stats == ExtractionStats::default()
         {
@@ -93,21 +112,36 @@ impl SceneExtractor {
         let mut scene = previous.as_ref().clone();
         scene.stats = ExtractionStats::default();
         let mut visited = Visits::default();
-        let mut moved = Vec::new();
+        let structural: BTreeSet<_> = edits
+            .iter()
+            .filter_map(|&(id, k)| (k == EntityWrite::Structure).then_some(id))
+            .collect();
+        if !structural.is_empty() && !self.apply_leaf_edits(world, &structural, &mut scene)? {
+            return Ok(None);
+        }
+        visited.extend(&structural);
+        let mut updates = TransformEdits::default();
         for pose in poses {
             scene.stats.pose_blocks_read += 1;
             for (id, local) in pose.changes() {
                 scene.stats.pose_locals_read += 1;
-                moved.push((self.transforms.slots[&id], pose.revision, local));
+                if structural.contains(&id) {
+                    continue;
+                }
+                updates
+                    .locals
+                    .push((self.transforms.slots[&id], pose.revision, local));
             }
         }
         let mut dirty_components = BTreeSet::new();
-        let mut dirty_lights = BTreeSet::new();
-        let mut rebound = Vec::new();
         for (id, kind) in edits {
+            if structural.contains(&id) {
+                continue;
+            } // Leaf edits read the complete final entity.
             let entity = &world.entities[&id];
             visited.insert(id);
             match kind {
+                EntityWrite::Structure => unreachable!(),
                 EntityWrite::Inspect => {
                     if !Entities::inspectable(entity)
                         || entity.parent != self.transforms.get(id).unwrap().parent
@@ -157,11 +191,11 @@ impl SceneExtractor {
                             .context("missing render instance")?
                             .geometry_assets;
                         scene.geometry_revision = next_geometry_revision();
-                        rebound.push(index);
+                        updates.rebound.push(index);
                     }
                 }
                 EntityWrite::Light => {
-                    dirty_lights.insert(id);
+                    updates.lights.insert(id);
                 }
                 EntityWrite::Texture => {
                     Arc::make_mut(&mut scene.textures)
@@ -172,7 +206,9 @@ impl SceneExtractor {
             if matches!(kind, EntityWrite::Inspect | EntityWrite::Local) {
                 // A direct edit can overlap a pose or undo it. The entity row
                 // contains the final value after every writer, including rollback.
-                moved.push((self.transforms.slots[&id], u64::MAX, entity.local));
+                updates
+                    .locals
+                    .push((self.transforms.slots[&id], u64::MAX, entity.local));
             }
             if matches!(kind, EntityWrite::Inspect | EntityWrite::Material)
                 && let Some(material) = &entity.material
@@ -183,14 +219,7 @@ impl SceneExtractor {
             }
         }
 
-        self.propagate_transforms(
-            world,
-            &mut moved,
-            &mut visited,
-            &mut scene,
-            &mut dirty_lights,
-            &rebound,
-        )?;
+        self.propagate_transforms(world, &mut scene, &mut visited, updates, &structural)?;
         for (&key, owner) in &mut self.dependencies.components {
             if dirty_components.contains(key) || owner.changed(&self.transforms) {
                 visited.insert(owner.id);
@@ -210,37 +239,39 @@ impl SceneExtractor {
     fn propagate_transforms(
         &mut self,
         world: &World,
-        moved: &mut Vec<(usize, u64, Mat4)>,
-        visited: &mut Visits,
         scene: &mut RenderScene,
-        dirty_lights: &mut BTreeSet<Id>,
-        rebound: &[usize],
+        visited: &mut Visits,
+        updates: TransformEdits,
+        structural: &BTreeSet<Id>,
     ) -> Result<()> {
+        let TransformEdits {
+            locals: mut moved,
+            lights: mut dirty_lights,
+            rebound,
+        } = updates;
         // Descendants occupy a contiguous range. Install every final local pose before
         // evaluating ranges so a changed child sees its parent's final world transform.
         moved.sort_by_key(|&(slot, version, _)| (slot, std::cmp::Reverse(version)));
         moved.dedup_by_key(|(slot, _, _)| *slot);
-        moved.retain(|&(slot, _, local)| {
-            let cached = &mut self.transforms.rows[slot].local;
-            if *cached == local {
-                return false;
-            }
-            *cached = local;
-            true
-        });
+        moved.retain(|&(slot, _, local)| self.transforms.install_local(slot, local));
         let mut changed_instances: BTreeMap<_, _> = rebound.iter().map(|&i| (i, None)).collect();
         let mut dirty_skins = Vec::new();
-        if !moved.is_empty() {
-            dirty_skins.resize_with(self.dependencies.skin_layouts.len(), DirtyJoints::default);
-        }
-        let mut covered = 0;
-        for &(root, _, _) in moved.iter() {
-            if root < covered {
-                continue;
+        if !moved.is_empty() || self.pending_visual {
+            dirty_skins.resize_with(self.dependencies.skins.len(), DirtyJoints::default);
+            for &(slot, _, _) in moved.iter() {
+                if let Some(users) = self.dependencies.pose_nodes.get(&slot) {
+                    for &(skin, node) in users.entries() {
+                        dirty_skins[skin].indices.push(node);
+                    }
+                }
             }
-            covered = self.transforms.rows[root].end;
-            visited.subtrees.push(root..covered);
-            for slot in root..covered {
+        }
+        visited.subtrees = self.transforms.eager_spans(&moved);
+        for range in &visited.subtrees {
+            for slot in range.clone() {
+                if !self.transforms.live(slot) {
+                    continue;
+                }
                 let id = self.transforms.rows[slot].id;
                 if self.transforms.resolve(slot) {
                     scene.stats.transforms_updated += 1;
@@ -251,7 +282,7 @@ impl SceneExtractor {
                     for &(skin, joint) in t.skins.entries() {
                         let dirty = &mut dirty_skins[skin];
                         dirty.count += 1;
-                        if dirty.count * 2 <= self.dependencies.skin_layouts[skin].1 {
+                        if dirty.count * 2 <= self.dependencies.skins[skin].joint_count {
                             dirty.indices.push(joint);
                         }
                     }
@@ -261,16 +292,65 @@ impl SceneExtractor {
                 }
             }
         }
-        for (index, dirty) in dirty_skins.into_iter().enumerate() {
+        let deferred = if let Some(budget) = &mut self.pose_budget {
+            let mut changed = BTreeSet::new();
+            for (skin, dirty) in self.dependencies.skins.iter().zip(&dirty_skins) {
+                if let Some(space) = &self.palettes[&skin.id].space
+                    && (!space.pending.is_empty() || !dirty.indices.is_empty())
+                {
+                    let actor = self.transforms.rows[space.root].id;
+                    if Some(actor) != self.focused_actor && (budget.eligible)(world, actor) {
+                        changed.insert(actor);
+                    }
+                }
+            }
+            budget.defer(changed)
+        } else {
+            BTreeSet::new()
+        };
+        self.pending_visual = !deferred.is_empty();
+        scene.stats.held_visual_actors = deferred.len();
+        for (index, mut dirty) in dirty_skins.into_iter().enumerate() {
+            let skin = &self.dependencies.skins[index];
+            let len = skin.joint_count;
+            let palette = self
+                .palettes
+                .get_mut(&skin.id)
+                .expect("skin dependency must have a palette");
+            if let Some(space) = &mut palette.space {
+                let root = &self.transforms.rows[space.root];
+                if !space.pending.is_empty() {
+                    dirty.indices.append(&mut space.pending);
+                    dirty.indices.sort_unstable();
+                    dirty.indices.dedup();
+                }
+                let inspected = if deferred.contains(&root.id) {
+                    space.pending = dirty.indices;
+                    0
+                } else {
+                    space.update(
+                        &self.transforms,
+                        &dirty.indices,
+                        &palette.inverse_bind,
+                        &mut palette.matrices,
+                    )
+                };
+                if inspected != 0 || root.version != space.root_version {
+                    space.root_version = root.version;
+                    visited.insert(skin.id);
+                    scene.stats.palette_joints_examined += inspected;
+                    scene.stats.palettes_updated += usize::from(inspected != 0);
+                    for &index in &skin.instances {
+                        changed_instances
+                            .insert(index, Some((palette.matrices.clone(), root.world)));
+                    }
+                }
+                continue;
+            }
             if dirty.count == 0 {
                 continue;
             }
-            let (skin, len) = self.dependencies.skin_layouts[index];
-            visited.insert(skin);
-            let palette = self
-                .palettes
-                .get_mut(&skin)
-                .expect("skin dependency must have a palette");
+            visited.insert(skin.id);
             let matrices = Arc::make_mut(&mut palette.matrices);
             let update = |i: usize| {
                 let transform = &self.transforms.rows[palette.slots[i]];
@@ -287,12 +367,18 @@ impl SceneExtractor {
                 dirty.indices.into_iter().for_each(update);
             }
             scene.stats.palettes_updated += 1;
-            for &user in &self.dependencies.skin_users[&skin] {
-                let index = self.transforms.get(user).unwrap().instance.unwrap();
-                changed_instances.insert(index, Some(palette.matrices.clone()));
+            for &index in &skin.instances {
+                changed_instances.insert(index, Some((palette.matrices.clone(), Mat4::IDENTITY)));
             }
         }
-        scene.stats.instances_updated = changed_instances.len();
+        scene.stats.instances_updated += if structural.is_empty() {
+            changed_instances.len()
+        } else {
+            changed_instances
+                .keys()
+                .filter(|&&i| !structural.contains(&scene.instances[i].id))
+                .count()
+        };
         if !changed_instances.is_empty() {
             let instances = Arc::make_mut(&mut scene.instances);
             for (index, palette) in changed_instances {
@@ -306,8 +392,9 @@ impl SceneExtractor {
                         &instance.gpu_model(),
                     );
                 }
-                if let Some(palette) = palette {
+                if let Some((palette, root)) = palette {
                     instance.palette = Some(palette);
+                    instance.palette_root = root;
                 }
             }
         }
@@ -439,6 +526,19 @@ mod pose_tests {
         world.save(&location)?;
         let reloaded = World::load(&location)?;
         assert_eq!(palettes(&snap(&mut fast, &reloaded)?), palettes(&cold));
+
+        // Removing an earlier unskinned draw shifts both skin users to new instance slots.
+        let first = world
+            .entities
+            .iter()
+            .find_map(|(&id, e)| (e.instance.is_some() && e.skin_binding.is_none()).then_some(id))
+            .unwrap();
+        world.entities.get_mut(&first).unwrap().instance = None;
+        assert!(snap(&mut slow, &world)?.scene.stats.full_rebuild);
+        world.set_local(joints[9], shift(9.))?;
+        let shifted = snap(&mut slow, &world)?;
+        assert_eq!(shifted.scene.stats.instances_updated, 2);
+        assert_eq!(palettes(&shifted), palettes(&snap(&mut fast, &world)?));
         Ok(())
     }
 }

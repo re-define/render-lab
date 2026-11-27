@@ -85,6 +85,7 @@ pub struct FrameProfile {
     pub extract_ms: f64,
     pub build_ms: f64,
     pub compile_ms: f64,
+    pub rdg_template_hit: bool,
     pub rhi_prepare_ms: f64,
     pub acquire_ms: f64,
     pub record_ms: f64,
@@ -107,7 +108,10 @@ pub struct FrameProfile {
     pub image_barriers: usize,
     pub timeline_waits: usize,
     pub timeline_signals: usize,
+    /// Distinct physical queues receiving at least one submission for this frame.
     pub physical_queues: usize,
+    /// Number of queues available to the mapping chosen by the execution policy.
+    pub physical_queue_limit: usize,
     pub wsi_transitions: usize,
     pub wsi_binary_pairs: usize,
 }

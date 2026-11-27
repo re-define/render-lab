@@ -9,7 +9,7 @@ use crate::{
 use anyhow::{Context, Result};
 
 impl RayScene {
-    pub(super) fn probe_inputs(&self, atlas: Resource) -> Result<Vec<Resource>> {
+    pub(in crate::experiments) fn probe_inputs(&self, atlas: Resource) -> Result<Vec<Resource>> {
         Ok(match self {
             Self::Software {
                 nodes,
@@ -68,7 +68,7 @@ impl NativeScene {
         g.pass_in(PassPhase::Lighting, name, trace);
     }
 
-    pub(super) fn probes(
+    pub(in crate::experiments) fn probes(
         &self,
         g: &mut FrameGraph,
         extent: [u32; 2],

@@ -1,5 +1,4 @@
-//! Only the conversion from physical bindings to per-interval hazard trackers is reusable.
-//! Operation validation, dependency ordering, external effects, and barrier selection run anew.
+//! Cache interval expansion on a schedule miss. The per-view schedule cache owns the compiled order.
 use super::*;
 use std::sync::Mutex;
 
@@ -51,15 +50,7 @@ pub(super) fn expand(
     let Some(cache) = cache else {
         return Some(build());
     };
-    let sizes: Vec<_> = graph
-        .subranges
-        .split
-        .iter()
-        .map(|r| match graph.resources[r.0].1 {
-            Storage::Buffer { bytes, .. } => bytes,
-            _ => 0,
-        })
-        .collect();
+    let sizes: Vec<_> = graph.range_sizes().collect();
     {
         let slot = cache.0.lock().unwrap();
         if let Some(entry) = slot.as_ref()
@@ -74,7 +65,11 @@ pub(super) fn expand(
     // Build outside the lock. Concurrent callers may safely publish equivalent or different shapes.
     let result = build();
     let entries = result.uses.iter().map(Vec::len).sum::<usize>();
-    if entries <= 65536 && raw.len() <= 8192 && graph.resources.len() <= 65536 {
+    if entries <= 65536
+        && raw.len() <= 8192
+        && graph.resources.len() <= 65536
+        && graph.subranges.slice_count() <= 65536
+    {
         let next = Entry {
             resources: graph.resources.len(),
             sizes,

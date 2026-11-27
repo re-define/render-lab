@@ -1,12 +1,15 @@
-use super::light_stack::{AddLight, Channel, Contribution, Producer};
+use super::light_stack::{AddLight, Contribution, Producer, Signal};
+use super::light_stack::{
+    denoise::{self, Denoise},
+    diffuse_gi::{self, DiffuseGi},
+};
 use crate::render::FrameGraph;
 use crate::render::rays::Traversal;
-mod diffuse_gi;
 pub(super) mod graph;
 mod ray_scene;
 pub(super) mod studies;
 pub use studies::{forest_study, karst_study, river_shadow_study, silver_study};
-mod scene;
+pub(super) mod scene;
 pub use scene::scene;
 
 use crate::{
@@ -37,15 +40,6 @@ enum Sampling {
     Reference,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-#[repr(u32)]
-enum Denoise {
-    Off,
-    Spatial,
-    Svgf,
-}
-
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum LightSource {
@@ -59,6 +53,8 @@ enum LightSource {
 pub(super) struct Settings {
     #[serde(default)]
     gi: DiffuseGi,
+    #[serde(default)]
+    gi_revision: u64,
     lights: u32,
     candidates: u32,
     reference_samples: u32,
@@ -101,19 +97,11 @@ fn read_ray_backend<'de, D: serde::Deserializer<'de>>(d: D) -> Result<RayBackend
     })
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum DiffuseGi {
-    #[default]
-    Direct,
-    Single,
-    Multi,
-}
-
 impl Default for Settings {
     fn default() -> Self {
         Self {
             gi: DiffuseGi::Direct,
+            gi_revision: 0,
             lights: 16384,
             candidates: 16,
             reference_samples: 256,
@@ -185,7 +173,7 @@ impl Settings {
     fn uses_history(self) -> bool {
         self.sampling == Sampling::Restir
             || self.denoise == Denoise::Svgf
-            || self.gi != DiffuseGi::Direct
+            || matches!(self.gi, DiffuseGi::Single | DiffuseGi::Multi)
     }
     fn validate(self) -> Result<()> {
         ensure!(
@@ -203,6 +191,26 @@ impl Settings {
         ensure!((-6. ..=6.).contains(&self.ev), "EV must be in [-6, 6]");
         Ok(())
     }
+}
+
+pub(super) fn color_revision(raw: &serde_json::Value, composition: u64) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hash = DefaultHasher::new();
+    composition.hash(&mut hash);
+    for key in [
+        "gi",
+        "sampling",
+        "denoise",
+        "rays",
+        "ev",
+        "lights",
+        "candidates",
+        "reference_samples",
+        "light_source",
+    ] {
+        raw.get(key).hash(&mut hash);
+    }
+    hash.finish()
 }
 
 pub(super) fn read(world: &World) -> Result<(Id, Settings)> {
@@ -254,11 +262,13 @@ pub(super) fn validate_device(world: &World, caps: crate::rhi::RayCapabilities) 
 }
 pub fn command(engine: &mut Engine, args: &str) -> Result<String> {
     let (id, mut cfg) = read(&engine.world)?;
+    let previous_cfg = cfg;
     let words: Vec<_> = args.split_whitespace().collect();
     let mut selected = args;
     match words.as_slice() {
         ["gi", "direct"] => cfg.gi = DiffuseGi::Direct,
         ["gi", "single"] => cfg.gi = DiffuseGi::Single,
+        ["gi", "uncached"] => cfg.gi = DiffuseGi::Uncached,
         ["gi", "multi"] => cfg.gi = DiffuseGi::Multi,
         ["uniform"] => cfg.sampling = Sampling::Uniform,
         ["ris"] => cfg.sampling = Sampling::Ris,
@@ -309,7 +319,7 @@ pub fn command(engine: &mut Engine, args: &str) -> Result<String> {
         ["history-stats", "off"] => cfg.history_stats = false,
         ["camera", view] => engine.camera = camera(view)?,
         _ => bail!(
-            "restir gi direct/single/multi · restir rays auto/hardware/inline/software/toggle · restir uniform/ris/reuse/reference · restir denoise off/spatial/svgf · restir source auto/scene/bank · restir lights N · restir candidates N · restir samples N · restir ev EV · restir camera overview/contact · restir history-stats on/off"
+            "restir gi direct/single/multi/uncached · restir rays auto/hardware/inline/software/toggle · restir uniform/ris/reuse/reference · restir denoise off/spatial/svgf · restir source auto/scene/bank · restir lights N · restir candidates N · restir samples N · restir ev EV · restir camera overview/contact · restir history-stats on/off"
         ),
     }
     cfg.validate()?;
@@ -320,12 +330,13 @@ pub fn command(engine: &mut Engine, args: &str) -> Result<String> {
             .first_raw_component(super::vegetation::SETTING)
             .map(|(_, v)| v),
     )?;
-    Arc::make_mut(&mut engine.world)
-        .entities
-        .get_mut(&id)
-        .unwrap()
-        .components
-        .insert(SETTING.into(), serde_json::to_value(cfg)?);
+    if previous_cfg.gi != cfg.gi {
+        cfg.gi_revision = cfg.gi_revision.wrapping_add(1);
+    }
+    let settings = serde_json::to_value(cfg)?;
+    if settings != serde_json::to_value(previous_cfg)? {
+        Arc::make_mut(&mut engine.world).set_setting(id, SETTING, settings);
+    }
     Ok(format!("restir {selected}"))
 }
 
@@ -372,7 +383,7 @@ impl Producer for Restir {
         &'a self,
         s: &'a Snapshot,
         surfaces: &[PosedSurface<'_>],
-    ) -> Result<AddLight<'a>> {
+    ) -> Result<Vec<AddLight<'a>>> {
         let cfg = decode(
             s.scene
                 .setting(SETTING)
@@ -387,44 +398,38 @@ impl Restir {
         s: &'a Snapshot,
         surfaces: &[PosedSurface<'_>],
         cfg: Settings,
-    ) -> Result<AddLight<'a>> {
+    ) -> Result<Vec<AddLight<'a>>> {
         let backend = cfg.selected_rays(s.ray_caps, s.scene.setting(super::vegetation::SETTING))?;
         let rigid = (backend == Traversal::Software)
             .then(|| self.shadow.get(&s.scene, surfaces, cfg.indirect()))
             .transpose()?
             .unwrap_or_default();
-        Ok(Box::new(move |g, inputs| {
-            if s.extent == [1920, 1080]
-                && cfg.rays == RayBackend::Hardware
-                && cfg.gi == DiffuseGi::Multi
-                && cfg.sampling == Sampling::Restir
-                && cfg.denoise == Denoise::Svgf
-                && s.temporal
-                    .as_ref()
-                    .is_some_and(|frame| frame.standard_taa())
-                && let Some(raw) = s.scene.setting(super::vegetation::SETTING)
-            {
-                use super::vegetation::{BrickRaster, Mode, Preset, Settings as Plants};
-                let plants = Plants::decode(raw)?;
-                if matches!(plants.preset, Preset::Karst)
-                    && matches!(plants.mode, Mode::Auto)
-                    && plants.raster == BrickRaster::Auto
-                    && !plants.mega_shadows
-                    && !plants.visualize
-                {
-                    // Device-specific result of the 1080p karst zoom replay. The queue override wins.
-                    g.serial_profile = Some(("NVIDIA GeForce RTX 5070", s.extent));
-                }
-            }
-            let (direct, controls, indirect) =
-                graph::add_light(g, s, self, cfg, backend, inputs, rigid)?;
-            Ok(Contribution {
-                channel: Channel::Direct,
-                resources: (direct, controls),
-                indirect_diffuse: Some(indirect),
-                backdrop: None,
-            })
-        }))
+        Ok(vec![
+            AddLight::new(
+                "Lighting surfaces",
+                &[],
+                Signal::Surfaces,
+                move |g, inputs, _| {
+                    Ok(Contribution::Surfaces(Box::new(graph::receivers(
+                        g, s, self, cfg, backend, inputs, rigid,
+                    )?)))
+                },
+            ),
+            AddLight::new(
+                "Many-light sampling",
+                &[Signal::Surfaces],
+                Signal::RawDirect,
+                move |g, _, products| {
+                    Ok(Contribution::RawDirect(graph::sample_direct(
+                        g,
+                        products.surfaces()?,
+                        cfg,
+                    )))
+                },
+            ),
+            denoise::stage(cfg.denoise),
+            diffuse_gi::stage(s, cfg.gi),
+        ])
     }
 }
 #[cfg(test)]

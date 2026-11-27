@@ -1,4 +1,4 @@
-//! Stream completed BGRA viewport frames to an encoder with bounded memory.
+//! Save BGRA viewport readbacks as still images or bounded-memory video recordings.
 use crate::rhi::Frame;
 use anyhow::{Context, Result, bail, ensure};
 use std::{
@@ -14,6 +14,22 @@ use std::{
     time::Instant,
 };
 use tempfile::TempPath;
+
+/// Save a tightly packed BGRA8 readback at its source orientation. The extension selects the encoder.
+pub fn save_capture(path: impl AsRef<Path>, extent: [u32; 2], mut pixels: Vec<u8>) -> Result<()> {
+    let bytes = (extent[0] as usize)
+        .checked_mul(extent[1] as usize)
+        .and_then(|count| count.checked_mul(4));
+    ensure!(
+        !extent.contains(&0) && bytes == Some(pixels.len()),
+        "invalid BGRA capture extent or byte count"
+    );
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    image::save_buffer(path, &pixels, extent[0], extent[1], image::ColorType::Rgba8)?;
+    Ok(())
+}
 
 fn format(path: &Path) -> Result<&'static str> {
     match path
@@ -378,6 +394,18 @@ impl Drop for LiveRecording {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn png_capture_preserves_orientation_alpha_and_color() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("capture.png");
+        save_capture(&file, [1, 2], vec![3, 2, 1, 255, 6, 5, 4, 128])?;
+        let pixels = image::open(&file)?.into_rgba8();
+        assert_eq!(pixels.dimensions(), (1, 2));
+        assert_eq!(pixels.into_raw(), [1, 2, 3, 255, 4, 5, 6, 128]);
+        assert!(save_capture(&file, [1, 2], vec![0; 4]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn gaps_repeat_prior_pixels_including_dropped_tail() -> Result<()> {

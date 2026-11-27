@@ -3,6 +3,53 @@ use vk::PipelineStageFlags2 as Stage;
 
 use std::ops::Range;
 
+/// Choose a physical mapping from the live GPU workload. Explicit device queue counts
+/// are also the reference paths for timestamped comparisons.
+pub(super) fn queue_count_for_frame(
+    device: &str,
+    available: usize,
+    explicit: bool,
+    plan: &Plan,
+) -> usize {
+    if explicit || available == 1 {
+        return available;
+    }
+    if plan
+        .steps
+        .windows(2)
+        .all(|pair| pair[1].parents.contains(&pair[0].index))
+    {
+        return 1;
+    }
+    // The 1080p timestamp replay on this GPU favors one queue for raster Hi-Z +
+    // conventional RT + denoise + temporal post. CLAS and vendor upscaling have
+    // different scheduling costs and retain their own mapping.
+    if device == "NVIDIA GeForce RTX 5070" && plan.graph.extent == [1920, 1080] {
+        use crate::rdg::PassPhase;
+        let mut pyramids = false;
+        let mut ray_pipeline = false;
+        let mut denoise = false;
+        let mut post = false;
+        for pass in &plan.graph.passes {
+            match pass.op {
+                Op::BuildClusters { .. } | Op::Dlss(_) => return available,
+                Op::TraceRays { .. } => ray_pipeline = true,
+                _ => {}
+            }
+            match pass.phase {
+                PassPhase::Pyramids => pyramids = true,
+                PassPhase::Denoise => denoise = true,
+                PassPhase::Post => post = true,
+                _ => {}
+            }
+        }
+        if pyramids && ray_pipeline && denoise && post {
+            return 1;
+        }
+    }
+    available
+}
+
 /// A command buffer never straddles a semaphore signal or a vendor call.
 pub(super) struct RecordingLayout {
     pub chunks: Vec<Range<usize>>,
@@ -363,6 +410,35 @@ impl Drop for Timelines {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_policy_preserves_explicit_replay_and_independent_work() -> Result<()> {
+        let make = |chain: bool| -> Result<Plan> {
+            let mut g = Graph::new([1, 1]);
+            for _ in 0..3 {
+                let id = g.pass(
+                    "dispatch",
+                    Op::Compute {
+                        program: Dispatch {
+                            shader: Shader::Compute(&[]),
+                            bindings: vec![],
+                            push: vec![],
+                        },
+                        groups: [1; 3],
+                    },
+                );
+                if chain && id != 0 {
+                    g.passes[id].after.push(id - 1);
+                }
+            }
+            g.compile()
+        };
+        let serial = make(true)?;
+        assert_eq!(queue_count_for_frame("test", 3, false, &serial), 1);
+        assert_eq!(queue_count_for_frame("test", 3, true, &serial), 3);
+        assert_eq!(queue_count_for_frame("test", 3, false, &make(false)?), 3);
+        Ok(())
+    }
 
     #[test]
     fn recording_chunks_cover_every_pass_without_crossing_signals_or_sdk_calls() {

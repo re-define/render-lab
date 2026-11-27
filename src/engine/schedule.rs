@@ -274,8 +274,30 @@ impl Entry {
     }
 }
 
+/// Wall-clock intervals in the most recent tick, summed across its fixed substeps.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct TickProfile {
+    pub binding: Duration,
+    pub evaluate: Duration,
+    /// Exclusive of rollback preparation.
+    pub commit: Duration,
+    pub capture_undo: Duration,
+    pub rollback: Duration,
+}
+fn timed<T>(counter: Option<&mut Duration>, work: impl FnOnce() -> T) -> T {
+    if let Some(counter) = counter {
+        let start = std::time::Instant::now();
+        let result = work();
+        *counter += start.elapsed();
+        result
+    } else {
+        work()
+    }
+}
 #[derive(Default)]
 pub struct Schedule {
+    profiling: bool,
+    profile: TickProfile,
     phases: Vec<Phase>,
     compiled: OnceLock<std::result::Result<Plan, String>>,
 }
@@ -297,6 +319,7 @@ struct Membership {
     entries: std::ops::Range<usize>,
     component: &'static str,
     owners: Vec<Id>,
+    hierarchy_source: Arc<()>,
     hierarchy_revision: u64,
     is_current: BindingCheck,
     bind: Box<BindSystems>,
@@ -305,7 +328,10 @@ impl Phase {
     fn refresh_membership(&mut self, world: &World) -> Result<()> {
         for membership in &mut self.memberships {
             let owners = world.entities.component_owners(membership.component);
-            if owners == membership.owners
+            if Arc::ptr_eq(
+                &membership.hierarchy_source,
+                world.entities.hierarchy_source(),
+            ) && owners == membership.owners
                 && membership.hierarchy_revision == world.entities.hierarchy_revision()
                 && (membership.is_current)(world)?
             {
@@ -326,6 +352,7 @@ impl Phase {
                 *entry = new;
             }
             membership.is_current = check;
+            membership.hierarchy_source = world.entities.hierarchy_source().clone();
             membership.hierarchy_revision = world.entities.hierarchy_revision();
             membership.owners.clear();
             membership.owners.extend_from_slice(owners);
@@ -461,6 +488,7 @@ impl Schedule {
             entries: start..phase.entries.len(),
             component,
             owners: world.entities.component_owners(component).to_vec(),
+            hierarchy_source: world.entities.hierarchy_source().clone(),
             hierarchy_revision: world.entities.hierarchy_revision(),
             is_current,
             bind: Box::new(bind),
@@ -562,11 +590,21 @@ impl Schedule {
         }
         out
     }
+    pub fn set_profiling(&mut self, enabled: bool) {
+        self.profiling = enabled;
+        self.profile = TickProfile::default();
+    }
+    pub fn tick_profile(&self) -> Option<TickProfile> {
+        self.profiling.then_some(self.profile)
+    }
     pub fn tick(&mut self, world: &mut Arc<World>, dt: f32, pool: &ThreadPool) -> Result<()> {
         anyhow::ensure!(dt.is_finite() && dt >= 0., "invalid simulation time");
         self.validate()?;
         let plan = self.compiled.get_mut().unwrap().as_mut().unwrap();
         plan.reports.take();
+        self.profile = TickProfile::default();
+        let profile = &mut self.profile;
+        let enabled = self.profiling;
         // Credit all fixed domains before work. On a failed earlier domain, retrying
         // with dt=0 must still advance every subsequent fixed domain to this tick.
         for phase in &mut self.phases {
@@ -583,31 +621,37 @@ impl Schedule {
                 .get(first + 1)
                 .is_some_and(clocks::frame_candidate)
             {
-                clocks::bind_frame_wave(&self.phases[first..], &mut plan.phases[first..], world)?
+                timed(enabled.then_some(&mut profile.binding), || {
+                    clocks::bind_frame_wave(&self.phases[first..], &mut plan.phases[first..], world)
+                })?
             } else {
                 0
             };
             if wave > 1 {
                 let phases = &mut self.phases[first..first + wave];
-                let edits = pool.install(|| {
-                    phases
-                        .par_iter()
-                        .zip(&plan.phases[first..first + wave])
-                        .map(|(phase, segments)| {
-                            phase.entries[0].prepare(
-                                world,
-                                dt,
-                                segments[0].bindings.get(&0).map(Arc::as_ref),
-                            )
-                        })
-                        .collect::<Result<Vec<_>>>()
+                let edits = timed(enabled.then_some(&mut profile.evaluate), || {
+                    pool.install(|| {
+                        phases
+                            .par_iter()
+                            .zip(&plan.phases[first..first + wave])
+                            .map(|(phase, segments)| {
+                                phase.entries[0].prepare(
+                                    world,
+                                    dt,
+                                    segments[0].bindings.get(&0).map(Arc::as_ref),
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
                 })?;
-                for (phase, changes) in phases.iter_mut().zip(edits) {
-                    for change in changes {
-                        change.apply(Arc::make_mut(world), None);
+                timed(enabled.then_some(&mut profile.commit), || {
+                    for (phase, changes) in phases.iter_mut().zip(edits) {
+                        for change in changes {
+                            change.apply(Arc::make_mut(world), None);
+                        }
+                        phase.completed += 1;
                     }
-                    phase.completed += 1;
-                }
+                });
                 first += wave;
                 continue;
             }
@@ -617,8 +661,18 @@ impl Schedule {
                 None => (1, dt),
             };
             for _ in 0..steps {
-                p.refresh_membership(world)?;
-                run_substep(p, &mut plan.phases[first], world, interval, pool)?;
+                timed(enabled.then_some(&mut profile.binding), || {
+                    p.refresh_membership(world)
+                })?;
+                run_substep(
+                    p,
+                    &mut plan.phases[first],
+                    world,
+                    interval,
+                    pool,
+                    enabled,
+                    profile,
+                )?;
                 if let Some(f) = &mut p.fixed {
                     f.remainder = (f.remainder - f.seconds).max(0.);
                 }
@@ -636,38 +690,55 @@ fn run_substep(
     world: &mut Arc<World>,
     dt: f32,
     pool: &ThreadPool,
+    enabled: bool,
+    profile: &mut TickProfile,
 ) -> Result<()> {
     let mut undo = Vec::new();
     let segment_count = segments.len();
     let result = (|| {
         for (index, segment) in segments.iter_mut().enumerate() {
-            segment.bind(phase, world, None)?;
+            timed(enabled.then_some(&mut profile.binding), || {
+                segment.bind(phase, world, None)
+            })?;
             for (level, batch) in segment.batches.iter().enumerate() {
-                let edits = pool.install(|| {
-                    batch
-                        .ids
-                        .par_iter()
-                        .map(|&i| {
-                            phase.entries[i].prepare(
-                                world,
-                                dt,
-                                segment.bindings.get(&i).map(Arc::as_ref),
-                            )
-                        })
-                        .collect::<Result<Vec<_>>>()
+                let edits = timed(enabled.then_some(&mut profile.evaluate), || {
+                    pool.install(|| {
+                        batch
+                            .ids
+                            .par_iter()
+                            .map(|&i| {
+                                phase.entries[i].prepare(
+                                    world,
+                                    dt,
+                                    segment.bindings.get(&i).map(Arc::as_ref),
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
                 })?;
                 let more = index + 1 < segment_count || level + 1 < segment.batches.len();
-                for change in edits.into_iter().flatten() {
-                    change.apply(Arc::make_mut(world), more.then_some(&mut undo));
-                }
+                let mut capture = Duration::ZERO;
+                timed(enabled.then_some(&mut profile.commit), || {
+                    for change in edits.into_iter().flatten() {
+                        change.apply_timed(
+                            Arc::make_mut(world),
+                            more.then_some(&mut undo),
+                            enabled.then_some(&mut capture),
+                        );
+                    }
+                });
+                profile.capture_undo += capture;
+                profile.commit -= capture;
             }
         }
         Ok(())
     })();
     if result.is_err() {
-        for revert in undo.into_iter().rev() {
-            revert(Arc::make_mut(world));
-        }
+        timed(enabled.then_some(&mut profile.rollback), || {
+            for revert in undo.into_iter().rev() {
+                revert(Arc::make_mut(world));
+            }
+        });
     }
     result
 }

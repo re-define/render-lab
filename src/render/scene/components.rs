@@ -55,9 +55,10 @@ impl SnapshotContext<'_> {
     }
 
     pub fn transform(&mut self, id: Id) -> Option<Mat4> {
-        let entry = self.transforms.get(id);
-        self.watched.insert(id, entry.map(|t| t.version));
-        entry.map(|t| t.world)
+        let slot = self.transforms.slots.get(&id).copied();
+        self.watched
+            .insert(id, slot.map(|s| self.transforms.world_version(s)));
+        slot.map(|s| self.transforms.world_matrix(s))
     }
 }
 
@@ -98,9 +99,13 @@ impl ComponentOwner {
     }
 
     pub fn changed(&self, transforms: &TransformCache) -> bool {
-        self.watched
-            .iter()
-            .any(|(id, version)| transforms.get(*id).map(|t| t.version) != *version)
+        self.watched.iter().any(|(id, version)| {
+            transforms
+                .slots
+                .get(id)
+                .map(|&s| transforms.world_version(s))
+                != *version
+        })
     }
 
     pub fn refresh(
@@ -164,6 +169,9 @@ impl SceneExtractor {
         Ok(Self {
             registry,
             transforms: Default::default(),
+            pose_budget: None,
+            focused_actor: None,
+            pending_visual: false,
             palettes: Default::default(),
             previous: None,
             cursor: None,

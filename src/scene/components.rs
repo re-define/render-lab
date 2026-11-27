@@ -17,13 +17,32 @@ impl<T: Serialize + Send + Sync + 'static> Stored for T {
 }
 
 #[derive(Clone, Default)]
-pub(super) struct RuntimeComponents(BTreeMap<(Id, &'static str), Arc<dyn Stored>>);
+pub(super) struct RuntimeComponents {
+    values: BTreeMap<(Id, &'static str), Arc<dyn Stored>>,
+    binding_edits: BTreeMap<&'static str, u64>,
+}
 impl RuntimeComponents {
+    pub(super) fn binding_changed(&mut self, key: &'static str) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        self.binding_edits
+            .insert(key, NEXT.fetch_add(1, Ordering::Relaxed));
+    }
     pub(super) fn remove_component(&mut self, id: Id, key: &'static str) {
-        self.0.remove(&(id, key));
+        self.values.remove(&(id, key));
     }
     pub(super) fn remove_entity(&mut self, entity: Id) {
-        self.0.retain(|(id, _), _| *id != entity);
+        // Removing the highest ID can make the next spawn reuse it. Clear only that ID's values.
+        let from = std::ops::Bound::Included((entity, ""));
+        let to = entity
+            .checked_add(1)
+            .map_or(std::ops::Bound::Unbounded, |id| {
+                std::ops::Bound::Excluded((id, ""))
+            });
+        let keys: Vec<_> = self.values.range((from, to)).map(|(&key, _)| key).collect();
+        for key in keys {
+            self.values.remove(&key);
+        }
     }
 }
 
@@ -34,7 +53,7 @@ impl World {
         key: &'static str,
     ) -> impl FnOnce(&mut Self) + Send + use<> {
         let previous = self.entities[&id].components.get(key).cloned();
-        let typed = self.runtime.0.get(&(id, key)).cloned();
+        let typed = self.runtime.values.get(&(id, key)).cloned();
         move |world| {
             let row = world
                 .entities
@@ -50,7 +69,7 @@ impl World {
             }
             match typed {
                 Some(value) => {
-                    world.runtime.0.insert((id, key), value);
+                    world.runtime.values.insert((id, key), value);
                 }
                 None => world.runtime.remove_component(id, key),
             }
@@ -80,7 +99,7 @@ impl World {
         key: &'static str,
         raw: &Value,
     ) -> Result<Cow<'_, T>> {
-        if let Some(value) = self.runtime.0.get(&(id, key)) {
+        if let Some(value) = self.runtime.values.get(&(id, key)) {
             return Ok(Cow::Borrowed(
                 value
                     .value()
@@ -97,11 +116,24 @@ impl World {
         key: &'static str,
         value: T,
     ) {
+        self.runtime.binding_changed(key);
+        self.set_bound_state(id, key, value);
+    }
+    pub(crate) fn binding_version(&self, key: &'static str) -> u64 {
+        self.runtime.binding_edits.get(key).copied().unwrap_or(0)
+    }
+    /// Runtime state produced from an existing binding. New membership still invalidates the owner index.
+    pub(crate) fn set_bound_state<T: Serialize + Send + Sync + 'static>(
+        &mut self,
+        id: Id,
+        key: &'static str,
+        value: T,
+    ) {
         self.mark_component(id, key)
             .components
             .entry(key.into())
             .or_insert(Value::Null);
-        self.runtime.0.insert((id, key), Arc::new(value));
+        self.runtime.values.insert((id, key), Arc::new(value));
     }
 
     pub(crate) fn hydrate_components<
@@ -115,7 +147,7 @@ impl World {
             .component_owners(key)
             .iter()
             .copied()
-            .filter(|id| !self.runtime.0.contains_key(&(*id, key)))
+            .filter(|id| !self.runtime.values.contains_key(&(*id, key)))
             .map(|id| {
                 serde_json::from_value::<T>(self.entities[&id].components[key].clone())
                     .map(|value| (id, value))
@@ -147,12 +179,12 @@ impl World {
             entities: &'a BTreeMap<Id, Entity>,
         }
         let owned;
-        let entities: &BTreeMap<Id, Entity> = if self.runtime.0.is_empty() {
+        let entities: &BTreeMap<Id, Entity> = if self.runtime.values.is_empty() {
             &self.entities
         } else {
             owned = {
                 let mut entities = BTreeMap::clone(&self.entities);
-                for (&(id, key), value) in &self.runtime.0 {
+                for (&(id, key), value) in &self.runtime.values {
                     if let Some(raw) = entities
                         .get_mut(&id)
                         .and_then(|e| e.components.get_mut(key))

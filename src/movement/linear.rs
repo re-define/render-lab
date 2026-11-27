@@ -76,7 +76,39 @@ impl World {
         providers: &'static [crate::scene::RootWriter],
     ) -> Result<()> {
         self.motion_writers = providers;
-        self.validate_motion_components()?;
+        // Stored JSON is decoded once before the policy and body validation passes.
+        self.hydrate_components::<MotionPolicy>(MOTION_POLICY)?;
+        self.hydrate_components::<LinearBody>(LINEAR_BODY)?;
+        for id in self.validate_motion_components()? {
+            self.set_linear_body(id, LinearBody::default())?;
+        }
+        Ok(())
+    }
+
+    /// Return ordinary simulated roots which still need their implicit linear body.
+    pub(crate) fn validate_motion_components(&self) -> Result<Vec<Id>> {
+        let mut claimed = std::collections::BTreeMap::new();
+        for writer in self.motion_writers {
+            for &id in self.entities.component_owners(writer.component) {
+                if writer.active(&self.entities[&id])
+                    && let Some(other) = claimed.insert(id, writer.component)
+                {
+                    anyhow::bail!(
+                        "entity {id} has conflicting root motion providers {other} and {}",
+                        writer.component
+                    );
+                }
+            }
+        }
+        for &id in self.entities.component_owners(LINEAR_BODY) {
+            self.linear_body(id)?
+                .context("missing linear body")?
+                .validate()?;
+            ensure!(
+                self.root_provider(&self.entities[&id]).is_none(),
+                "entity {id} has conflicting root motion providers"
+            );
+        }
         let mut ordinary = Vec::new();
         for &id in self.entities.component_owners(MOTION_POLICY) {
             let policy = self.motion_policy(id, MotionPolicy::STATIC)?;
@@ -93,41 +125,7 @@ impl World {
                 None => {}
             }
         }
-        for id in ordinary {
-            self.set_linear_body(id, LinearBody::default())?;
-        }
-        // Restore typed values to avoid JSON deserialization on subsequent ticks.
-        self.hydrate_components::<MotionPolicy>(MOTION_POLICY)?;
-        self.hydrate_components::<LinearBody>(LINEAR_BODY)
-    }
-
-    pub(crate) fn validate_motion_components(&self) -> Result<()> {
-        let mut claimed = std::collections::BTreeMap::new();
-        for writer in self.motion_writers {
-            for &id in self.entities.component_owners(writer.component) {
-                if writer.active(&self.entities[&id])
-                    && let Some(other) = claimed.insert(id, writer.component)
-                {
-                    anyhow::bail!(
-                        "entity {id} has conflicting root motion providers {other} and {}",
-                        writer.component
-                    );
-                }
-            }
-        }
-        for &id in self.entities.component_owners(MOTION_POLICY) {
-            self.motion_policy(id, MotionPolicy::STATIC)?;
-        }
-        for &id in self.entities.component_owners(LINEAR_BODY) {
-            self.linear_body(id)?
-                .context("missing linear body")?
-                .validate()?;
-            ensure!(
-                self.root_provider(&self.entities[&id]).is_none(),
-                "entity {id} has conflicting root motion providers"
-            );
-        }
-        Ok(())
+        Ok(ordinary)
     }
 }
 

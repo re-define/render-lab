@@ -48,6 +48,7 @@ impl LocalPose {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Write {
+    Structure,
     Inspect,
     Local,
     Material,
@@ -168,6 +169,12 @@ pub struct Entities {
     rows: BTreeMap<Id, Entity>,
     #[serde(skip)]
     hierarchy_revision: u64,
+    // Monotonically allocated IDs use generation zero. Reused or explicitly inserted
+    // IDs below the high-water mark get a distinct lifetime for motion history.
+    #[serde(skip)]
+    highest_id: Id,
+    #[serde(skip)]
+    incarnations: HashMap<Id, u64>,
     #[serde(skip)]
     journal: Journal,
     #[serde(skip)]
@@ -178,6 +185,8 @@ impl Clone for Entities {
         Self {
             rows: self.rows.clone(),
             hierarchy_revision: self.hierarchy_revision,
+            highest_id: self.highest_id,
+            incarnations: self.incarnations.clone(),
             journal: Default::default(),
             owners: Default::default(),
         }
@@ -198,6 +207,9 @@ impl<'a> IntoIterator for &'a Entities {
 }
 impl Entities {
     /// Raw row edits may change a name or parent. Typed value and local-pose updates preserve this revision.
+    pub(crate) fn hierarchy_source(&self) -> &Arc<()> {
+        &self.journal.identity
+    }
     pub(crate) fn hierarchy_revision(&self) -> u64 {
         self.hierarchy_revision
     }
@@ -319,17 +331,60 @@ impl Entities {
         self.journal.write(id, kind);
         Some(row)
     }
-    pub fn insert(&mut self, id: Id, entity: Entity) -> Option<Entity> {
+    pub(crate) fn plain_leaf(e: &Entity) -> bool {
+        (e.instance.is_some() || e.light.is_some())
+            && e.components.is_empty()
+            && e.mesh.is_none()
+            && e.geometry_assets.is_none()
+            && e.skin.is_none()
+            && e.skin_binding.is_none()
+            && e.texture.is_none()
+            && e.material.is_none()
+            && e.gaussian_payload.is_none()
+            && e.animation.is_none()
+            && e.meshlets.is_none()
+            && e.hierarchy.is_none()
+            && e.topology.is_none()
+            && e.plant.is_none()
+    }
+    fn structure_changed(&mut self, id: Id, sparse: bool) {
         self.hierarchy_revision = self.hierarchy_revision.wrapping_add(1);
-        self.owners.take();
-        self.journal.invalidate();
-        self.rows.insert(id, entity)
+        if sparse {
+            self.journal.write(id, Write::Structure);
+        } else {
+            self.owners.take();
+            self.journal.invalidate();
+        }
+    }
+    pub(crate) fn incarnation(&self, id: Id) -> u64 {
+        self.incarnations.get(&id).copied().unwrap_or(0)
+    }
+    fn remember_highest_id(&mut self) {
+        // Archives store semantic IDs but omit lifetime tokens. Observe their maximum
+        // before any deletion, even when the first operation after loading is a remove.
+        if self.highest_id == 0 {
+            self.highest_id = self.rows.last_key_value().map_or(0, |(&id, _)| id);
+        }
+    }
+    pub fn insert(&mut self, id: Id, entity: Entity) -> Option<Entity> {
+        self.remember_highest_id();
+        if id <= self.highest_id {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            self.incarnations
+                .insert(id, NEXT.fetch_add(1, Ordering::Relaxed));
+        } else {
+            self.highest_id = id;
+        }
+        let sparse = Self::plain_leaf(&entity);
+        let old = self.rows.insert(id, entity);
+        self.structure_changed(id, sparse && old.as_ref().is_none_or(Self::plain_leaf));
+        old
     }
     pub fn remove(&mut self, id: &Id) -> Option<Entity> {
+        self.remember_highest_id();
         let row = self.rows.remove(id)?;
-        self.hierarchy_revision = self.hierarchy_revision.wrapping_add(1);
-        self.owners.take();
-        self.journal.invalidate();
+        self.incarnations.remove(id);
+        self.structure_changed(*id, Self::plain_leaf(&row));
         Some(row)
     }
     pub fn values_mut(&mut self) -> std::collections::btree_map::ValuesMut<'_, Id, Entity> {
@@ -348,7 +403,9 @@ impl Entities {
         self.hierarchy_revision = self.hierarchy_revision.wrapping_add(1);
         self.owners.take();
         self.journal.invalidate();
-        self.rows.retain(keep)
+        self.remember_highest_id();
+        self.rows.retain(keep);
+        self.incarnations.retain(|id, _| self.rows.contains_key(id));
     }
 }
 impl World {
@@ -412,6 +469,7 @@ impl World {
         key: &'static str,
         value: Value,
     ) -> Option<()> {
+        self.runtime.binding_changed(key);
         self.runtime.remove_component(id, key);
         self.entities
             .edit(id, Write::Component(key))?

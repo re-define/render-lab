@@ -18,7 +18,7 @@ mod scene;
 use glam::Vec3;
 pub use scene::scene;
 use std::sync::Arc;
-const SETTING: &str = "lab.composition";
+pub(super) const SETTING: &str = "lab.composition";
 const LAYER: &str = "lab.composition.layer";
 pub(crate) const HIDDEN: &str = "lab.render.hidden";
 
@@ -37,7 +37,24 @@ pub(super) fn snapshot_layer_enabled(
     layer_enabled(context.first_setting(SETTING), layer)
 }
 
-fn layer_enabled(settings: Option<&serde_json::Value>, layer: &str) -> bool {
+pub(super) fn color_revision(scene: &crate::render::RenderScene) -> u64 {
+    let layout = scene
+        .setting(SETTING)
+        .and_then(|cfg| cfg["color_revision"].as_u64())
+        .unwrap_or(0);
+    scene
+        .setting(restir::SETTING)
+        .map_or(layout, |raw| restir::color_revision(raw, layout))
+}
+
+pub(super) fn light_revision(scene: &crate::render::RenderScene, layer: &str) -> u64 {
+    scene
+        .setting(SETTING)
+        .and_then(|cfg| cfg["light_revisions"][layer].as_u64())
+        .unwrap_or(0)
+}
+
+pub(super) fn layer_enabled(settings: Option<&serde_json::Value>, layer: &str) -> bool {
     settings
         .and_then(|v| v.get(layer))
         .and_then(|v| v.as_bool())
@@ -165,6 +182,20 @@ struct Modules {
     layers: Contributors,
 }
 impl Technique for Modules {
+    fn color_revision(&self, scene: &crate::render::RenderScene) -> u64 {
+        color_revision(scene)
+    }
+    fn prepare_feature(
+        &self,
+        feature: &str,
+        world: &World,
+        tasks: &rayon::ThreadPool,
+    ) -> Result<()> {
+        if let Some(stack) = &self.lights {
+            stack.prepare_feature(feature, world, tasks)?;
+        }
+        Ok(())
+    }
     fn needs_surface_motion(&self, s: &Snapshot) -> bool {
         self.lights
             .as_ref()
@@ -212,7 +243,7 @@ impl Technique for Modules {
             s,
             |g, t| {
                 g.products.request_ray_proxies |=
-                    self.lights.as_ref().is_some_and(|l| l.uses_shadow_rays());
+                    self.lights.as_ref().is_some_and(|l| l.uses_shadow_rays(s));
                 g.products.instance_visits += visits;
                 let draw = |g: &mut FrameGraph, t: &mut crate::render::Targets| {
                     if let Some(draw) = &self.ordinary {
@@ -274,6 +305,29 @@ pub fn command(engine: &mut Engine, arg: &str) -> Result<String> {
     }
     let mut config = config.clone();
     config[*layer] = active.into();
+    if let Some(registration) = light_stack::REGISTRY.iter().find(|r| r.feature == *layer) {
+        if active {
+            ensure!(
+                engine.world.first_raw_component(registration.key).is_some(),
+                "scene is missing {} for {layer}",
+                registration.key
+            );
+            if let Some(check) = registration.validate_device {
+                check(&engine.world, engine.ray_caps)?;
+            }
+            engine
+                .technique
+                .prepare_feature(layer, &engine.world, &engine.tasks)?;
+        }
+        let revision = config["color_revision"]
+            .as_u64()
+            .unwrap_or(0)
+            .wrapping_add(1);
+        config["color_revision"] = revision.into();
+        config["light_revisions"][*layer] = revision.into();
+        Arc::make_mut(&mut engine.world).set_setting(id, SETTING, config);
+        return Ok(format!("{layer} {state}"));
+    }
     let mut world = (*engine.world).clone();
     world.clocks = engine.schedule.checkpoints(&world);
     world.set_setting(id, SETTING, config);
@@ -290,9 +344,8 @@ pub fn command(engine: &mut Engine, arg: &str) -> Result<String> {
     }
     world.validate()?;
     let prepared = super::SceneConfiguration::prepare(&world, &engine.tasks, engine.ray_caps)?;
-    let lighting_only = light_stack::REGISTRY.iter().any(|r| r.feature == *layer);
     engine.world = Arc::new(world);
-    prepared.apply_layers(engine, lighting_only);
+    prepared.apply_layers(engine);
     Ok(format!("{layer} {state}"))
 }
 
@@ -302,10 +355,95 @@ mod tests {
     use crate::render::post::{Mode, Sequence, Settings};
 
     #[test]
+    #[ignore = "compares three actual Vulkan readbacks from the confluence scene"]
+    fn ibl_hot_switch_changes_submitted_frames_at_fixed_time() -> Result<()> {
+        use std::time::{Duration, Instant};
+        let mut engine = super::super::open(scene()?)?;
+        engine.select_post(Mode::Off)?;
+        command(&mut engine, "restir off")?;
+        command(&mut engine, "water off")?;
+        let mut pixels = Vec::new();
+        for (state, label) in [("ibl on", "on"), ("ibl off", "off"), ("ibl on", "restored")] {
+            command(&mut engine, state)?;
+            for sample in 0..2 {
+                ensure!(engine.tick(0., [480, 300])?, "frame admission");
+                let deadline = Instant::now() + Duration::from_secs(60);
+                let frame = loop {
+                    if let Some(frame) = engine.take_frame() {
+                        break frame.map_err(anyhow::Error::msg)?;
+                    }
+                    ensure!(Instant::now() < deadline, "GPU frame timed out");
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                assert_eq!(frame.pixels.len(), 480 * 300 * 4);
+                if sample == 1 {
+                    if let Some(dir) = std::env::var_os("RENDER_LAB_COMPARISON_DIR") {
+                        let dir = std::path::Path::new(&dir);
+                        std::fs::create_dir_all(dir)?;
+                        let mut rgba = frame.pixels.clone();
+                        for pixel in rgba.chunks_exact_mut(4) {
+                            pixel.swap(0, 2);
+                        }
+                        image::save_buffer(
+                            dir.join(format!("confluence_ibl_{label}.png")),
+                            &rgba,
+                            480,
+                            300,
+                            image::ColorType::Rgba8,
+                        )?;
+                    }
+                    pixels.push(frame.pixels);
+                }
+            }
+        }
+        let different = |a: &[u8], b: &[u8]| {
+            a.chunks_exact(4)
+                .zip(b.chunks_exact(4))
+                .filter(|(a, b)| a[..3] != b[..3])
+                .count()
+        };
+        let off = different(&pixels[0], &pixels[1]);
+        let restored = different(&pixels[0], &pixels[2]);
+        // The toon actor receives the environment while the vegetation uses its own
+        // material. Count actual illuminated pixels going dark and being relit.
+        let mut darkened = 0;
+        let mut relit = 0;
+        for ((on, off), again) in pixels[0]
+            .chunks_exact(4)
+            .zip(pixels[1].chunks_exact(4))
+            .zip(pixels[2].chunks_exact(4))
+        {
+            if on[..3].iter().any(|c| *c >= 10) && off[..3] == [0, 0, 0] {
+                darkened += 1;
+                relit += usize::from(
+                    on[..3]
+                        .iter()
+                        .zip(&again[..3])
+                        .all(|(a, b)| a.abs_diff(*b) <= 2),
+                );
+            }
+        }
+        println!(
+            "pixels={} changed_with_ibl_off={off} changed_after_restoring_ibl={restored} lit_to_black={darkened} recovered_lighting={relit}",
+            480 * 300
+        );
+        assert!(
+            darkened >= 100,
+            "no material visibly lost its environment lighting"
+        );
+        assert!(
+            relit * 100 >= darkened * 99 && restored * 10 < off,
+            "lighting did not return to its original appearance"
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires confluence assets and a Vulkan device"]
     fn switches_contributors_independently_and_preserves_the_camera() -> Result<()> {
         let mut engine = super::super::open(scene()?)?;
         let camera = engine.camera;
+        let mut extractor = crate::render::SceneExtractor::default();
         let mut sequence = Sequence::default();
         let mut settings = Settings::default();
         settings.select(Mode::Taa);
@@ -322,17 +460,32 @@ mod tests {
             ("forest on", [true, true, true, false, true]),
             ("ibl on", [true, true, true, true, true]),
         ] {
+            let light_change = cmd.starts_with("ibl ") || cmd.starts_with("restir ");
+            let mut before_switch = None;
             if !cmd.is_empty() {
-                let light_change = cmd.starts_with("ibl ") || cmd.starts_with("restir ");
                 if light_change {
                     engine
                         .schedule
                         .tick(&mut engine.world, 1. / 60., &engine.tasks)?;
+                    let mut prior = extractor.snapshot(
+                        &engine.world,
+                        camera,
+                        [224, 140],
+                        engine.materials.clone(),
+                    )?;
+                    sequence.assign(settings, &engine.technique, &mut prior);
+                    before_switch = Some(prior);
                 }
                 let before = engine.schedule.describe();
+                let technique = engine.technique.clone();
+                let world = Arc::as_ptr(&engine.world);
+                let start = std::time::Instant::now();
                 command(&mut engine, cmd)?;
                 if light_change {
+                    eprintln!("{cmd}: apply_us={:.2}", start.elapsed().as_secs_f64() * 1e6);
                     assert_eq!(before, engine.schedule.describe());
+                    assert_eq!(world, Arc::as_ptr(&engine.world));
+                    assert!(Arc::ptr_eq(&technique, &engine.technique));
                 }
             }
             let expected: Vec<_> = [
@@ -377,7 +530,8 @@ mod tests {
                 engine.world.save(&path)?;
                 super::super::replace(&mut engine, World::load(&path)?)?;
             }
-            let mut view = Snapshot::new(
+            let start = std::time::Instant::now();
+            let mut view = extractor.snapshot(
                 &engine.world,
                 engine.camera,
                 [224, 140],
@@ -388,8 +542,54 @@ mod tests {
                 state[2],
                 "{cmd}"
             );
+            let elapsed = start.elapsed();
             sequence.assign(settings, &engine.technique, &mut view);
             let graph = engine.technique.build(&view)?;
+            if let Some(prior) = before_switch {
+                eprintln!(
+                    "{cmd}: extraction_us={:.2} entities={} visited={} instances_updated={}",
+                    elapsed.as_secs_f64() * 1e6,
+                    engine.world.entities.len(),
+                    view.scene.stats.entities_visited,
+                    view.scene.stats.instances_updated
+                );
+                assert!(!view.scene.stats.full_rebuild);
+                assert_eq!(view.scene.stats.instances_updated, 0);
+                assert!(Arc::ptr_eq(&view.scene.instances, &prior.scene.instances));
+                assert!(Arc::ptr_eq(
+                    view.temporal
+                        .as_ref()
+                        .unwrap()
+                        .previous_scene
+                        .as_ref()
+                        .unwrap(),
+                    &prior.scene
+                ));
+                let old = engine.technique.build(&prior)?;
+                let history = |g: &FrameGraph, name: &str| {
+                    g.resources
+                        .iter()
+                        .position(|(n, _)| n == name)
+                        .and_then(|i| g.histories.get(&crate::rdg::Resource(i)).copied())
+                };
+                let name = "Temporal history color and depth";
+                assert_ne!(history(&old, name), history(&graph, name));
+                if cmd.starts_with("ibl ") {
+                    assert_eq!(
+                        light_revision(&view.scene, "restir"),
+                        light_revision(&prior.scene, "restir")
+                    );
+                }
+                command(&mut engine, cmd)?;
+                assert_eq!(
+                    extractor
+                        .snapshot(&engine.world, camera, [224, 140], engine.materials.clone())?
+                        .scene
+                        .stats
+                        .entities_visited,
+                    0
+                );
+            }
             let has = |name: &str| graph.passes.iter().any(|p| p.name.contains(name));
             let resources = |name: &str| graph.resources.iter().filter(|(n, _)| n == name).count();
             assert_eq!(resources("Visibility IDs"), 1, "{cmd}");

@@ -1,5 +1,5 @@
 use super::*;
-use crate::rdg::{Access, Dispatch, Op, PassPhase, Resource, Storage};
+use crate::rdg::{Access, Dispatch, Op, PassPhase, Resource};
 
 // One vertex per lateral streamline and parcel age. Bed and raster share these units.
 pub(super) const LANES: u32 = 49;
@@ -133,15 +133,7 @@ pub(super) fn scene() -> Result<World> {
     Ok(world)
 }
 fn storage(g: &mut FrameGraph, label: &str, stride: usize) -> Resource {
-    let r = g.resource(
-        label,
-        Storage::Buffer {
-            bytes: stride * VERTICES,
-            initial: None,
-        },
-    );
-    g.prefer_local_buffer(r);
-    r
+    g.local_buffer(label, stride * VERTICES)
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]

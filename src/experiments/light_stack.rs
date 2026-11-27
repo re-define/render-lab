@@ -9,7 +9,7 @@ use crate::{
     },
     scene::{Shading, World},
 };
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use glam::Mat4;
 use std::cell::Cell;
 #[cfg(test)]
@@ -36,20 +36,12 @@ pub(super) type Backdrop = fn(&mut FrameGraph, Resource, Resource, (Resource, Re
 
 pub(super) const REGISTRY: &[Registration] = &[restir::REGISTRATION, ibl::REGISTRATION];
 
-#[derive(Clone, Copy)]
-pub(super) enum Channel {
-    Direct,
-    Environment,
-}
-pub(super) struct Contribution {
-    pub channel: Channel,
-    pub indirect_diffuse: Option<Resource>,
-    pub resources: (Resource, Resource),
-    pub backdrop: Option<Backdrop>,
-}
-
-pub(super) type AddLight<'a> =
-    Box<dyn FnOnce(&mut FrameGraph, ResolveInputs) -> Result<Contribution> + 'a>;
+pub(super) mod denoise;
+pub(super) mod diffuse_gi;
+mod stages;
+pub(super) use stages::{
+    AddLight, Contribution, Samples, Signal, SurfaceLighting, pass, pixel_buffer,
+};
 
 pub(super) trait Producer: Send + Sync {
     fn uses_shadow_rays(&self) -> bool {
@@ -62,13 +54,37 @@ pub(super) trait Producer: Send + Sync {
         &'a self,
         s: &'a Snapshot,
         surfaces: &[PosedSurface<'_>],
-    ) -> Result<AddLight<'a>>;
+    ) -> Result<Vec<AddLight<'a>>>;
 }
 pub(super) struct LightStack {
-    producers: Vec<Box<dyn Producer>>,
+    producers: Vec<Layer>,
     pub(super) hdr: bool,
 }
+struct Layer {
+    registration: &'static Registration,
+    producer: std::sync::OnceLock<Box<dyn Producer>>,
+}
+impl Layer {
+    fn prepare(&self, world: &World, tasks: &rayon::ThreadPool) -> Result<()> {
+        if self.producer.get().is_none() {
+            let producer = (self.registration.open)(world, tasks)?;
+            let _ = self.producer.set(producer);
+        }
+        Ok(())
+    }
+}
 impl LightStack {
+    fn active<'a>(&'a self, s: &'a Snapshot) -> impl Iterator<Item = &'a dyn Producer> {
+        self.producers.iter().filter_map(|layer| {
+            let enabled = super::composition::layer_enabled(
+                s.scene.setting(super::composition::SETTING),
+                layer.registration.feature,
+            );
+            enabled
+                .then(|| layer.producer.get().map(Box::as_ref))
+                .flatten()
+        })
+    }
     #[cfg(test)]
     pub fn open(
         world: &World,
@@ -84,10 +100,9 @@ impl LightStack {
         tasks: &rayon::ThreadPool,
         mixed_geometry: bool,
     ) -> Result<Option<(Self, Camera)>> {
-        let registrations = REGISTRY.iter().filter(|r| {
-            world.first_raw_component(r.key).is_some()
-                && super::composition::enabled(world, r.feature)
-        });
+        let registrations = REGISTRY
+            .iter()
+            .filter(|r| world.first_raw_component(r.key).is_some());
         let camera = if let Some(first) = registrations.clone().next() {
             (first.camera)()?
         } else if super::composition::is_scene(world) {
@@ -104,7 +119,13 @@ impl LightStack {
         });
         let hdr = builtin_lighting || mixed_geometry || super::composition::is_scene(world);
         for registration in registrations {
-            let producer = (registration.open)(world, tasks)?;
+            let producer = Layer {
+                registration,
+                producer: Default::default(),
+            };
+            if super::composition::enabled(world, registration.feature) {
+                producer.prepare(world, tasks)?;
+            }
             let MaterialShader {
                 name,
                 display,
@@ -155,8 +176,26 @@ impl LightStack {
     }
 }
 impl Technique for LightStack {
+    fn prepare_feature(
+        &self,
+        feature: &str,
+        world: &World,
+        tasks: &rayon::ThreadPool,
+    ) -> Result<()> {
+        if let Some(layer) = self
+            .producers
+            .iter()
+            .find(|l| l.registration.feature == feature)
+        {
+            layer.prepare(world, tasks)?;
+        }
+        Ok(())
+    }
+    fn color_revision(&self, scene: &crate::render::RenderScene) -> u64 {
+        super::composition::color_revision(scene)
+    }
     fn needs_surface_motion(&self, s: &Snapshot) -> bool {
-        self.producers.iter().any(|p| p.needs_motion(s))
+        self.active(s).any(|p| p.needs_motion(s))
     }
     fn build(&self, s: &Snapshot) -> Result<FrameGraph> {
         let surfaces = Forward::default().posed_surfaces(s, |_| true)?;
@@ -175,18 +214,19 @@ impl Technique for LightStack {
     }
 }
 impl LightStack {
-    pub fn uses_shadow_rays(&self) -> bool {
-        self.producers.iter().any(|p| p.uses_shadow_rays())
+    pub fn uses_shadow_rays(&self, s: &Snapshot) -> bool {
+        self.active(s).any(|p| p.uses_shadow_rays())
     }
     pub fn layers<'a>(
         &'a self,
         s: &'a Snapshot,
         surfaces: &[PosedSurface<'_>],
     ) -> Result<Vec<AddLight<'a>>> {
-        self.producers
-            .iter()
-            .map(|p| p.prepare(s, surfaces))
-            .collect()
+        let mut layers = Vec::new();
+        for producer in self.active(s) {
+            layers.extend(producer.prepare(s, surfaces)?);
+        }
+        Ok(layers)
     }
 }
 pub(super) fn draw_surfaces(
@@ -229,6 +269,7 @@ pub(super) fn build_modules(
     scene: impl FnOnce(&mut FrameGraph, crate::render::SceneLayers) -> Result<()>,
     display: impl FnOnce(&mut FrameGraph, crate::render::DisplayLayers) -> Result<()>,
 ) -> Result<FrameGraph> {
+    let layers = stages::order(layers, &s.materials)?;
     let sky = Cell::new(None);
     build_frame_with_lighting(
         s,
@@ -236,46 +277,21 @@ pub(super) fn build_modules(
         geometry,
         |g, inputs| {
             let mut materials = Vec::new();
-            let mut direct = None;
-            let mut environment = None;
-            let mut indirect = None;
-            for add in layers {
-                let light = add(g, inputs)?;
-                let slot = match light.channel {
-                    Channel::Direct => &mut direct,
-                    Channel::Environment => &mut environment,
-                };
-                ensure!(
-                    slot.replace(light.resources).is_none(),
-                    "duplicate producer for lighting channel"
-                );
-                if let Some(draw) = light.backdrop {
-                    ensure!(
-                        sky.replace(Some((draw, light.resources))).is_none(),
-                        "duplicate backdrop producer"
-                    );
-                }
-                if let Some(gi) = light.indirect_diffuse {
-                    ensure!(
-                        indirect.replace(gi).is_none(),
-                        "duplicate indirect diffuse producer"
-                    );
-                }
+            let mut signals = stages::Products::default();
+            for layer in layers {
+                signals.run(layer, g, inputs)?;
+            }
+            if let Some((resources, Some(draw))) = signals.environment {
+                sky.set(Some((draw, resources)));
             }
             let mut neutral = std::collections::HashMap::new();
             for (bin, name, inputs, optional) in s.materials.lighting() {
                 let mut bindings = Vec::with_capacity(inputs.len());
                 for &input in inputs {
-                    let resource = match input {
-                        LightingInput::Environment => environment.map(|pair| pair.0),
-                        LightingInput::EnvironmentControls => environment.map(|pair| pair.1),
-                        LightingInput::Direct => direct.map(|pair| pair.0),
-                        LightingInput::DirectControls => direct.map(|pair| pair.1),
-                        LightingInput::IndirectDiffuse => indirect,
-                    };
+                    let resource = signals.material_input(input);
                     let resource = match resource {
                         Some(resource) => resource,
-                        // The mixed kernels branch on zero controls before accessing absent data.
+                        // Mixed kernels detect disabled controls or an empty irradiance buffer.
                         None if optional => *neutral.entry(input).or_insert_with(|| {
                             g.input(&format!("Disabled {input:?}"), vec![0; 112])
                         }),
@@ -357,16 +373,14 @@ mod tests {
                 .to_string()
                 .contains("Independent material requires a producer for Environment")
         );
-        let source: AddLight<'_> = Box::new(|g, _| {
-            Ok(Contribution {
-                channel: Channel::Environment,
-                resources: (
+        let source = AddLight::new("test environment", &[], Signal::Environment, |g, _, _| {
+            Ok(Contribution::Environment(
+                (
                     g.input("Custom tables", vec![0; 16]),
                     g.input("Custom controls", vec![0; 112]),
                 ),
-                indirect_diffuse: None,
-                backdrop: None,
-            })
+                None,
+            ))
         });
         let graph = build(vec![source])?;
         let pass = graph

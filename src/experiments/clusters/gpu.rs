@@ -191,17 +191,8 @@ impl ClusterScene {
                         .checked_add(added.try_into()?)
                         .context("plant palette capacity overflow")
                 })?;
-        let create_palette = |g: &mut FrameGraph, name| {
-            let r = g.resource(
-                name,
-                Storage::Buffer {
-                    bytes: 64 * palette_matrices as usize,
-                    initial: None,
-                },
-            );
-            g.prefer_local_buffer(r);
-            r
-        };
+        let create_palette =
+            |g: &mut FrameGraph, name| g.local_buffer(name, 64 * palette_matrices as usize);
         let palette = (palette_matrices != 0).then(|| {
             if settings.wind > 0. {
                 create_palette(g, "Wind joint palettes")
@@ -579,16 +570,9 @@ impl ClusterScene {
         let slots = widths[0]
             .checked_add(widths[1])
             .ok_or_else(|| anyhow::anyhow!("global BVH node list exceeds 32-bit indexing"))?;
-        let nodes = g.resource(
-            "Global BVH node list",
-            Storage::Buffer {
-                bytes: 8 * slots as usize,
-                initial: None,
-            },
-        );
+        let nodes = g.local_buffer("Global BVH node list", 8 * slots as usize);
         let levels = self.level_widths.len();
         let counts = g.input("BVH frontier counts", vec![0; 4 * levels]);
-        g.prefer_local_buffer(nodes);
         g.prefer_local_buffer(counts);
         let dispatches = (0..levels)
             .map(|level| arguments(g, &format!("BVH level {level} dispatch"), 1))
@@ -871,7 +855,7 @@ impl ClusterLod {
         t.full_upload = !fast;
         let mut full = BTreeMap::new();
         let groups = if fast {
-            &s.scene.routes.groups
+            s.scene.routes.groups.as_ref()
         } else {
             g.products.instance_visits += s.scene.instances.len();
             for (idx, i) in s.scene.instances.iter().enumerate() {

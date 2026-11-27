@@ -44,7 +44,8 @@ impl Benchmark {
         let (previous, sequence) = prev.unwrap();
         self.frame_times.push(json!({"tick":f.profile.tick_id,"snapshot":f.profile.snapshot_id,
             "submission":f.profile.submission_id,"completion":f.sequence,"skipped_ticks_total":f.profile.skipped_render_ticks,
-            "cpu_us":f.profile.cpu_times_us,"gpu_span_ms":f.profile.gpu_span_ms}));
+            "cpu_us":f.profile.cpu_times_us,"gpu_span_ms":f.profile.gpu_span_ms,
+            "rdg_template_hit":f.profile.rdg_template_hit,"physical_queues":f.profile.physical_queues,"physical_queue_limit":f.profile.physical_queue_limit}));
         if sequence + 1 == f.sequence {
             self.series
                 .entry("frame_interval_ms".into())

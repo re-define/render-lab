@@ -72,7 +72,7 @@ pub(super) fn run(
     };
     writeln!(
         csv,
-        "lap,frame,stage,forward_steps,interval_ms,gpu_ms,rhi_prepare_ms,shadow_ms,main_clusters,detailed_instances,detailed_triangles,coarse_triangles,allocations,allocated_bytes,frees,freed_bytes,device_local_bytes,peak_device_local_bytes,suballocations,suballocated_bytes,returned_ranges,returned_range_bytes,pool_blocks,local_pool_free_bytes,nonlocal_pool_free_bytes,raster_ms,voxel_raster_ms,voxel_clusters,visible_bricks,proxy_prepare_ms,software_bvh_ms,blas_ms,tlas_ms,as_builds,as_updates,shadow_backend,gi_trace,gi_trace_ms,gi_cache_ms,gi_probe_ms,gi_resolve_ms,gi_total_ms,as_bytes,scratch_bytes,main_blas_overlap_ms,resource_barriers,barrier_calls,memory_barriers,image_barriers,timeline_waits,timeline_signals,transient_bytes,culled_passes,pipeline_creations,pipeline_create_ms"
+        "lap,frame,stage,forward_steps,interval_ms,gpu_ms,rhi_prepare_ms,shadow_ms,main_clusters,detailed_instances,detailed_triangles,coarse_triangles,allocations,allocated_bytes,frees,freed_bytes,device_local_bytes,peak_device_local_bytes,suballocations,suballocated_bytes,returned_ranges,returned_range_bytes,pool_blocks,local_pool_free_bytes,nonlocal_pool_free_bytes,raster_ms,voxel_raster_ms,voxel_clusters,visible_bricks,proxy_prepare_ms,software_bvh_ms,blas_ms,tlas_ms,as_builds,as_updates,shadow_backend,gi_trace,gi_trace_ms,gi_cache_ms,gi_probe_ms,gi_resolve_ms,gi_total_ms,as_bytes,scratch_bytes,main_blas_overlap_ms,resource_barriers,barrier_calls,memory_barriers,image_barriers,timeline_waits,timeline_signals,transient_bytes,culled_passes,pipeline_creations,pipeline_create_ms,graph_build_ms,rdg_compile_ms,rdg_template_hit,physical_queues,physical_queue_limit"
     )?;
     // This thread owns and pumps the hidden window until the engine and swapchain are dropped.
     let hwnd = unsafe {
@@ -276,7 +276,7 @@ pub(super) fn run(
             .sum();
         writeln!(
             csv,
-            "{},{},{stage},{steps},{interval:.5},{gpu:.5},{:.5},{shadow:.5},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{raster:.5},{voxel_ms:.5},{},{},{prepare:.5},{refit:.5},{blas:.5},{tlas:.5},{},{},{backend},{trace_kind},{gi_trace:.5},{gi_cache:.5},{gi_probe:.5},{gi_resolve:.5},{gi_total:.5},{},{},{overlap:.5},{},{},{},{},{},{},{},{},{},{:.5}",
+            "{},{},{stage},{steps},{interval:.5},{gpu:.5},{:.5},{shadow:.5},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{raster:.5},{voxel_ms:.5},{},{},{prepare:.5},{refit:.5},{blas:.5},{tlas:.5},{},{},{backend},{trace_kind},{gi_trace:.5},{gi_cache:.5},{gi_probe:.5},{gi_resolve:.5},{gi_total:.5},{},{},{overlap:.5},{},{},{},{},{},{},{},{},{},{:.5},{:.5},{:.5},{},{},{}",
             seen / FRAMES + 1,
             seen % FRAMES + 1,
             frame.profile.rhi_prepare_ms,
@@ -313,6 +313,11 @@ pub(super) fn run(
             frame.profile.culled_passes,
             frame.profile.pipeline_creations,
             frame.profile.pipeline_create_ms,
+            frame.profile.build_ms,
+            frame.profile.compile_ms,
+            u8::from(frame.profile.rdg_template_hit),
+            frame.profile.physical_queues,
+            frame.profile.physical_queue_limit,
         )?;
         if let Some(writer) = &mut details {
             let full = path((seen + 1) % FRAMES).0 != stage;

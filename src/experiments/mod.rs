@@ -52,6 +52,7 @@ pub(crate) fn snapshot_components() -> impl Iterator<Item = SnapshotComponent> {
         SnapshotComponent::setting(crate::render::rays::VIEW),
         cartoon::SNAPSHOT,
         SnapshotComponent::setting(effects::SETTING),
+        SnapshotComponent::setting(composition::SETTING),
         // The reference matcher's render input is the joint pose; its controller state stays on the CPU.
         SnapshotComponent {
             copy_setting: false,

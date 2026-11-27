@@ -1,4 +1,4 @@
-use super::light_stack::{AddLight, Channel, Contribution, Producer};
+use super::light_stack::{AddLight, Contribution, Producer, Signal};
 use crate::rdg::PassPhase;
 use crate::render::FrameGraph;
 mod bake;
@@ -251,20 +251,23 @@ pub(super) const REGISTRATION: super::light_stack::Registration =
         camera: || Ok(CAMERA),
     };
 impl Producer for Ibl {
-    fn prepare<'a>(&'a self, s: &'a Snapshot, _: &[PosedSurface<'_>]) -> Result<AddLight<'a>> {
+    fn prepare<'a>(&'a self, s: &'a Snapshot, _: &[PosedSurface<'_>]) -> Result<Vec<AddLight<'a>>> {
         let cfg = decode(
             s.scene
                 .setting(SETTING)
                 .context("scene has no IBL settings")?,
         )?;
-        Ok(Box::new(move |g, _| {
-            Ok(Contribution {
-                channel: Channel::Environment,
-                indirect_diffuse: None,
-                resources: self.resources(g, s, cfg),
-                backdrop: cfg.sky.then_some(backdrop),
-            })
-        }))
+        Ok(vec![AddLight::new(
+            "IBL",
+            &[],
+            Signal::Environment,
+            move |g, _, _| {
+                Ok(Contribution::Environment(
+                    self.resources(g, s, cfg),
+                    cfg.sky.then_some(backdrop),
+                ))
+            },
+        )])
     }
 }
 
@@ -296,7 +299,7 @@ mod tests {
             let surfaces = crate::render::Forward::default().posed_surfaces(&view, |_| true)?;
             let layer = ibl.prepare(&view, &surfaces)?;
             gpu.execute(
-                super::super::light_stack::build(&view, surfaces, vec![layer], false)?.compile()?,
+                super::super::light_stack::build(&view, surfaces, layer, false)?.compile()?,
                 &pool,
             )
         };

@@ -53,7 +53,7 @@ impl SimulationSystem for Prepare {
     fn bound_transforms(&self) -> Option<TransformTargets> {
         let mut targets = TransformTargets::default();
         for stage in &self.actors {
-            targets.reads.extend([stage.actor, stage.target]);
+            targets.reads.extend([stage.actor, stage.binding.target]);
             targets.reads.extend_from_slice(&stage.binding.bones);
         }
         Some(targets)
@@ -92,7 +92,7 @@ impl SimulationSystem for Prepare {
                     &mut c,
                     &mut p,
                     root.w_axis.truncate(),
-                    target_point(local(cx, s.target)?),
+                    target_point(local(cx, s.binding.target)?),
                     dt,
                 );
             }
@@ -113,8 +113,8 @@ impl SimulationSystem for Prepare {
                 root: RootMotionRequest::new(root)?,
                 inherited_velocity,
             });
-            cx.set_typed_component(id, SETTING, c)?;
-            cx.set_typed_component(id, PLAYER, p)
+            cx.set_bound_state(id, SETTING, c)?;
+            cx.set_bound_state(id, PLAYER, p)
         })
     }
 }
@@ -141,8 +141,10 @@ impl SimulationSystem for Feedback {
         let mut targets = TransformTargets::default();
         for s in &self.0 {
             targets.reads.extend_from_slice(&s.rig.ids);
-            targets.reads.extend(s.rail);
-            targets.reads.push(s.target);
+            targets
+                .reads
+                .extend(s.binding.course.map(|fixtures| fixtures.rail));
+            targets.reads.push(s.binding.target);
             targets
                 .writes
                 .extend_from_slice(s.rig.published_joints.joints());
@@ -242,7 +244,7 @@ fn feedback(s: &Stage, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
     } else {
         c.pelvis = 0.;
     }
-    let target = target_point(local(cx, s.target)?);
+    let target = target_point(local(cx, s.binding.target)?);
     let [shoulder, _, wrist] = r.arm;
     let from = pose.position(shoulder);
     let tip = pose.world[r.finger].transform_point3(r.fingertip);
@@ -250,7 +252,7 @@ fn feedback(s: &Stage, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
     c.palm_load = 0.;
     if c.hand_ik
         && c.section == traversal::Section::Rail
-        && let (Some(play), Some(rail)) = (c.play, s.rail)
+        && let (Some(play), Some(rail)) = (c.play, s.binding.course.map(|fixtures| fixtures.rail))
     {
         c.palm_load = traversal::brace(r, &mut pose, play.frame, local(cx, rail)?);
     }
@@ -280,7 +282,7 @@ fn feedback(s: &Stage, cx: &mut SystemContext<'_>, dt: f32) -> Result<()> {
         r.published_joints.clone(),
         r.corrected.iter().map(|&i| pose.local[i]).collect(),
     )?;
-    cx.set_typed_component(s.actor, SETTING, c)
+    cx.set_bound_state(s.actor, SETTING, c)
 }
 
 #[cfg(test)]

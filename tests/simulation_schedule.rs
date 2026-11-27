@@ -346,6 +346,7 @@ fn named_domain_interleaves_plugins_and_rolls_back_an_entire_failed_step() -> Re
             let id = base.spawn(Default::default());
             let mut world = Arc::new(base);
             let mut sched = Schedule::default();
+            sched.set_profiling(true);
             // Plugins register in reverse dependency order. An adjacent independent clock
             // keeps its own catch-up limit and is not inserted between these systems.
             sched.add_fixed_system(
@@ -394,6 +395,12 @@ fn named_domain_interleaves_plugins_and_rolls_back_an_entire_failed_step() -> Re
             );
             for &dt in cadence {
                 if sched.tick(&mut world, dt, &pool).is_err() {
+                    let measured = sched.tick_profile().unwrap();
+                    assert!(
+                        measured.evaluate > Duration::ZERO
+                            && measured.capture_undo > Duration::ZERO
+                            && measured.rollback > Duration::ZERO
+                    );
                     assert!(fail && !world.entities[&id].components.contains_key("path"));
                     sched.tick(&mut world, 0., &pool)?;
                 }

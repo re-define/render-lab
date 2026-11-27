@@ -9,14 +9,18 @@ impl Graph {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn compile_frame(self) -> Result<Plan> {
+        self.compile_frame_with(None)
+    }
+    pub(crate) fn compile_frame_with(self, compiler: Option<&mut Compiler>) -> Result<Plan> {
         // Keep the original whole-resource plan available for differential replay.
         if std::env::var_os("RENDER_LAB_REFERENCE_RDG").is_some_and(|v| v == "1") {
             let mut graph = self;
             graph.subranges = Default::default();
             return graph.compile();
         }
-        let mut plan = self.compile()?;
+        let mut plan = self.compile_with(compiler)?;
         let started = std::time::Instant::now();
         let graph = &mut plan.graph;
         let mut live = vec![false; graph.passes.len()];

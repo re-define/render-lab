@@ -181,7 +181,7 @@ fn check_bounces(hardware: bool, inline: bool) -> Result<()> {
                 mode,
                 sequence,
                 Inputs {
-                    scene,
+                    scene: &scene,
                     raster: [surface; 3],
                     surface,
                     config,
@@ -207,10 +207,103 @@ fn check_bounces(hardware: bool, inline: bool) -> Result<()> {
         bounced = bounced.max(draw(reflector, 1.5, DiffuseGi::Multi, tick, 4)?[1]);
     }
     assert!(bounced > 0.4, "delayed emitter energy {bounced}");
+    let uncached = draw(emitter, 1.5, DiffuseGi::Uncached, 1, 5)?;
+    assert!(uncached[1] > 0.98 && uncached[0] < 0.012, "{uncached:?}");
+    assert_eq!(draw(reflector, 1.5, DiffuseGi::Uncached, 2, 5)?, [0.; 3]);
     let blue = draw(painted, 1.5, DiffuseGi::Single, 1, 5)?;
     assert!(
         blue[0] < 0.001 && blue[1] < 0.001 && (blue[2] - 1.4304).abs() < 0.035,
         "{blue:?}"
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Vulkan 1.4 and VK_EXT_descriptor_heap"]
+fn mixed_scene_switches_estimators_and_filters_on_the_same_direct_input() -> Result<()> {
+    use crate::experiments::{light_stack::LightStack, mixed, restir};
+    use crate::render::{SceneExtractor, post};
+    let mut world = mixed::scene()?;
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+    let mut gpu = Backend::open()?;
+    let mut materials = MaterialPrograms::default();
+    let (technique, camera) = LightStack::open(&world, &mut materials, &pool)?.unwrap();
+    let materials = Arc::new(materials);
+    let mut extract = SceneExtractor::default();
+    let mut sequence = post::Sequence::default();
+    let (id, value) = world.first_raw_component(restir::SETTING).unwrap();
+    let mut config = value.clone();
+    config["sampling"] = "reference".into();
+    config["lights"] = 32.into();
+    config["reference_samples"] = 32.into();
+    config["rays"] = "software".into();
+    let mut images = Vec::new();
+    for (gi, denoise) in [
+        ("direct", "off"),
+        ("single", "off"),
+        ("uncached", "off"),
+        ("uncached", "spatial"),
+        ("direct", "off"),
+    ] {
+        config["gi"] = gi.into();
+        config["denoise"] = denoise.into();
+        world.set_setting(id, restir::SETTING, config.clone());
+        let mut frames = Vec::new();
+        for step in 0..18 {
+            let mut view = extract.snapshot(&world, camera, [320, 180], materials.clone())?;
+            sequence.assign(Default::default(), &technique, &mut view);
+            let graph = technique.build(&view)?;
+            let has = |name| graph.passes.iter().any(|p| p.name == name);
+            assert!(has("Stratified direct-light reference"));
+            assert_eq!(
+                has("Uncached GI: average first-hit radiance"),
+                gi == "uncached"
+            );
+            assert_eq!(has("À-trous denoise step 1"), denoise == "spatial");
+            assert_eq!(
+                graph
+                    .resources
+                    .iter()
+                    .any(|(name, _)| name == "GI-1.2 world radiance cells"),
+                gi == "single"
+            );
+            assert!(
+                graph
+                    .resources
+                    .iter()
+                    .any(|(name, _)| name.contains("environment") || name.contains("IBL")),
+                "missing environment provider"
+            );
+            let frame = gpu.execute(graph.compile()?, &pool)?;
+            if step >= 4 {
+                frames.push(frame.profile.gpu_span_ms.expect("aligned timestamps"));
+            }
+            if step == 17 {
+                images.push(frame.pixels);
+            }
+        }
+        frames.sort_by(f64::total_cmp);
+        eprintln!(
+            "mixed 320x180 {gi}/{denoise}: GPU P50 {:.3} ms P95 {:.3} ms ({} frames after 4 warmup)",
+            frames[frames.len() / 2],
+            frames[(frames.len() * 95).div_ceil(100) - 1],
+            frames.len()
+        );
+    }
+    let changed = |a: usize, b: usize| {
+        images[a]
+            .chunks_exact(4)
+            .zip(images[b].chunks_exact(4))
+            .filter(|(a, b)| a != b)
+            .count()
+    };
+    assert_eq!(
+        changed(0, 4),
+        0,
+        "restoring direct-only must restore the fixed reference image"
+    );
+    for (a, b) in [(0, 1), (0, 2), (1, 2), (2, 3)] {
+        assert!(changed(a, b) > 32, "switch {a}->{b} changed too few pixels");
+    }
     Ok(())
 }

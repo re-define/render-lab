@@ -1,15 +1,14 @@
-# 引擎文档
+# Render Lab 文档
 
-| 想弄清的问题 | 阅读入口 |
+第一次运行可从仓库首页的 `movement` 实验开始。要跟踪一帧从输入直到呈现，先看架构图，再按关心的模块阅读。[构建与运行](../README.md) · [架构图与一帧的数据流](architecture.md)
+
+| 想解决的问题 | 阅读入口 |
 | --- | --- |
-| Move、动画与物理如何协作，物体如何选择时钟、边界与投影代理 | [世界、运动与模块时钟](world-runtime.md) |
-| 当前代码与 Unreal 的架构差在哪里，下一代设计如何迁移和验收 | [架构评审与目标设计](architecture-review.md) |
-| 五项改进上机后，人群、森林和双相机分别有什么变化 | [实现与实测对照](pipeline-evolution.md) |
-| 如何追踪一帧从模拟、渲染到 RHI 的提交和退役 | [运行架构与模块](architecture.md) |
-| 修改实体、骨骼、共享树皮后，哪些数据会重新提取和上传 | [变化追踪与提取](extraction.md) |
-| 光栅、硬件光追、光照、后处理怎样进入 RDG 和交换链 | [渲染实现](rendering.md) |
-| 多个银狼如何选动作、共享踏板、求解 IK 及重绑骨架 | [动画与物理](animation-physics.md) |
-| 如何打开 23 个具名实验，哪些命令和离线工具可以复现它们 | [实验目录](experiment-catalog.md) |
-| 数百个银狼的 CPU、GPU 和提取耗时怎么测 | [性能与复现](performance.md) |
+| 同一个实体谁能移动、何时更新，模块之间如何传递结果 | [世界、Move 与模块时钟](world-runtime.md) |
+| 银狼怎样选动作、根据支撑反馈调整姿态并用 IK 触达目标 | [动画与物理](animation-physics.md) |
+| 哪些 ECS 变化需要重新提取，哪些 GPU 数据可以跨帧复用 | [场景提取与资产发布](extraction.md) |
+| 三角簇、体素、材质、光追和时域后处理怎样进入 RDG 与 RHI | [渲染实现](rendering.md) |
+| 如何选择实验、资产和调试命令 | [实验目录](experiment-catalog.md) |
+| 如何测模拟、GPU 与窗口耗时，以及已有对照能说明什么 | [性能与复现](performance.md) |
 
-[运行环境](../README.md) · [贡献规范](../CONTRIBUTING.md) · [资产与署名](../assets/README.md)
+代码与文档修改走同一套验证流程。第三方资产的原作、许可与使用范围单独记录。[开发与验证](../CONTRIBUTING.md) · [资产署名](../assets/README.md)

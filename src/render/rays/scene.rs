@@ -36,8 +36,8 @@ impl RayScene {
     }
 
     /// Purely rigid proxies leave the GPU-deformed geometry identical for both ray purposes.
-    pub(crate) fn into_material_hits(
-        self,
+    pub(crate) fn material_hits(
+        &self,
         g: &mut FrameGraph,
         traversal: Traversal,
         rigid: Option<[Arc<[u8]>; 2]>,
@@ -47,7 +47,7 @@ impl RayScene {
             Ok(Self::Software {
                 nodes: g.resident_input("GI visual BVH", nodes),
                 triangles: g.resident_input("GI visual triangles", triangles),
-                deformed,
+                deformed: *deformed,
             })
         } else {
             Self::build(g, traversal, true, rigid)

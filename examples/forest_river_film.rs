@@ -1,4 +1,5 @@
 //! Five twelve-second takes of the same seeded river, rendered at fixed simulation steps.
+mod support;
 use anyhow::{Context, Result, ensure};
 use glam::Vec3;
 use render_lab::{
@@ -56,16 +57,11 @@ fn camera(base: Camera, shot: usize, t: f32) -> Camera {
 fn render(engine: &mut Engine, dt: f32, size: [u32; 2]) -> Result<Frame> {
     ensure!(engine.tick(dt, size)?, "frame queue full");
     let start = Instant::now();
-    loop {
-        if let Some(frame) = engine.take_frame() {
-            return frame.map_err(anyhow::Error::msg);
-        }
-        ensure!(
-            start.elapsed() < Duration::from_secs(180),
-            "film frame timed out"
-        );
-        std::thread::sleep(Duration::from_micros(300));
-    }
+    support::wait_frame(
+        engine,
+        start + Duration::from_secs(180),
+        Duration::from_micros(300),
+    )
 }
 
 fn main() -> Result<()> {
@@ -156,16 +152,10 @@ fn main() -> Result<()> {
             if let Some(encoder) = &mut encoder {
                 encoder.write(&f)?;
             } else {
-                let mut rgba = f.pixels;
-                for p in rgba.chunks_exact_mut(4) {
-                    p.swap(0, 2);
-                }
-                image::save_buffer(
+                render_lab::recording::save_capture(
                     output.with_file_name(format!("film-shot-{}.png", shot + 1)),
-                    &rgba,
-                    size[0],
-                    size[1],
-                    image::ColorType::Rgba8,
+                    f.extent,
+                    f.pixels,
                 )?;
             }
         }

@@ -172,7 +172,7 @@ pub fn scene() -> Result<World> {
     Ok(world)
 }
 
-pub(super) fn mesh(world: &mut World, name: &str, mesh: Mesh) -> Id {
+pub(in crate::experiments) fn mesh(world: &mut World, name: &str, mesh: Mesh) -> Id {
     world.spawn(Entity {
         name: name.into(),
         mesh: Some(Arc::new(mesh)),
@@ -192,7 +192,7 @@ pub(super) fn material(world: &mut World, name: &str, rgb: [f32; 3]) -> Id {
     })
 }
 
-pub(super) fn object(
+pub(in crate::experiments) fn object(
     world: &mut World,
     mesh: Id,
     mat: Id,

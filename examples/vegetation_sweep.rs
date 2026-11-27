@@ -1,4 +1,5 @@
 //! Repeatable forest LOD sweep and fixed-camera wind/TAA measurements.
+mod support;
 use anyhow::{Context, Result, ensure};
 use render_lab::{console::Console, engine::Engine, experiments, rhi::Frame};
 use std::{
@@ -17,13 +18,11 @@ fn frame(engine: &mut Engine) -> Result<Frame> {
 fn step(engine: &mut Engine, dt: f32) -> Result<Frame> {
     let start = Instant::now();
     ensure!(engine.tick(dt, EXTENT)?, "frame was not queued");
-    loop {
-        if let Some(frame) = engine.take_frame() {
-            return frame.map_err(anyhow::Error::msg);
-        }
-        ensure!(start.elapsed() < Duration::from_secs(30), "frame timed out");
-        std::thread::sleep(Duration::from_micros(200));
-    }
+    support::wait_frame(
+        engine,
+        start + Duration::from_secs(30),
+        Duration::from_micros(200),
+    )
 }
 
 fn delta(before: &[u8], after: &[u8]) -> f64 {
@@ -37,11 +36,7 @@ fn delta(before: &[u8], after: &[u8]) -> f64 {
 
 fn capture(path: &Path, frame: &Frame) -> Result<()> {
     std::fs::create_dir_all(path.parent().context("capture directory")?)?;
-    let mut rgba = frame.pixels.clone();
-    for pixel in rgba.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
-    image::save_buffer(path, &rgba, EXTENT[0], EXTENT[1], image::ColorType::Rgba8)?;
+    render_lab::recording::save_capture(path, frame.extent, frame.pixels.clone())?;
     Ok(())
 }
 

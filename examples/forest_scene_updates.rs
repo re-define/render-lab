@@ -1,4 +1,5 @@
 //! End-to-end GPU upload audit with deterministic edits and a full CPU packing reference.
+mod support;
 use anyhow::{Context, Result, ensure};
 use render_lab::{
     console::Console,
@@ -15,16 +16,11 @@ use std::{
 fn frame(engine: &mut Engine) -> Result<Frame> {
     ensure!(engine.tick(0., [800, 500])?, "frame queue full");
     let start = Instant::now();
-    loop {
-        if let Some(result) = engine.take_frame() {
-            return result.map_err(anyhow::Error::msg);
-        }
-        ensure!(
-            start.elapsed() < Duration::from_secs(90),
-            "frame retirement timed out"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    support::wait_frame(
+        engine,
+        start + Duration::from_secs(90),
+        Duration::from_millis(1),
+    )
 }
 fn main() -> Result<()> {
     let output = PathBuf::from(
@@ -108,16 +104,10 @@ fn main() -> Result<()> {
                         for (label, pixels) in
                             [("full", &reference[sample]), ("resident", &f.pixels)]
                         {
-                            let mut rgba = pixels.clone();
-                            for pixel in rgba.chunks_exact_mut(4) {
-                                pixel.swap(0, 2);
-                            }
-                            image::save_buffer(
+                            render_lab::recording::save_capture(
                                 output.with_file_name(format!("forest-bark-{label}.png")),
-                                &rgba,
-                                800,
-                                500,
-                                image::ColorType::Rgba8,
+                                f.extent,
+                                pixels.clone(),
                             )?;
                         }
                     }

@@ -24,17 +24,7 @@ pub(super) fn prepare(
         "Cluster asset surface bindings",
         bytemuck::cast_slice(assets).to_vec(),
     );
-    let mut buffer = |name: &str, n: usize| {
-        let r = g.resource(
-            name,
-            Storage::Buffer {
-                bytes: n.max(16),
-                initial: None,
-            },
-        );
-        g.prefer_local_buffer(r);
-        r
-    };
+    let mut buffer = |name: &str, n: usize| g.local_buffer(name, n.max(16));
     let total = s.scene.instances.len();
     let cull = buffer("Cluster instances", count as usize * 128);
     let shading = buffer("Cluster and ordinary surfaces", total * 144);

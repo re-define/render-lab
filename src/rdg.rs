@@ -1,5 +1,8 @@
 mod liveness;
 mod range_cache;
+mod schedule_cache;
+pub(crate) use schedule_cache::Compiler;
+use schedule_cache::Order;
 mod ranges;
 mod validate;
 use anyhow::{Context, Result, ensure};
@@ -468,12 +471,10 @@ pub struct Graph {
     pub(crate) addresses: std::collections::BTreeMap<Resource, Vec<Resource>>,
     pub(crate) append_lists: BTreeSet<Resource>,
     pub(crate) histories: std::collections::BTreeMap<Resource, u64>,
-    // Measurements are authored by a workload and applied only on a matching backend and extent.
-    pub(crate) serial_profile: Option<(&'static str, [u32; 2])>,
     external_effects: BTreeSet<usize>,
     subranges: ranges::Declarations,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Barrier {
     pub resource: Resource,
     pub from: Vec<Access>,
@@ -522,12 +523,14 @@ impl AccessHistory {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step {
     pub index: usize,
     pub parents: Vec<usize>,
     pub barriers: Vec<Barrier>,
 }
 pub struct Plan {
+    pub(crate) template_hit: bool,
     pub(crate) compile_ms: f64,
     pub(crate) queue_limit: usize,
     pub(crate) graph: Graph,
@@ -578,7 +581,6 @@ impl Graph {
             resources: vec![],
             passes: vec![],
             histories: Default::default(),
-            serial_profile: None,
             external_effects: Default::default(),
             subranges: Default::default(),
             append_lists: Default::default(),
@@ -638,17 +640,22 @@ impl Graph {
             },
         )
     }
-    /// Only the declared byte range is visible to shaders. The contents start undefined each frame.
-    pub(crate) fn scratch_buffer(&mut self, name: &str, owner: u64, bytes: usize) -> Resource {
+    /// Allocate an uninitialized logical buffer and prefer mapped device-local memory.
+    pub(crate) fn local_buffer(&mut self, name: &str, bytes: usize) -> Resource {
         let r = self.resource(
             name,
             Storage::Buffer {
-                bytes: bytes.max(16),
+                bytes,
                 initial: None,
             },
         );
-        self.scratch_owners.insert(r, owner);
         self.prefer_local_buffer(r);
+        r
+    }
+    /// Only the declared byte range is visible to shaders. The contents start undefined each frame.
+    pub(crate) fn scratch_buffer(&mut self, name: &str, owner: u64, bytes: usize) -> Resource {
+        let r = self.local_buffer(name, bytes.max(16));
+        self.scratch_owners.insert(r, owner);
         r
     }
     /// Prefer mapped device-local memory for buffers that receive many GPU accesses.
@@ -656,13 +663,7 @@ impl Graph {
         self.local_buffers.insert(buffer);
     }
     pub(crate) fn resident_input(&mut self, name: &str, data: Arc<[u8]>) -> Resource {
-        let resource = self.resource(
-            name,
-            Storage::Buffer {
-                bytes: data.len().max(16),
-                initial: Some(data),
-            },
-        );
+        let resource = self.frame_input(name, data);
         self.resident_inputs.insert(resource);
         resource
     }
@@ -782,12 +783,23 @@ impl Graph {
         i
     }
     pub fn compile(self) -> Result<Plan> {
+        self.compile_with(None)
+    }
+    fn compile_with(self, compiler: Option<&mut Compiler>) -> Result<Plan> {
         let use_cache = !self.subranges.split.is_empty()
             && std::env::var_os("RENDER_LAB_RDG_RANGE_CACHE").is_some_and(|v| v == "1");
-        self.compile_with_ranges(use_cache.then_some(&range_cache::CACHE))
+        self.compile_plan(use_cache.then_some(&range_cache::CACHE), compiler)
     }
 
+    #[cfg(test)]
     fn compile_with_ranges(self, cache: Option<&range_cache::Cache>) -> Result<Plan> {
+        self.compile_plan(cache, None)
+    }
+    fn compile_plan(
+        self,
+        cache: Option<&range_cache::Cache>,
+        compiler: Option<&mut Compiler>,
+    ) -> Result<Plan> {
         let started = std::time::Instant::now();
         ensure!(
             self.extent
@@ -842,6 +854,33 @@ impl Graph {
                     "invalid buffer size"
                 );
             }
+        }
+        if let Some(template) = compiler.as_ref().and_then(|c| c.lookup(&self)) {
+            // Dispatch parameters, shader kinds and AS inputs belong to this frame even
+            // when its order and barriers are identical. Never skip their validation.
+            let mut tlas = std::collections::BTreeMap::new();
+            for (p, uses) in self.passes.iter().zip(&template.uses) {
+                self.validate_pass(p, &defined, &mut tlas)?;
+                for &(r, a) in uses {
+                    if a.writes() {
+                        defined[r.0] = true;
+                    }
+                }
+            }
+            let mut plan = Plan {
+                template_hit: true,
+                queue_limit: usize::MAX,
+                graph: self,
+                steps: template.steps.clone(),
+                written: template.written.clone(),
+                image_usage: template.images.clone(),
+                pass_uses: template.uses.clone(),
+                unused: Default::default(),
+                culled_passes: 0,
+                compile_ms: 0.,
+            };
+            plan.compile_ms = started.elapsed().as_secs_f64() * 1000.;
+            return Ok(plan);
         }
         let pass_uses: Vec<_> = self.passes.iter().map(|pass| self.uses(&pass.op)).collect();
         ensure!(
@@ -949,27 +988,40 @@ impl Graph {
         }
         let mut dependents = vec![Vec::new(); deps.len()];
         let mut remaining = Vec::with_capacity(deps.len());
-        let mut ready = BTreeSet::new();
         for (id, parents) in deps.iter().enumerate() {
             remaining.push(parents.len());
-            if parents.is_empty() {
-                ready.insert(id);
-            }
             for &parent in parents {
                 dependents[parent].push(id);
             }
         }
         let mut steps = Vec::with_capacity(deps.len());
         let mut layout_owner: Vec<Option<(Access, usize)>> = vec![None; self.resources.len()];
+        let heights = if compiler
+            .as_ref()
+            .is_some_and(|c| c.order == Order::Critical)
+        {
+            schedule_cache::heights(&deps, &dependents)
+        } else {
+            vec![0; deps.len()]
+        };
+        // Three ordered ready sets avoid rescanning all independent passes to find the next queue.
+        use std::cmp::Reverse;
+        let key = |i: usize| (Reverse(heights[i]), i);
+        let mut ready: [BTreeSet<_>; 3] = Default::default();
+        for (i, &n) in remaining.iter().enumerate() {
+            if n == 0 {
+                ready[self.passes[i].queue as usize].insert(key(i));
+            }
+        }
         let mut previous_queue = None;
-        while !ready.is_empty() {
-            let i = ready
-                .iter()
-                .copied()
-                .find(|&i| Some(self.passes[i].queue) == previous_queue)
-                .unwrap_or_else(|| *ready.first().unwrap());
-            ready.remove(&i);
-            previous_queue = Some(self.passes[i].queue);
+        while let Some((q, (_, i))) = ready
+            .iter()
+            .enumerate()
+            .filter_map(|(q, set)| Some((q, *set.first()?)))
+            .min_by_key(|&(q, (priority, i))| (priority, Some(q) != previous_queue, i))
+        {
+            ready[q].remove(&key(i));
+            previous_queue = Some(q);
             let mut barriers = Vec::new();
             for &(track, a) in &track_uses[i] {
                 let r = physical[track.0];
@@ -1007,7 +1059,7 @@ impl Graph {
             for &child in &dependents[i] {
                 remaining[child] -= 1;
                 if remaining[child] == 0 {
-                    ready.insert(child);
+                    ready[self.passes[child].queue as usize].insert(key(child));
                 }
             }
             steps.push(Step {
@@ -1025,9 +1077,10 @@ impl Graph {
             self.resident_inputs.iter().all(|r| !written[r.0]),
             "resident input may not be written by a pass"
         );
-        Ok(Plan {
+        let mut plan = Plan {
+            template_hit: false,
             queue_limit: usize::MAX,
-            compile_ms: started.elapsed().as_secs_f64() * 1000.,
+            compile_ms: 0.,
             graph: self,
             steps,
             written,
@@ -1035,6 +1088,11 @@ impl Graph {
             pass_uses,
             unused: Default::default(),
             culled_passes: 0,
-        })
+        };
+        if let Some(c) = compiler {
+            c.remember(&plan);
+        }
+        plan.compile_ms = started.elapsed().as_secs_f64() * 1000.;
+        Ok(plan)
     }
 }

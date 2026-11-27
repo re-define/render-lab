@@ -1,33 +1,65 @@
-# 实验与操作
+# 实验目录
 
-引擎提供 23 个具名预设。可用 `--list-experiments` 列出名称。从仓库根运行 `cargo run --release --locked -- --experiment 名称`。省略预设时打开默认演示。窗口控制台和 `--command` 共用命令分派。保存和加载使用 `save PATH`、`load PATH`。不同的主渲染技术由装配器校验兼容性。[完整预设](../src/presets.rs) · [调试命令](../src/console.rs)
+从仓库根目录运行。下列命令依次列出本次构建的全部具名预设、打开岩柱森林、从存档恢复。省略预设和存档时打开默认的双材质演示。窗口中用 WASD 移动相机，按住鼠标右键转向，按 F 重新取景，按 `/` 打开控制台。银狼的移动输入使用 IJKL。[启动参数](../src/cli.rs) · [预设与文件加载](../src/presets.rs) · [窗口输入](../src/ui.rs)
 
-| 预设 | 输入、执行内容和观察方法 |
-| --- | --- |
-| `clusters` | 多个 Dragon 和普通网格共存，GPU 遍历簇并按屏幕误差选层。`lodview on` 给选层着色，`lod 0.25` 改阈值。 |
-| `vegetation`、`vegetation-scale` | 程序化树、草、风动与混合表示 DAG；近景检查轮廓，大规模布局检查剔除。比较 `vegetation triangles`、`vegetation voxels` 和 `vegetation auto`。 |
-| `river-forest`、`forest-karst` | 密林与河流，岩柱版本增加岩石布景和光照研究配置。适合固定机位比较投影几何、运动向量、间接光与后处理。 |
-| `confluence` | 同场组合森林、流水、银狼、IBL 与 ReSTIR。用 `feature water off` 等命令独立切换贡献层。 |
-| `movement` | 左侧物体固定，中间物体按指定速度运动，右侧物体按重力自由落下。三个物体共享网格。用 `object` 查看对象、`tick` 查看时钟。 |
-| `water` | 计算着色器推进台阶上的水体状态，渲染随水面变化的表面。用 `effect restart` 重置。 |
-| `destruction` | 物体破碎和消融，观察碎片局部变换、可见性及材料随时间变化。 |
-| `motion` | 轨迹预测驱动银狼的 Motion Matching；IJKL 控制移动，`motionsearch kd` 与 `motionsearch scan` 可对照检索。 |
-| `silver-contact` | 走、跳、撑栏、钻行与终点触摸。可调重力、起跳冲量和 IK，支持保存并继续中途动作。 |
-| `silver-contact-duo` | 两条相邻障碍路线共用银狼网格。第二个角色多一个腕部父关节，使用显式指尖绑定。用 `control ENTITY` 切换输入，`contact spin 45` 旋转受控角色的起跳板。 |
-| `toon` | 二分光照、面部 SDF 与轮廓。图像、法线外扩及边拓扑四边形路径共用同一人物资产。 |
-| `texture` | Modern Hall 的基础色用特征网格和小型 MLP 在着色时恢复。`texture original`、`texture neural` 用于同视图对照。 |
-| `gaussian` | 2D Gaussian 表示贴图；支持扫描、tile、BVH 与紧凑参数。用 `gaussian stats` 检查表示成本，比较时计入索引。 |
-| `gi` | 独立间接光研究路径，可切换 `gi off`、`gi ssgi`、`gi probes` 和 `gi ray`。 |
-| `shadow` | 阴影贴图的 hard、PCF、PCSS 和射线阴影，可调尺寸、偏移和调试视图。 |
-| `rt` | 独立主射线渲染，观察硬件管线、加速结构与命中输出，适合分离光追前端与光栅材质的行为。 |
-| `restir` | 大量光源的均匀采样、RIS、时空复用和参考路径；支持降噪、候选数与历史统计。 |
-| `gi12-forest`、`gi12-silver` | 森林和角色用 ReSTIR 直接光及探针 / 缓存间接光，比较材质命中、直接光、单跳和多跳。 |
-| `ibl`、`mixed` | 前者在 HDR 环境下评估 PBR；后者把 IBL 与多光源采样接入同一实验。 |
+```powershell
+cargo run --release --locked -- --list-experiments
+cargo run --release --locked -- --experiment forest-karst
+cargo run --release --locked -- --scene target/saved.json
+```
 
-几何实验入口位于 [clusters](../src/experiments/clusters.rs) 和 [vegetation](../src/experiments/vegetation.rs)。流水、破碎与消融位于 [effects](../src/experiments/effects.rs)。基础光照实验在 [lighting](../src/experiments/lighting.rs)，储层与间接光研究在 [restir](../src/experiments/restir.rs)。
+## 几何、运动与场景组合
 
-## 资产处理
+| 预设 | 资产和要观察的现象 | 建议的同机位操作 |
+| --- | --- | --- |
+| `clusters` | 多个 Dragon 实例和普通网格同屏。GPU 按屏幕误差遍历几何层级。 | `lodview on` 显示所选层级，`lod 0.25` 修改误差阈值。 |
+| `vegetation` | 程序化树和草。枝叶可在同一层级中选择三角簇或体素簇。 | `vegetation view paths` 后在 `vegetation auto` 和 `vegetation triangles` 间切换。 |
+| `vegetation-scale` | 放大到林地规模，共享树干、树冠、草丛网格和材质。 | `vegetation wind 0` 固定风，再调 `vegetation pixels 1` 观察选簇变化。 |
+| `river-forest` | 稠密河谷，生成器回归检查至少两万棵树、二十万丛草，并保留水道和河岸。 | `vegetation camera river` 看河道，`vegetation camera grass` 检查地表。 |
+| `forest-karst` | 岩柱、河谷植物、太阳、ReSTIR 和缓存间接光。预设要求硬件光追，CLI 默认选择 TAA。 | `vegetation camera karst` 固定机位，分别输入 `restir gi direct`、`restir gi multi`。 |
+| `movement` | 三个共享网格的物体分别静止、水平移动、受重力落下。 | `object` 列出 ID，`object 3` 查看策略。`tick movement 30` 调整普通运动频率。 |
+| `motion` | 银狼骨架和烘焙的动作库，观察输入轨迹、姿态候选和转向。 | 用 IJKL 改方向，再用 `motionsearch kd`、`motionsearch scan` 对照查询。 |
+| `silver-contact` | 银狼通过平台、栏杆和低矮障碍，用接触反馈修正脚掌和末端触点。 | `contact status` 查看状态，`tick character 120` 修改角色反馈链的子步频率。 |
+| `silver-contact-duo` | 双角色障碍路线。两者共享可见网格，第二名角色采用不同的腕部关节链与指尖绑定。 | `control` 查询角色 ID，`control ID` 选择角色，再用 `contact spin 45` 旋转其起跳台。 |
+| `water` | 程序化台阶上，计算着色器推进水量和流动状态，水面随模拟变化。 | `effect restart` 重新开始，`effect time 2` 指定观察时刻。 |
+| `destruction` | 程序化碎块和消融表面。比较相同几何在完整、破碎和消融阶段的轮廓。 | 依次输入 `effect restart`、`effect time 2.2`、`effect time 4.7`。 |
+| `confluence` | 同一 ECS 世界装配森林、流水、银狼、IBL 与多光源直接光。 | `feature water off`、`feature actor off`、`feature restir off` 分别关闭一层，相同命令改成 `on` 可恢复。 |
 
-神经纹理可用 `python tools/train_texture_grid.py assets/scenes/modern-hall/modern_hall_core.gltf assets/texture/modern-hall` 在安装 PyTorch、NumPy 和 Pillow 的环境重新拟合。Gaussian 工具负责打包、量化、剪枝与指标计算，CUDA 对照工具校验外部训练实现的梯度。评价应同时给出拟合误差、渲染端解码时间，以及含加速结构的存储费用。[神经纹理训练](../tools/train_texture_grid.py) · [Gaussian 工具](../tools/gaussian_texture.py) · [梯度检查](../tools/check_2dgaussian_gradients.cu)
+几何树与材质、运动与碰撞各自有独立入口。林地样本由种子生成，截图对照时可固定风时间。银狼运动时钟与物理状态可通过 `save target/saved.json` 保存，再用 `load target/saved.json` 接续。[植物生成](../src/experiments/vegetation.rs) · [稠密河谷规模回归](../src/experiments/vegetation/river_forest.rs) · [特效实现](../src/experiments/effects.rs) · [角色求解](animation-physics.md)
 
-场景运行直接使用仓库内的成品资产，各资源的原始署名和使用条件见[资产表](../assets/README.md)。
+## 材质、压缩、直接光与间接光
+
+| 预设 | 资产和要观察的现象 | 建议的同机位操作 |
+| --- | --- | --- |
+| `toon` | 银狼的二分光照、面部 SDF 和轮廓。屏幕边缘、法线外扩、边面邻接产生的四边形分别生成轮廓。 | `toon view face`、`toon sdf off`。全身视图用 `toon outline image`、`toon outline hull`、`toon outline quad`。 |
+| `texture` | Modern Hall 的 Wood、FloorTiles、Wallpaper 使用特征网格和小型 MLP 还原基础色。 | `texture neural`、`texture original` 比画面，`texture stats` 看存储数据。 |
+| `gaussian` | 默认使用 Modern Hall 的地砖，着色时查询打包的 2D Gaussian 表示。 | `gaussian scan`、`gaussian tile`、`gaussian bvh` 比查询。`gaussian compact-bvh` 和 `gaussian stats` 检查紧凑表示与索引成本。 |
+| `gi` | 程序化红绿墙、白色测试块、球体及面光源，控制反弹遮挡与染色。 | 切换 `gi off`、`gi ssgi`、`gi probes`、`gi ray`。`gi view indirect` 只看间接项。 |
+| `shadow` | 带网格标记的接收平面和遮挡体，便于观察接触处与远端半影。 | `shadow hard`、`shadow pcf`、`shadow pcss`、`shadow ray`。`shadow view visibility` 查看遮挡值。 |
+| `rt` | 独立的 KHR 光追管线对程序化物体发射主射线，需要设备支持 `VK_KHR_ray_tracing_pipeline`。 | `rt view normals`、`rt view distance`、`rt view reflections`。 |
+| `restir` | 程序化大厅、四个共享低面数阴影代理的球和多光源。 | `restir reuse`、`restir reference` 比采样。`restir denoise off\|spatial\|svgf` 选择直接光滤波，`restir gi direct\|uncached\|single\|multi` 选择漫反射间接光。 |
+| `gi12-forest` | 在程序化植被上组合 ReSTIR 直接光和探针／缓存间接光，检查林地、树冠和阴影。 | `restir gi direct`、`restir gi single`、`restir gi multi`。`restir rays auto` 使用设备能力选择查询。 |
+| `gi12-silver` | 动画银狼使用材质自定义命中着色和贴图 UV，检查非写实材质的间接光。 | 保持机位与姿态一致，使用同一组三种 `restir gi` 设置。 |
+| `ibl` | HDR 摄影棚环境和程序化材质球，观察粗糙度、金属度与环境反射。 | `ibl view diffuse`、`ibl view specular`，再用 `ibl yaw 90` 旋转环境。 |
+| `mixed` | 将 IBL 环境与 ReSTIR 大厅组合，环境与有限光源共享材质表面。 | 分别使用 `ibl ev -4` 和 `restir ev 0` 调整各自贡献。 |
+
+光照方法、求交后端与降噪器由不同选项控制。`gi12-forest`、`gi12-silver` 是仓库对探针和辐亮度缓存的实验实现。重现具体结果时请记录场景、`restir gi`、`restir rays` 和降噪设置。[基础光照场景与模式](../src/experiments/lighting.rs) · [ReSTIR 场景与命令](../src/experiments/restir.rs) · [森林与银狼 GI 配置](../src/experiments/restir/studies.rs) · [IBL](../src/experiments/ibl.rs)
+
+## 输入、捕获和资产
+
+`--scene FILE.json` 恢复引擎存档。单独传 glTF 可导入默认世界。`--experiment clusters --scene FILE.gltf` 为导入几何准备分层簇。`--experiment toon --scene FILE.gltf` 为人物装配卡通材质。`--experiment gaussian --scene FILE.g2t` 在独立纹理预览上读取打包数据。其它具名预设由自己的构造函数提供场景。打包的 Dragon、银狼、Modern Hall 与环境贴图的署名、源文件和授权见[资产目录](../assets/README.md)。
+
+截图可显式指定尺寸与渲染预热帧数。`--secondary-capture` 从同一次模拟读第二个相机，`--secondary-yaw` 单位为度。录制会按给定帧率推进模拟，`--at` 在相应模拟秒数执行控制台命令，MP4/GIF 需要 FFmpeg。窗口内可用 `record target/live.mp4`、`stoprecord` 记录交互。运行中的 RDG 可通过 `rdg` 查看，`timeline target/frame.json` 导出当前帧的 GPU 队列区间。[控制台](../src/console.rs) · [帧捕获与录制](../src/recording.rs)
+
+```powershell
+cargo run --release --locked -- --experiment clusters --command "lodview on" --capture target/clusters.png --size 1280x720
+cargo run --release --locked -- --experiment silver-contact-duo --capture target/front.png --secondary-capture target/side.png --secondary-yaw 45
+cargo run --release --locked -- --experiment motion --record target/motion.gif --fps 24 --duration 3 --at 1 "motion 1 0"
+```
+
+成品场景可直接运行。重训神经纹理时使用 PyTorch、NumPy 和 Pillow。动作 PCA/KD 索引可独立校验。Gaussian 工具支持拟合、PLY 打包和按 tile 尺寸构建索引。[神经纹理训练](../tools/train_texture_grid.py) · [Gaussian 打包](../tools/gaussian_texture.py) · [动作烘焙](../tools/motion_index.py)
+
+```powershell
+python tools/train_texture_grid.py assets/scenes/modern-hall/modern_hall_core.gltf target/modern-hall
+python tools/motion_index.py --check
+```

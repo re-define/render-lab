@@ -160,6 +160,7 @@ pub(crate) struct SurfaceGeometry<'a> {
     pub(crate) mesh: &'a Arc<Mesh>,
     model: Mat4,
     palette: Option<&'a Arc<[Mat4]>>,
+    palette_root: Mat4,
     pub(crate) selected: Option<Vec<u32>>,
     edges: Option<&'a [Edge]>,
 }
@@ -217,6 +218,7 @@ impl VisibilityRenderer {
                         model,
                         selected,
                         palette: instance.palette.as_ref(),
+                        palette_root: instance.palette_root,
                         edges: if instance.outline {
                             asset.topology.as_ref().map(|edges| edges.as_slice())
                         } else {
@@ -305,7 +307,7 @@ impl SurfaceGeometry<'_> {
                 "joint index out of range"
             );
             (
-                self.skin(g, inputs, self.model, palette, false)?,
+                self.skin(g, inputs, [self.model, self.palette_root], palette, false)?,
                 Mat4::IDENTITY,
             )
         } else {
@@ -353,7 +355,13 @@ impl SurfaceGeometry<'_> {
                         .last_joint
                         .is_none_or(|joint| usize::from(joint) < palette.len())
                     {
-                        MotionSource::Skinned(self.skin(g, inputs, prior.model, palette, true)?)
+                        MotionSource::Skinned(self.skin(
+                            g,
+                            inputs,
+                            [prior.model, prior.palette_root],
+                            palette,
+                            true,
+                        )?)
                     } else {
                         MotionSource::Unavailable
                     }
@@ -435,13 +443,13 @@ impl SurfaceGeometry<'_> {
         &self,
         g: &mut FrameGraph,
         input: MeshInputs,
-        model: Mat4,
+        transforms: [Mat4; 2],
         palette: &Arc<[Mat4]>,
         previous: bool,
     ) -> Result<Resource> {
         let count = self.mesh.positions.len().try_into()?;
         g.skins
-            .add(&mut g.graph, input, count, model, palette, previous)
+            .add(&mut g.graph, input, count, transforms, palette, previous)
     }
 
     fn outline_masks(

@@ -54,21 +54,14 @@ pub(crate) struct ClusterShadow {
     pub proxy_start: usize,
     pub proxy_end: usize,
 }
+#[derive(Clone, Copy)]
 pub(crate) struct Software {
     pub triangles: Resource,
     pub nodes: Resource,
     pub count: u32,
 }
 pub(crate) fn buffer(g: &mut FrameGraph, name: &str, bytes: usize) -> Resource {
-    let r = g.resource(
-        name,
-        Storage::Buffer {
-            bytes: bytes.max(16),
-            initial: None,
-        },
-    );
-    g.prefer_local_buffer(r);
-    r
+    g.local_buffer(name, bytes.max(16))
 }
 pub(crate) fn dispatch(
     g: &mut FrameGraph,

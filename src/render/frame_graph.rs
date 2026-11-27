@@ -60,7 +60,13 @@ impl FrameGraph {
         self.present = Some(output);
         Ok(output)
     }
-    pub fn compile(mut self) -> Result<FramePlan> {
+    pub fn compile(self) -> Result<FramePlan> {
+        self.compile_with(None)
+    }
+    pub(crate) fn compile_with(
+        mut self,
+        compiler: Option<&mut crate::rdg::Compiler>,
+    ) -> Result<FramePlan> {
         let skin_pages = std::mem::take(&mut self.skins).finish(&mut self.graph);
         let output = self
             .products
@@ -99,7 +105,7 @@ impl FrameGraph {
         }
         Ok(FramePlan {
             stamp: Default::default(),
-            commands: self.graph.compile_frame()?,
+            commands: self.graph.compile_frame_with(compiler)?,
             output,
             skin_pages,
             instance_visits: self.products.instance_visits,

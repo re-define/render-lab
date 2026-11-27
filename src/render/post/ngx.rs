@@ -19,15 +19,7 @@ impl Backend for Nvidia {
             g.resource(name, Storage::Image(ImageDesc { extent, format }))
         };
         let buffer = |g: &mut FrameGraph, name, [width, height]: [u32; 2], stride| {
-            let r = g.resource(
-                name,
-                Storage::Buffer {
-                    bytes: width as usize * height as usize * stride,
-                    initial: None,
-                },
-            );
-            g.prefer_local_buffer(r);
-            r
+            g.local_buffer(name, width as usize * height as usize * stride)
         };
         let packed = buffer(graph, "DLSS packed input color", input_extent, 16);
         let vectors = buffer(graph, "DLSS motion vectors", input_extent, 4);

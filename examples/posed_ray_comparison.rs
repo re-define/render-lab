@@ -83,16 +83,10 @@ fn main() -> Result<()> {
                 ensure!(diff < 480 * 360 / 100, "ray backends disagree");
             }
             if mode == "hardware" {
-                let mut rgba = frame.pixels;
-                for p in rgba.chunks_exact_mut(4) {
-                    p.swap(0, 2);
-                }
-                image::save_buffer(
+                render_lab::recording::save_capture(
                     dir.join(format!("silver-arm-shadow-{label}.png")),
-                    &rgba,
-                    480,
-                    360,
-                    image::ColorType::Rgba8,
+                    frame.extent,
+                    frame.pixels,
                 )?;
             }
         }

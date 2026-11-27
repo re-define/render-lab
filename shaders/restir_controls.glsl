@@ -2,7 +2,7 @@ layout(set=0,binding=RESTIR_CONFIG,std430) readonly buffer RestirConfig {
     vec4 reprojection; // previous minus current jitter in render pixels
     uvec4 options; // sampling mode, point lights, initial candidates, reference samples
     uvec4 viewport;
-    vec4 controls; // exposure multiplier, denoiser
+    vec4 controls; // exposure, denoiser, light normalization, indirect estimator
     vec4 canopySky; // summed diffuse sky irradiance of active scene lights, linear RGB
 };
 #define screenSize viewport.xy

@@ -1,6 +1,7 @@
 //! Capture and time the same deterministic forest wind sequence for both caster LODs and suns.
 #[path = "forest_shadows/proxy_images.rs"]
 mod proxy_images;
+mod support;
 #[path = "forest_shadows/zoom.rs"]
 mod zoom;
 use anyhow::{Context, Result, ensure};
@@ -15,16 +16,11 @@ use std::{
 fn frame(e: &mut Engine, dt: f32, extent: [u32; 2]) -> Result<Frame> {
     let start = Instant::now();
     ensure!(e.tick(dt, extent)?, "frame queue full");
-    loop {
-        if let Some(result) = e.take_frame() {
-            return result.map_err(anyhow::Error::msg);
-        }
-        ensure!(
-            start.elapsed() < Duration::from_secs(120),
-            "frame timed out"
-        );
-        std::thread::sleep(Duration::from_micros(200));
-    }
+    support::wait_frame(
+        e,
+        start + Duration::from_secs(120),
+        Duration::from_micros(200),
+    )
 }
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -162,16 +158,10 @@ fn main() -> Result<()> {
                 } else {
                     ""
                 };
-                let mut rgba = image.pixels;
-                for p in rgba.chunks_exact_mut(4) {
-                    p.swap(0, 2);
-                }
-                image::save_buffer(
+                render_lab::recording::save_capture(
                     dir.join(format!("{prefix}{geometry}-{source}.png")),
-                    &rgba,
-                    800,
-                    500,
-                    image::ColorType::Rgba8,
+                    image.extent,
+                    image.pixels,
                 )?;
             }
             for index in 0..frames {

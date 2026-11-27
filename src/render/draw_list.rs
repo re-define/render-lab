@@ -130,20 +130,9 @@ impl OrdinaryDrawList {
             "Ordinary draw transforms and bounds",
             bytemuck::cast_slice(&records).to_vec(),
         );
-        let mut temp = |label, bytes| {
-            let r = g.resource(
-                label,
-                Storage::Buffer {
-                    bytes,
-                    initial: None,
-                },
-            );
-            g.prefer_local_buffer(r);
-            r
-        };
-        let counts = temp("Ordinary visible group counts", batch.len() * 4);
-        let ends = temp("Ordered ordinary group ends", batch.len() * 4);
-        let args = temp("Ordinary indirect mesh arguments", 12);
+        let counts = g.local_buffer("Ordinary visible group counts", batch.len() * 4);
+        let ends = g.local_buffer("Ordered ordinary group ends", batch.len() * 4);
+        let args = g.local_buffer("Ordinary indirect mesh arguments", 12);
         let count = batch.len() as u32;
         use Access::{ComputeRead as R, ComputeWrite as W, Mesh as M};
         g.pass_in(

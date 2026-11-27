@@ -1,26 +1,26 @@
 use crate::{
-    render::FramePlan,
     render::{Camera, SceneExtractor, Snapshot, Technique, post},
-    rhi::{Backend, Frame},
+    rhi::Frame,
     scene::World,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::{
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, RecvTimeoutError, SyncSender},
+        Arc,
+        atomic::{AtomicBool, Ordering},
     },
-    thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    thread,
+    time::Instant,
 };
 
+mod pipeline;
 pub use crate::movement::{MoveIntent, MovementControls, MovementDriver};
+use pipeline::Pipeline;
 mod schedule;
 pub use schedule::{
     BindingCheck, BoundSystems, Edit, FixedDomain, Schedule, SimulationData, SimulationSystem,
-    System, SystemAccess, SystemContext, SystemOrder, TickRate, TransformBindings,
+    System, SystemAccess, SystemContext, SystemOrder, TickProfile, TickRate, TransformBindings,
     TransformTargets,
 };
 
@@ -58,24 +58,9 @@ struct Input {
     technique: Arc<dyn Technique>,
     post: post::Settings,
 }
-#[derive(Default)]
-struct LastFrame {
-    results: std::collections::VecDeque<FrameResult>,
-    ordered: bool,
-    memory: Option<crate::rhi::ManagedMemory>,
-}
-type Latest = Arc<Mutex<LastFrame>>;
-fn publish(mailbox: &Latest, frame: FrameResult) {
-    let mut last = mailbox.lock().unwrap();
-    if let Ok(frame) = &frame {
-        last.memory = Some(frame.memory.managed.clone());
-    }
-    if !last.ordered {
-        last.results.clear();
-    }
-    last.results.push_back(frame);
-}
 pub struct Engine {
+    // Stop the workers before releasing scene, technique and device-facing state.
+    pipeline: Pipeline,
     pub capture_viewport: bool,
     pub materials: Arc<crate::render::MaterialPrograms>,
     pub(crate) window: Option<isize>,
@@ -88,16 +73,12 @@ pub struct Engine {
     pub movement: MovementControls,
     pub technique: Arc<dyn Technique>,
     pub tasks: Arc<ThreadPool>,
-    input: Option<SyncSender<Input>>,
     admission: Arc<AtomicBool>,
     origin: Instant,
     tick_id: u64,
     snapshot_id: u64,
     skipped: u64,
-    latest: Latest,
-    secondary_results: Latest,
-    threads: Vec<JoinHandle<()>>,
-    extraction: SceneExtractor,
+    pub(crate) extraction: SceneExtractor,
 }
 impl Engine {
     pub fn new(world: World, technique: Arc<dyn Technique>) -> Result<Self> {
@@ -125,182 +106,7 @@ impl Engine {
                 .thread_name(|i| format!("lab-task-{i}"))
                 .build()?,
         );
-        let (input, scenes) = mpsc::sync_channel::<Input>(1);
-        let (out, plans) = mpsc::sync_channel::<(FramePlan, Option<isize>, bool)>(1);
-        let latest = Latest::default();
-        let secondary_results = Latest::default();
-        let secondary_mailbox = secondary_results.clone();
-        let generation = Arc::new(AtomicU64::new(0));
-        let rhi_generation = generation.clone();
-        let pool = tasks.clone();
-        let mailbox = latest.clone();
-        let (ready, startup) = mpsc::sync_channel(1);
-        let rhi = thread::Builder::new()
-            .name("lab-rhi".into())
-            .spawn(move || {
-                let mut backend = match Backend::open() {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let _ = ready.send(Err(format!("{e:#}")));
-                        return;
-                    }
-                };
-                if ready
-                    .send(Ok((
-                        backend.dlss_unavailable(),
-                        backend.buffer_atomic64(),
-                        backend.ray_capabilities(),
-                    )))
-                    .is_err()
-                {
-                    return;
-                }
-                let report = |result: Result<Frame>, secondary: bool| {
-                    if result.is_err() {
-                        rhi_generation.fetch_add(1, Ordering::AcqRel);
-                    }
-                    publish(
-                        if secondary {
-                            &secondary_mailbox
-                        } else {
-                            &mailbox
-                        },
-                        result.map_err(|e| format!("{e:#}")),
-                    );
-                };
-                loop {
-                    let incoming = if backend.has_pending() {
-                        plans.recv_timeout(Duration::from_millis(1))
-                    } else {
-                        plans.recv().map_err(|_| RecvTimeoutError::Disconnected)
-                    };
-                    match incoming {
-                        Ok((plan, window, secondary)) => {
-                            if window.is_none() {
-                                while let Some(frame) = backend.retire_next() {
-                                    report(frame, false);
-                                }
-                            }
-                            backend.select_view(secondary, plan.stamp.has_secondary);
-                            let id = plan.stamp.snapshot_id;
-                            if plan.stamp.generation != rhi_generation.load(Ordering::Acquire) {
-                                publish(
-                                    if secondary {
-                                        &secondary_mailbox
-                                    } else {
-                                        &mailbox
-                                    },
-                                    Err(format!(
-                                        "skipped snapshot {id} after RHI history invalidation"
-                                    )),
-                                );
-                                continue;
-                            }
-                            let result = match window {
-                                Some(window) => backend.enqueue(plan, &pool, window),
-                                None => backend.execute(plan, &pool).map(Some),
-                            };
-                            match result {
-                                Ok(Some(frame)) => report(Ok(frame), secondary),
-                                Ok(None) => (),
-                                Err(error) => {
-                                    report(Err(error.context(format!("snapshot {id}"))), secondary)
-                                }
-                            }
-                        }
-                        Err(RecvTimeoutError::Timeout) => {
-                            if let Some(frame) = backend.retire_ready() {
-                                report(frame, false);
-                            }
-                        }
-                        Err(RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-                while let Some(frame) = backend.retire_next() {
-                    report(frame, false);
-                }
-            })?;
-        let (dlss_unavailable, buffer_atomic64, ray_caps) =
-            startup.recv()?.map_err(|e| anyhow!(e))?;
-        let pool = tasks.clone();
-        let mailbox = latest.clone();
-        let secondary_mailbox = secondary_results.clone();
-        let render = thread::Builder::new()
-            .name("lab-render".into())
-            .spawn(move || {
-                let mut sequences = [post::Sequence::default(), post::Sequence::default()];
-                let mut previous_generation = 0;
-                for mut frame in scenes {
-                    drop(frame.admission);
-                    let epoch = generation.load(Ordering::Acquire);
-                    if epoch != previous_generation {
-                        for sequence in &mut sequences {
-                            sequence.discard();
-                        }
-                        previous_generation = epoch;
-                    }
-                    frame.stamp.generation = epoch;
-                    frame.stamp.render_dequeued = Some(Instant::now());
-                    frame.snapshot.buffer_atomic64 = buffer_atomic64;
-                    frame.snapshot.ray_caps = ray_caps;
-                    let secondary = frame.secondary.map(|view| {
-                        (
-                            frame.snapshot.for_camera(view.camera, view.extent),
-                            view.post,
-                        )
-                    });
-                    if secondary.is_none() {
-                        sequences[1].discard();
-                    }
-                    let views = std::iter::once((frame.snapshot, frame.post)).chain(secondary);
-                    for (index, (mut snapshot, settings)) in views.enumerate() {
-                        let secondary = index == 1;
-                        let window = frame.window.filter(|_| !secondary);
-                        let temporal = &mut sequences[index];
-                        temporal.assign(settings, &frame.technique, &mut snapshot);
-                        let result = pool.install(|| {
-                            let started = Instant::now();
-                            let mut graph = frame.technique.build(&snapshot)?;
-                            if window.is_some() {
-                                let output = graph.present()?;
-                                if frame.readback {
-                                    graph.pass(
-                                        "Capture recording",
-                                        crate::rdg::Op::HostRead(output),
-                                    );
-                                }
-                            }
-                            let build_ms = started.elapsed().as_secs_f64() * 1000.;
-                            let mut plan = graph.compile()?;
-                            plan.stamp = frame.stamp;
-                            plan.stamp.plan_ready = Some(Instant::now());
-                            plan.build_ms = build_ms;
-                            plan.main_ms = frame.main_ms;
-                            plan.extract_ms = if secondary { 0. } else { frame.extract_ms };
-                            plan.extraction = snapshot.scene.stats;
-                            Ok::<_, anyhow::Error>(plan)
-                        });
-                        match result {
-                            Ok(plan) => {
-                                if out.send((plan, window, secondary)).is_err() {
-                                    return;
-                                }
-                            }
-                            Err(error) => {
-                                temporal.discard();
-                                publish(
-                                    if secondary {
-                                        &secondary_mailbox
-                                    } else {
-                                        &mailbox
-                                    },
-                                    Err(format!("{error:#}")),
-                                );
-                            }
-                        }
-                    }
-                }
-            })?;
+        let (pipeline, device) = Pipeline::start(&tasks)?;
         Ok(Self {
             capture_viewport: false,
             window: None,
@@ -308,21 +114,18 @@ impl Engine {
             world: Arc::new(world),
             camera: Camera::default(),
             post: Default::default(),
-            dlss_unavailable,
-            ray_caps,
+            dlss_unavailable: device.dlss_unavailable,
+            ray_caps: device.ray_caps,
             schedule: Schedule::default(),
             movement: Default::default(),
             technique,
             tasks,
-            input: Some(input),
+            pipeline,
             admission: Default::default(),
             origin: Instant::now(),
             tick_id: 0,
             snapshot_id: 0,
             skipped: 0,
-            latest,
-            secondary_results,
-            threads: vec![render, rhi],
             extraction: SceneExtractor::default(),
         })
     }
@@ -367,12 +170,8 @@ impl Engine {
         let started = std::time::Instant::now();
         self.schedule.tick(&mut self.world, dt, &self.tasks)?;
         self.tick_id += 1;
-        let full = |mailbox: &Latest| {
-            let mailbox = mailbox.lock().unwrap();
-            mailbox.ordered && mailbox.results.len() >= 2
-        };
-        let pending_reports =
-            full(&self.latest) || (secondary.is_some() && full(&self.secondary_results));
+        let pending_reports = self.pipeline.completions().full(false)
+            || (secondary.is_some() && self.pipeline.completions().full(true));
         let Some(admission) = (!pending_reports)
             .then(|| Admission::reserve(&self.admission))
             .flatten()
@@ -381,6 +180,9 @@ impl Engine {
             return Ok(false);
         };
         let extraction_started = Instant::now();
+        if self.extraction.visual_pose_budget().is_some() {
+            self.extraction.focused_actor = self.movement.target(&self.world);
+        }
         let snapshot =
             self.extraction
                 .snapshot(&self.world, self.camera, extent, self.materials.clone())?;
@@ -406,11 +208,7 @@ impl Engine {
             technique: self.technique.clone(),
             post: self.post,
         };
-        self.input
-            .as_ref()
-            .context("engine stopped")?
-            .send(frame)
-            .map_err(|_| anyhow!("render thread exited"))?;
+        self.pipeline.submit(frame)?;
         Ok(true)
     }
     /// # Safety
@@ -421,39 +219,23 @@ impl Engine {
     /// Enable before driving a benchmark. Render admission applies backpressure when the
     /// ordered reader falls behind; simulation continues advancing on each tick.
     pub fn set_ordered_completions(&mut self, ordered: bool) {
-        for mailbox in [&self.latest, &self.secondary_results] {
-            let mut mailbox = mailbox.lock().unwrap();
-            mailbox.ordered = ordered;
-            if !ordered {
-                let latest = mailbox.results.pop_back();
-                mailbox.results.clear();
-                mailbox.results.extend(latest);
-            }
-        }
+        self.pipeline.completions().set_ordered(ordered);
     }
     pub fn take_frame(&self) -> Option<FrameResult> {
-        self.latest.lock().unwrap().results.pop_front()
+        self.pipeline.completions().take(false)
     }
     pub fn take_secondary_frame(&self) -> Option<FrameResult> {
-        self.secondary_results.lock().unwrap().results.pop_front()
+        self.pipeline.completions().take(true)
     }
     pub fn last_memory(&self) -> Option<crate::rhi::ManagedMemory> {
-        self.latest.lock().unwrap().memory.clone()
+        self.pipeline.completions().primary_memory()
     }
 }
-impl Drop for Engine {
-    fn drop(&mut self) {
-        self.input.take();
-        for h in self.threads.drain(..) {
-            let _ = h.join();
-        }
-    }
-}
-
 #[cfg(test)]
 mod pipeline_tests {
     use super::*;
     use crate::render::{Forward, FrameGraph};
+    use std::{sync::Mutex, time::Duration};
 
     #[test]
     fn waiting_snapshot_slot_is_returned_on_failure_or_dequeue() {

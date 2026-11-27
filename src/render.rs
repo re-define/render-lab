@@ -198,6 +198,19 @@ impl Snapshot {
 }
 pub trait Technique: Send + Sync {
     fn build(&self, snapshot: &Snapshot) -> Result<FrameGraph>;
+    /// Prepare an optional feature before publishing the scene setting that makes it visible.
+    fn prepare_feature(
+        &self,
+        _feature: &str,
+        _world: &crate::scene::World,
+        _tasks: &rayon::ThreadPool,
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// Version of accumulated final color. A color-only change preserves geometry motion history.
+    fn color_revision(&self, _scene: &RenderScene) -> u64 {
+        0
+    }
     /// Request surface motion even when the post-processing backend is disabled.
     fn needs_surface_motion(&self, _snapshot: &Snapshot) -> bool {
         false
@@ -268,6 +281,7 @@ pub(crate) struct SurfaceInstance {
     pub routing: [u32; 4],
 }
 impl SurfaceInstance {
+    const MATERIAL_OFFSET: usize = std::mem::offset_of!(Self, color);
     /// Bit in tex.w shared with shaders/cluster.glsl.
     pub(crate) const TEMPORAL_REACTIVE: u32 = 1024;
 }
@@ -312,17 +326,27 @@ impl Targets {
         i: &RenderInstance,
         model: Mat4,
     ) -> Result<SurfaceInstance> {
-        let fallback = Material::default();
-        let m = i
-            .material
-            .and_then(|id| s.scene.materials.get(&id))
-            .map(Arc::as_ref)
-            .unwrap_or(&fallback);
         let reactive = s
             .temporal
             .as_ref()
             .is_some_and(|frame| i.is_skinned() || frame.moved(i.id));
-        let mut result = self.material_value(s, m)?;
+        let mut result = if let Some(rows) = &self.shared_materials {
+            let slot = i
+                .material
+                .map_or(0, |id| s.scene.routes.material_slots[&id]);
+            let mut result = SurfaceInstance::zeroed();
+            bytemuck::bytes_of_mut(&mut result)[SurfaceInstance::MATERIAL_OFFSET..]
+                .copy_from_slice(rows.record(slot));
+            result
+        } else {
+            let fallback = Material::default();
+            let m = i
+                .material
+                .and_then(|id| s.scene.materials.get(&id))
+                .map(Arc::as_ref)
+                .unwrap_or(&fallback);
+            self.material_value(s, m)?
+        };
         result.model = model.to_cols_array();
         result.tex[3] = u32::from(i.outline)
             | if reactive {

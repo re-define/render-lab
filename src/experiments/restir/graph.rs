@@ -1,7 +1,8 @@
 use super::*;
+use crate::experiments::light_stack::{Samples, SurfaceLighting, pass, pixel_buffer};
 use crate::{
     experiments::lighting::geometry,
-    rdg::{Access, Dispatch, Op, PassPhase, Resource, Shader, Storage},
+    rdg::{Access, Op, PassPhase},
     render::{ResolveInputs, rays::RayScene},
 };
 use Access::{ComputeRead as R, ComputeReadWrite as RW, ComputeWrite as W};
@@ -25,47 +26,11 @@ struct Uniform {
     canopy_sky: [f32; 4],
 }
 
-fn pixel_buffer(g: &mut FrameGraph, name: &str, stride: usize) -> Resource {
-    let [w, h] = g.extent;
-    let buffer = g.resource(
-        name,
-        Storage::Buffer {
-            bytes: w as usize * h as usize * stride,
-            initial: None,
-        },
-    );
-    g.prefer_local_buffer(buffer);
-    buffer
-}
-
-fn pass(
-    g: &mut FrameGraph,
-    phase: PassPhase,
-    name: &str,
-    shader: &'static [u8],
-    bindings: Vec<(Resource, Access)>,
-    push: Vec<u8>,
-) {
-    let [w, h] = g.extent;
-    g.pass_in(
-        phase,
-        name,
-        Op::Compute {
-            program: Dispatch {
-                shader: Shader::Compute(shader),
-                bindings,
-                push,
-            },
-            groups: [w.div_ceil(8), h.div_ceil(8), 1],
-        },
-    );
-}
-
 #[cfg(test)]
 pub(super) fn build(s: &Snapshot, technique: &Restir, cfg: Settings) -> Result<FrameGraph> {
     let surfaces = crate::render::Forward::default().posed_surfaces(s, |_| true)?;
     let layer = technique.prepare_with(s, &surfaces, cfg)?;
-    super::super::light_stack::build(s, surfaces, vec![layer], false)
+    super::super::light_stack::build(s, surfaces, layer, false)
 }
 
 #[derive(Default)]
@@ -123,7 +88,7 @@ impl ShadowCache {
     }
 }
 
-pub(super) fn add_light(
+pub(super) fn receivers(
     g: &mut FrameGraph,
     s: &Snapshot,
     technique: &Restir,
@@ -138,7 +103,7 @@ pub(super) fn add_light(
         motion,
     }: ResolveInputs,
     rigid: RigidInputs,
-) -> Result<(Resource, Resource, Resource)> {
+) -> Result<SurfaceLighting> {
     let [w, h] = s.extent;
     let authored = cfg.scene_lights(s);
     let amount = if authored {
@@ -217,7 +182,11 @@ pub(super) fn add_light(
     );
     let mut key = DefaultHasher::new();
     (
-        (technique.generation, s.scene.geometry_revision),
+        (
+            technique.generation,
+            s.scene.geometry_revision,
+            crate::experiments::composition::light_revision(&s.scene, "restir"),
+        ),
         motion.and(s.temporal.as_ref()).map(|f| f.generation_key()),
         cfg.sampling as u32,
         g.products.cluster_shadow.is_some(),
@@ -291,6 +260,52 @@ pub(super) fn add_light(
     } else {
         camera
     }; // Unread binding when viewport.w is zero.
+    let mut gi_key = DefaultHasher::new();
+    (
+        technique.generation,
+        s.scene.geometry_revision,
+        crate::experiments::composition::light_revision(&s.scene, "restir"),
+        motion.and(s.temporal.as_ref()).map(|f| f.generation_key()),
+        cfg.gi_revision,
+        backend,
+        g.products.cluster_shadow.is_some(),
+        amount,
+        cfg.candidates,
+        authored.then_some(s.scene.lights.signature),
+    )
+        .hash(&mut gi_key);
+    let material_hits = (cfg.indirect() && separate)
+        .then(|| scene.material_hits(g, backend, packed(rigid.visual)))
+        .transpose()?;
+    Ok(SurfaceLighting {
+        current,
+        config,
+        lights,
+        history,
+        indices,
+        motion: motion.unwrap_or(camera),
+        depth,
+        raster: [objects, addresses, camera],
+        occluders: scene,
+        material_hits,
+        history_key: gi_key.finish(),
+    })
+}
+
+pub(super) fn sample_direct(
+    g: &mut FrameGraph,
+    lighting: &SurfaceLighting,
+    cfg: Settings,
+) -> Samples {
+    let [w, h] = g.extent;
+    let SurfaceLighting {
+        current,
+        lights,
+        config,
+        history,
+        indices,
+        ..
+    } = *lighting;
     let initial = if matches!(cfg.sampling, Sampling::Ris | Sampling::Restir) {
         let initial = pixel_buffer(g, "Initial and temporal reservoirs", 16);
         let name = if cfg.sampling == Sampling::Restir {
@@ -344,7 +359,7 @@ pub(super) fn add_light(
     } else {
         "Trace one shadow ray per sampled pixel"
     };
-    match &scene {
+    match &lighting.occluders {
         RayScene::Hardware(n) => {
             let read = Access::RayRead;
             if n.inline_queries {
@@ -401,90 +416,7 @@ pub(super) fn add_light(
             );
         }
     }
-    let accumulated = if cfg.denoise == Denoise::Svgf {
-        let filtered = pixel_buffer(g, "Temporally accumulated radiance and moments", 32);
-        pass(
-            g,
-            PassPhase::Denoise,
-            "SVGF: temporal reprojection and moments",
-            spirv!("restir_temporal_filter"),
-            vec![
-                (current, R),
-                (config, R),
-                (history, R),
-                (raw, R),
-                (filtered, W),
-                (indices, R),
-            ],
-            vec![],
-        );
-        filtered
-    } else {
-        raw
-    };
-    pass(
-        g,
-        PassPhase::Lighting,
-        "Store results for the next rendered frame",
-        spirv!("restir_commit"),
-        vec![
-            (current, R),
-            (config, R),
-            (initial, R),
-            (accumulated, R),
-            (history, RW),
-            (motion.unwrap_or(camera), R),
-            (depth, Access::ComputeSample),
-        ],
-        vec![],
-    );
-    let mut output = accumulated;
-    let steps = match cfg.denoise {
-        Denoise::Off => &[][..],
-        Denoise::Spatial => &[1i32, 2][..],
-        Denoise::Svgf => &[1, 2, 4][..],
-    };
-    if !steps.is_empty() {
-        let ping = pixel_buffer(g, "À-trous radiance A", 32);
-        let pong = pixel_buffer(g, "À-trous radiance B", 32);
-        for (i, stride) in steps.iter().enumerate() {
-            let dest = if i % 2 == 0 { ping } else { pong };
-            pass(
-                g,
-                PassPhase::Denoise,
-                &format!("À-trous denoise step {stride}"),
-                spirv!("restir_atrous"),
-                vec![(current, R), (config, R), (output, R), (dest, W)],
-                stride.to_ne_bytes().to_vec(),
-            );
-            output = dest;
-        }
-    }
-    let indirect = if cfg.gi == DiffuseGi::Direct {
-        g.input("Disabled indirect diffuse", vec![0; 16])
-    } else {
-        let scene = if separate {
-            scene.into_material_hits(g, backend, packed(rigid.visual))?
-        } else {
-            scene
-        };
-        diffuse_gi::build(
-            g,
-            s,
-            cfg.gi,
-            key.finish(),
-            diffuse_gi::Inputs {
-                scene,
-                raster: [objects, addresses, camera],
-                surface: current,
-                config,
-                lights,
-                history,
-                old_pixels: indices,
-            },
-        )?
-    };
-    Ok((output, config, indirect))
+    Samples { raw, initial }
 }
 
 #[cfg(test)]

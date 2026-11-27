@@ -9,7 +9,7 @@ pub(in crate::render) struct SkinBatches {
     active: BTreeMap<(Resource, bool, usize), usize>,
     // Hold each palette until the graph is finalized so its Arc address cannot be recycled.
     palettes: BTreeMap<usize, (Arc<[Mat4]>, usize, u32)>,
-    pages: Vec<Vec<Mat4>>,
+    pages: Vec<Vec<[f32; 16]>>,
     batches: Vec<Batch>,
 }
 
@@ -24,6 +24,7 @@ struct Batch {
 #[repr(C)]
 struct SkinJob {
     model: [f32; 16],
+    root: [f32; 16],
     // The GPU reads the first word as the matrix offset. Pad the std430 array stride.
     offset: [u32; 4],
 }
@@ -44,7 +45,7 @@ impl SkinBatches {
         }
         let page = self.pages.len() - 1;
         let offset = self.pages[page].len().try_into()?;
-        self.pages[page].extend_from_slice(palette);
+        self.pages[page].extend(palette.iter().map(Mat4::to_cols_array));
         self.palettes.insert(key, (palette.clone(), page, offset));
         Ok((page, offset))
     }
@@ -53,7 +54,7 @@ impl SkinBatches {
         g: &mut Graph,
         input: MeshInputs,
         vertices: u32,
-        model: Mat4,
+        [model, root]: [Mat4; 2],
         palette: &Arc<[Mat4]>,
         previous: bool,
     ) -> Result<Resource> {
@@ -102,21 +103,18 @@ impl SkinBatches {
                 i
             }
         };
-        let out = g.resource(
+        let out = g.local_buffer(
             if previous {
                 "Previous GPU-skinned positions"
             } else {
                 "GPU-skinned vertices"
             },
-            Storage::Buffer {
-                bytes: (vertices as usize * if previous { 16 } else { 32 }).max(16),
-                initial: None,
-            },
+            (vertices as usize * if previous { 16 } else { 32 }).max(16),
         );
-        g.prefer_local_buffer(out);
         let batch = &mut self.batches[index];
         batch.jobs.push(SkinJob {
             model: model.to_cols_array(),
+            root: root.to_cols_array(),
             offset: [offset, 0, 0, 0],
         });
         batch.outputs.push(out);
@@ -127,13 +125,7 @@ impl SkinBatches {
         let pages: Vec<_> = self
             .pages
             .into_iter()
-            .map(|p| {
-                let mut bytes = Vec::with_capacity(p.len() * 64);
-                for matrix in p {
-                    bytes.extend_from_slice(bytemuck::bytes_of(&matrix.to_cols_array()));
-                }
-                g.input("Skin pose matrices", bytes)
-            })
+            .map(|records| g.table("Skin pose matrices", &crate::rdg::rows::Rows::new(&records)))
             .collect();
         for batch in self.batches {
             let instances = batch.outputs.len() as u32;
@@ -162,7 +154,7 @@ mod tests {
 
     // Two vertices per part exercise both the weighted joint transform and zero-weight
     // fallback. Reuse the asset for two actors with entirely different poses and history.
-    fn two_actors() -> Result<(FramePlan, Vec<f32>)> {
+    fn two_actors(root_shift: f32) -> Result<(FramePlan, Vec<f32>)> {
         let mut g = FrameGraph::new([48, 1]);
         let vertices: [[f32; 8]; 2] = [[1., 0., 0., 0.25, 0., 1., 0., 0.75]; 2];
         let joints = [[0, 0, 0, 0, 1_f32.to_bits(), 0, 0, 0], [0; 8]];
@@ -176,14 +168,14 @@ mod tests {
         let mut expected = Vec::new();
         for actor in [0., 100.] {
             for previous in [false, true] {
-                let dx = actor + if previous { 10. } else { 20. };
+                let dx = root_shift + actor + if previous { 10. } else { 20. };
                 let translate = |x| Mat4::from_translation(Vec3::new(x, 0., 0.));
                 let out = g.skins.add(
                     &mut g.graph,
                     mesh,
                     2,
-                    translate(dx + 2.),
-                    &Arc::from([translate(dx)]),
+                    [translate(dx + 2.), translate(dx - 3.)],
+                    &Arc::from([translate(3.)]),
                     previous,
                 )?;
                 let offset = expected.len() as u32;
@@ -234,7 +226,10 @@ mod tests {
                 &mut g,
                 inputs,
                 1,
-                Mat4::from_translation(Vec3::X * mesh as f32),
+                [
+                    Mat4::from_translation(Vec3::X * mesh as f32),
+                    Mat4::IDENTITY,
+                ],
                 &p,
                 false,
             )?;
@@ -254,7 +249,7 @@ mod tests {
     }
     #[test]
     fn two_actors_share_dispatches_and_keep_output_dependencies() -> Result<()> {
-        let (plan, _) = two_actors()?;
+        let (plan, _) = two_actors(0.)?;
         let producers: Vec<_> = plan
             .graph
             .passes
@@ -291,18 +286,24 @@ mod tests {
     #[test]
     #[ignore = "requires Vulkan 1.4 and descriptor heaps"]
     fn batched_gpu_skin_matches_both_actors_and_their_previous_poses() -> Result<()> {
-        let (plan, expected) = two_actors()?;
-        let frame = crate::rhi::Backend::open()?.execute(
-            plan,
-            &rayon::ThreadPoolBuilder::new().num_threads(2).build()?,
-        )?;
-        let actual: Vec<f32> = frame
-            .pixels
-            .chunks_exact(4)
-            .map(|word| f32::from_ne_bytes(word.try_into().unwrap()))
-            .collect();
-        assert_eq!(actual, expected);
-        assert_eq!(frame.profile.skin_pose_upload_bytes, 4 * 64);
+        let mut backend = crate::rhi::Backend::open()?;
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+        for tick in 0..4 {
+            let (plan, expected) = two_actors(tick as f32 * 3.)?;
+            let frame = backend.execute(plan, &pool)?;
+            let actual: Vec<f32> = frame
+                .pixels
+                .chunks_exact(4)
+                .map(|word| f32::from_ne_bytes(word.try_into().unwrap()))
+                .collect();
+            assert_eq!(actual, expected);
+            if tick == 0 {
+                assert_eq!(frame.profile.skin_pose_upload_bytes, 4 * 64);
+            }
+            if tick >= 2 {
+                assert_eq!(frame.profile.skin_pose_upload_bytes, 0);
+            }
+        }
         Ok(())
     }
 }

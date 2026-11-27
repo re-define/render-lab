@@ -1,0 +1,21 @@
+#version 460
+#include "restir_types.glsl"
+#include "gi12_types.glsl"
+layout(binding=0,std430) readonly buffer Visible { Surface surfaces[]; };
+layout(binding=1,std430) readonly buffer Paths { Path paths[]; };
+layout(binding=2,std430) writeonly buffer Current { Probe probes[]; };
+layout(local_size_x=64) in;
+void main() {
+    uint probe=gl_GlobalInvocationID.x;
+    if(probe>=probes.length()) return;
+    uint first=probe*RAYS;
+    uint anchor=paths[first].address.z;
+    Probe sampleProbe=Probe(Surface(vec4(0),vec2(0),0.,0u),vec4(0));
+    if(anchor!=INVALID) {
+        sampleProbe.anchor=surfaces[anchor];
+        vec3 radiance=vec3(0);
+        for(uint j=0u;j<RAYS;j++) radiance+=paths[first+j].first.rgb;
+        sampleProbe.light=vec4(radiance/float(RAYS),1.);
+    }
+    probes[probe]=sampleProbe;
+}

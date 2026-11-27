@@ -211,6 +211,8 @@ fn silver_crowd_extraction_profile() -> Result<()> {
     let mut times = Vec::new();
     let mut sim_times = Vec::new();
     let mut pose_counts = [0usize; 3];
+    schedule.set_profiling(std::env::var_os("RENDER_LAB_SIM_PROFILE").is_some());
+    let mut stages: [Vec<f64>; 5] = Default::default();
     for frame in 0..116 {
         let tick = Instant::now();
         schedule.tick(&mut world, 0.1, &pool)?;
@@ -230,7 +232,10 @@ fn silver_crowd_extraction_profile() -> Result<()> {
                 )?;
                 assert_eq!(view.scene.instances().len(), cold.scene.instances().len());
                 for (a, b) in view.scene.instances().iter().zip(cold.scene.instances()) {
-                    assert_eq!((a.id, a.model, &a.palette), (b.id, b.model, &b.palette));
+                    assert_eq!(
+                        (a.id, a.model, a.palette_root, &a.palette),
+                        (b.id, b.model, b.palette_root, &b.palette)
+                    );
                 }
             }
             let stats = view.scene.stats;
@@ -241,8 +246,29 @@ fn silver_crowd_extraction_profile() -> Result<()> {
             ]) {
                 *sum += n;
             }
+            if let Some(p) = schedule.tick_profile() {
+                for (series, d) in stages.iter_mut().zip([
+                    p.binding,
+                    p.evaluate,
+                    p.commit,
+                    p.capture_undo,
+                    p.rollback,
+                ]) {
+                    series.push(d.as_secs_f64() * 1000.);
+                }
+            }
             times.push(ms);
             sim_times.push(sim_ms);
+        }
+    }
+    for (series, name) in
+        stages
+            .iter_mut()
+            .zip(["binding", "workers", "commit", "capture undo", "rollback"])
+    {
+        if !series.is_empty() {
+            series.sort_by(f64::total_cmp);
+            println!("{name}: P50/P95 {:.2}/{:.2} ms", series[48], series[90]);
         }
     }
     times.sort_by(f64::total_cmp);
@@ -255,6 +281,170 @@ fn silver_crowd_extraction_profile() -> Result<()> {
         "NPCs {count}; 96 frames, 6 fixed substeps; simulation P50/P95 {:.2}/{:.2} ms, extraction P50/P95 {:.2}/{:.2} ms",
         sim_times[48], sim_times[90], times[48], times[90]
     );
+    Ok(())
+}
+
+#[test]
+fn visual_budget_preserves_ik_focus_and_catches_up_without_new_edits() -> Result<()> {
+    use crate::render::SceneExtractor;
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+    let mut world = population::populated_world(6, &pool, false)?;
+    let actors = world.entities.component_owners(PLAYER).to_vec();
+    for &actor in &actors[1..] {
+        world
+            .entities
+            .get_mut(&actor)
+            .unwrap()
+            .components
+            .remove(SETTING);
+        world.set_motion_policy(actor, MotionPolicy::KINEMATIC)?;
+    }
+    world.set_motion_policy(actors[2], MotionPolicy::MOVING_COLLIDER)?;
+    let mut schedule = Schedule::default();
+    install(&world, &mut schedule)?;
+    let mut world = Arc::new(world);
+    let snap = |r: &mut SceneExtractor, w: &World| {
+        r.snapshot(w, Camera::default(), [128, 72], Default::default())
+    };
+    let (mut exact, mut limited) = (SceneExtractor::default(), SceneExtractor::default());
+    let first = snap(&mut exact, &world)?;
+    snap(&mut limited, &world)?;
+    limited.set_visual_pose_budget(std::num::NonZeroUsize::new(1), super::super::cosmetic_pose);
+    limited.focused_actor = Some(actors[1]);
+    schedule.tick(&mut world, 1. / 30., &pool)?;
+    let full = snap(&mut exact, &world)?;
+    let owners: BTreeMap<_, _> = full
+        .scene
+        .instances()
+        .iter()
+        .filter_map(|inst| {
+            let mut id = *world.entities[&world.entities[&inst.id].skin_binding?]
+                .skin
+                .as_ref()?
+                .joints
+                .first()?;
+            while !actors.contains(&id) {
+                id = world.entities[&id].parent?;
+            }
+            Some((inst.id, id))
+        })
+        .collect();
+    for held in [2, 1, 0] {
+        let view = snap(&mut limited, &world)?;
+        assert_eq!(view.scene.stats.held_visual_actors, held);
+        let mut outdated = BTreeSet::new();
+        for ((inst, current), prior) in view
+            .scene
+            .instances()
+            .iter()
+            .zip(full.scene.instances())
+            .zip(first.scene.instances())
+        {
+            assert_eq!(
+                (inst.id, inst.model, inst.palette_root),
+                (current.id, current.model, current.palette_root)
+            );
+            if inst.palette != current.palette {
+                let actor = owners[&inst.id];
+                assert!(!actors[..3].contains(&actor));
+                assert_eq!(inst.palette, prior.palette);
+                outdated.insert(actor);
+            }
+        }
+        assert_eq!(outdated.len(), held);
+    }
+    Ok(())
+}
+
+/// Paired render extraction using the same assets and the same sequence of authored edits.
+#[test]
+#[ignore = "release CPU character-space palette benchmark; uses Silver Wolf assets"]
+fn silver_crowd_palette_paths() -> Result<()> {
+    use crate::render::SceneExtractor;
+    let count = std::env::var("RENDER_LAB_NPCS").map_or(Ok(500), |n| n.parse::<usize>())?;
+    ensure!(count > 0);
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(16).build()?;
+    let mut character = population::populated_world(count, &pool, false)?;
+    let mut reference = character.clone();
+    let actors = character.entities.component_owners(PLAYER).to_vec();
+    let mut selections: [Vec<(Id, Mat4)>; 3] = Default::default();
+    for &actor in &actors {
+        let p = player(&character, actor)?;
+        // A skin without an explicit moving ancestor goes through the original world-space path.
+        reference
+            .entities
+            .get_mut(&actor)
+            .unwrap()
+            .components
+            .remove(crate::scene::MOTION_POLICY);
+        selections[0].push((actor, character.entities[&actor].local));
+        selections[1].push((p.bones[8], character.entities[&p.bones[8]].local));
+        selections[2].extend(p.bones.iter().map(|&j| (j, character.entities[&j].local)));
+    }
+    let mut extractors = [SceneExtractor::default(), SceneExtractor::default()];
+    for (case, edits) in ["root only", "right wrist", "all 21 animated joints"]
+        .into_iter()
+        .zip(selections)
+    {
+        let mut samples: [Vec<f64>; 2] = Default::default();
+        let mut checks = [0usize; 2];
+        for frame in 0..52 {
+            let offset = 0.003 * (frame + 1) as f32;
+            let edit =
+                Mat4::from_rotation_translation(Quat::from_rotation_y(offset), Vec3::X * offset);
+            for (id, local) in &edits {
+                reference.set_local(*id, *local * edit)?;
+                character.set_local(*id, *local * edit)?;
+            }
+            let mut views = [None, None];
+            for side in [frame % 2, 1 - frame % 2] {
+                let w = if side == 0 { &reference } else { &character };
+                let start = Instant::now();
+                let snap = extractors[side].snapshot(
+                    w,
+                    Camera::default(),
+                    [1920, 1080],
+                    Default::default(),
+                )?;
+                let ms = start.elapsed().as_secs_f64() * 1000.;
+                if frame >= 4 {
+                    samples[side].push(ms);
+                    checks[side] += snap.scene.stats.palette_joints_examined;
+                }
+                views[side] = Some(snap)
+            }
+            if frame == 51 {
+                for (a, b) in views[0]
+                    .as_ref()
+                    .unwrap()
+                    .scene
+                    .instances()
+                    .iter()
+                    .zip(views[1].as_ref().unwrap().scene.instances())
+                {
+                    assert_eq!((a.id, a.model), (b.id, b.model));
+                    if let (Some(ap), Some(bp)) = (&a.palette, &b.palette) {
+                        for (x, y) in ap.iter().zip(bp.iter()) {
+                            assert!(
+                                x.abs_diff_eq(b.palette_root * *y, 2e-4),
+                                "divergent pose on {}",
+                                a.id
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for (side, name) in ["world", "character"].into_iter().enumerate() {
+            samples[side].sort_by(f64::total_cmp);
+            println!(
+                "{count} actors {case} {name}: P50/P95 {:.2}/{:.2} ms, {} palette joints",
+                samples[side][24],
+                samples[side][45],
+                checks[side] / 48
+            );
+        }
+    }
     Ok(())
 }
 
@@ -363,6 +553,9 @@ fn silver_crowd_window_profile() -> Result<()> {
                 for (key, ms) in [
                     ("simulation", p.main_ms),
                     ("extraction", p.extract_ms),
+                    ("render build", p.build_ms),
+                    ("RDG compile", p.compile_ms),
+                    ("RDG template hit", u8::from(p.rdg_template_hit) as f64),
                     ("render build+compile", p.build_ms + p.compile_ms),
                     ("RHI elapsed", p.rhi_ms),
                     ("render queue", p.render_queue_ms),
@@ -424,7 +617,7 @@ fn silver_crowd_window_profile() -> Result<()> {
 }
 
 #[cfg(windows)]
-fn verify_character_coverage(engine: Engine, count: usize) -> Result<()> {
+fn verify_character_coverage(engine: crate::engine::Engine, count: usize) -> Result<()> {
     // Release the WSI device before opening the offscreen readback device. Keep the last simulated pose.
     let (world, camera, post, technique, materials, pool) = (
         engine.world.clone(),
@@ -544,3 +737,6 @@ fn verify_character_coverage(engine: Engine, count: usize) -> Result<()> {
 
 #[path = "crowd_draw_test.rs"]
 mod crowd_draw_test;
+
+#[path = "structural_profile.rs"]
+mod structural_profile;

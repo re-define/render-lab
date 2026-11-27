@@ -142,11 +142,8 @@ impl SceneConfiguration {
             technique,
         })
     }
-    pub fn apply_layers(mut self, e: &mut Engine, uses_same_systems: bool) {
+    pub fn apply_layers(mut self, e: &mut Engine) {
         self.camera = e.camera;
-        if uses_same_systems {
-            self.schedule = std::mem::take(&mut e.schedule);
-        }
         e.movement.rebind(self.movement);
         self.apply_rendering_and_schedule(e);
     }

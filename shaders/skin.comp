@@ -8,7 +8,7 @@ layout(set=0,binding=1,std430) readonly buffer Weights { Influence influences[];
 layout(set=0,binding=2,std430) readonly buffer Pose { mat4 matrices[]; };
 layout(buffer_reference,std430,buffer_reference_align=16) writeonly buffer PosedVertices { vec4 values[]; };
 layout(set=0,binding=3,std430) readonly buffer Destinations { uvec2 destinations[]; };
-struct SkinJob { mat4 model; uvec4 offset; };
+struct SkinJob { mat4 model; mat4 root; uvec4 offset; };
 layout(set=0,binding=4,std430) readonly buffer Jobs { SkinJob jobs[]; };
 layout(push_constant) uniform Params { layout(offset=20) uint count; } p;
 
@@ -26,7 +26,7 @@ void main() {
             total+=skin.weights[j];
         }
     }
-    mat4 transform=total>0.0 ? blend*(1.0/total) : jobs[gl_WorkGroupID.z].model;
+    mat4 transform=total>0.0 ? jobs[gl_WorkGroupID.z].root * (blend*(1.0/total)) : jobs[gl_WorkGroupID.z].model;
     vec4 position=inputVertices[2u*i];
     vec3 posed=(transform*vec4(position.xyz,1.0)).xyz;
 #ifdef POSITION_ONLY

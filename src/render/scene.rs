@@ -2,6 +2,9 @@ mod components;
 use components::{ComponentOutputs, ComponentOwner};
 pub use components::{SnapshotComponent, SnapshotContext, SnapshotValue};
 mod incremental;
+mod leaf_edits;
+mod pose_space;
+use pose_space::PoseSpace;
 mod transforms;
 use transforms::TransformCache;
 mod pages;
@@ -11,7 +14,7 @@ use super::{AtlasCache, Camera, MaterialPrograms, MeshCache, Snapshot};
 use crate::{experiments, scene::*};
 use anyhow::{Context, Result, ensure};
 use glam::Mat4;
-use incremental::Dependencies;
+use incremental::{Dependencies, SkinDependency};
 pub(crate) use pages::InstancePages;
 pub(crate) use routes::GeometryRoutes;
 use serde_json::Value;
@@ -45,6 +48,12 @@ fn same_arc<T: ?Sized>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
 }
 
 impl MeshAsset {
+    fn clustered(&self, outline: bool) -> bool {
+        !self.ordinary
+            && self.meshlets.is_some()
+            && self.hierarchy.is_some()
+            && !(outline && self.topology.is_some())
+    }
     pub(super) fn ordinary_draw_template(
         &self,
         bounds: Option<LocalBounds>,
@@ -111,27 +120,50 @@ pub struct RenderInstance {
     pub model: Mat4,
     pub geometry_assets: Option<Id>,
     pub outline: bool,
+    /// Weighted matrices are expressed in palette_root space; unweighted vertices use model.
     pub palette: Option<Arc<[Mat4]>>,
+    pub palette_root: Mat4,
     pub(crate) emitter: bool,
     pub(crate) grid: bool,
     skinned: bool,
     /// Revision of the resolved world matrix as seen by this extractor.
     pub transform_version: u64,
+    pub(super) incarnation: u64,
 }
 
 impl RenderInstance {
+    fn from_entity(
+        entity: &Entity,
+        transform: &transforms::Transform,
+        incarnation: u64,
+        palette: Option<Arc<[Mat4]>>,
+        palette_root: Mat4,
+    ) -> Self {
+        let instance = entity.instance.as_ref().expect("instance entity");
+        Self {
+            geometry_assets: instance.geometry_assets,
+            id: transform.id,
+            incarnation,
+            mesh: MeshId(instance.mesh),
+            material: instance.material.map(MaterialId),
+            model: transform.world,
+            outline: instance.outline,
+            palette,
+            palette_root,
+            emitter: entity
+                .components
+                .contains_key(experiments::lighting::EMITTER),
+            grid: entity.components.contains_key(experiments::lighting::GRID),
+            skinned: entity.skin_binding.is_some(),
+            transform_version: transform.version,
+        }
+    }
     pub(super) fn is_skinned(&self) -> bool {
         self.skinned
     }
 
     pub fn geometry_path(&self, asset: &MeshAsset, cluster_lod: bool) -> GeometryPath {
-        if cluster_lod
-            && !asset.ordinary
-            && !self.skinned
-            && asset.meshlets.is_some()
-            && asset.hierarchy.is_some()
-            && !(self.outline && asset.topology.is_some())
-        {
+        if cluster_lod && !self.skinned && asset.clustered(self.outline) {
             GeometryPath::ClusterLod
         } else {
             GeometryPath::Ordinary
@@ -151,6 +183,9 @@ pub struct ExtractionStats {
     pub pose_locals_read: usize,
     /// Palette entries actually inspected, including a dense scan when most joints changed.
     pub palette_joints_examined: usize,
+    /// Distinct cosmetic actors retaining their last published presentation pose.
+    pub held_visual_actors: usize,
+    /// Live instance records constructed or changed; deleting a draw retires its slot.
     pub instances_updated: usize,
 }
 
@@ -204,12 +239,16 @@ pub struct SceneExtractor {
     registry: BTreeMap<&'static str, SnapshotComponent>,
     transforms: TransformCache,
     palettes: BTreeMap<Id, Palette>,
+    pose_budget: Option<pose_space::VisualBudget>,
+    pub(crate) focused_actor: Option<Id>,
+    pending_visual: bool,
     previous: Option<Arc<RenderScene>>,
     cursor: Option<ChangeCursor>,
     dependencies: Dependencies,
 }
 
 struct Palette {
+    space: Option<PoseSpace>,
     slots: Vec<usize>,
     joints: Vec<(Id, u64)>,
     inverse_bind: Vec<Mat4>,
@@ -263,9 +302,9 @@ impl SceneExtractor {
         let mut geometry_assets = BTreeMap::new();
         let mut render_materials = BTreeMap::new();
         let mut textures = BTreeMap::new();
-        let mut active_palettes = BTreeSet::new();
+        let mut skin_indices = BTreeMap::new();
         let mut lights = vec![];
-        let mut has_lights = false;
+        let mut light_count = 0;
         let previous_scene = self.previous.clone();
         let previous = previous_scene.as_deref();
         let mut instances = Vec::with_capacity(previous.map_or(0, |scene| scene.instances.len()));
@@ -276,7 +315,7 @@ impl SceneExtractor {
         for (&id, entity) in &world.entities {
             stats.entities_visited += 1;
             if let Some(light) = entity.light {
-                has_lights = true;
+                light_count += 1;
                 self.transforms.row_mut(id).light = true;
                 if let Some(render_light) = self.light(id, light)? {
                     lights.push(render_light);
@@ -342,44 +381,57 @@ impl SceneExtractor {
                     "missing render instance material {id}"
                 );
             }
-            let palette =
+            let (palette, palette_root) =
                 if let Some(skin) = entity.skin_binding.filter(|_| !mesh.weights.is_empty()) {
-                    if active_palettes.insert(skin) {
+                    let index = if let Some(&index) = skin_indices.get(&skin) {
+                        index
+                    } else {
                         stats.palettes_updated += usize::from(self.update_palette(world, skin)?);
                         let palette = &self.palettes[&skin];
-                        let index = dependencies.skin_layouts.len();
-                        dependencies.skin_layouts.push((skin, palette.slots.len()));
                         stats.palette_joints_examined += palette.slots.len();
-                        for (joint_index, &(joint, _)) in palette.joints.iter().enumerate() {
-                            self.transforms
-                                .row_mut(joint)
-                                .skins
-                                .add((index, joint_index));
+                        let index = dependencies.skins.len();
+                        if let Some(space) = &palette.space {
+                            for (node, row) in space.rows().enumerate() {
+                                dependencies
+                                    .pose_nodes
+                                    .entry(row)
+                                    .or_default()
+                                    .add((index, node));
+                            }
+                        } else {
+                            for (joint, &slot) in palette.slots.iter().enumerate() {
+                                self.transforms.rows[slot].skins.add((index, joint));
+                            }
                         }
-                    }
-                    dependencies.skin_users.entry(skin).or_default().push(id);
-                    Some(self.palettes[&skin].matrices.clone())
+                        dependencies.skins.push(SkinDependency {
+                            id: skin,
+                            joint_count: palette.slots.len(),
+                            instances: Vec::new(),
+                        });
+                        skin_indices.insert(skin, index);
+                        index
+                    };
+                    dependencies.skins[index].instances.push(instances.len());
+                    let palette = &self.palettes[&skin];
+                    (
+                        Some(palette.matrices.clone()),
+                        palette.space.as_ref().map_or(Mat4::IDENTITY, |space| {
+                            self.transforms.rows[space.root].world
+                        }),
+                    )
                 } else {
-                    None
+                    (None, Mat4::IDENTITY)
                 };
             let transform = self.transforms.row_mut(id);
             transform.instance = Some(instances.len());
             world.validate_geometry_binding(entity, instance.geometry_assets)?;
-            let next = RenderInstance {
-                geometry_assets: instance.geometry_assets,
-                id,
-                mesh: MeshId(instance.mesh),
-                material: instance.material.map(MaterialId),
-                model: transform.world,
-                outline: instance.outline,
+            let next = RenderInstance::from_entity(
+                entity,
+                transform,
+                world.entities.incarnation(id),
                 palette,
-                emitter: entity
-                    .components
-                    .contains_key(experiments::lighting::EMITTER),
-                grid: entity.components.contains_key(experiments::lighting::GRID),
-                skinned: entity.skin_binding.is_some(),
-                transform_version: transform.version,
-            };
+                palette_root,
+            );
             while prior_instances.peek().is_some_and(|prior| prior.id < id) {
                 prior_instances.next();
             }
@@ -389,11 +441,13 @@ impl SceneExtractor {
                     prior.geometry_assets == next.geometry_assets
                         && prior.mesh == next.mesh
                         && prior.material == next.material
+                        && prior.incarnation == next.incarnation
                         && prior.transform_version == next.transform_version
                         && prior.outline == next.outline
                         && prior.emitter == next.emitter
                         && prior.grid == next.grid
                         && prior.skinned == next.skinned
+                        && prior.palette_root == next.palette_root
                         && same_arc(&prior.palette, &next.palette)
                 });
             instances.push(match_prior.cloned().unwrap_or_else(|| {
@@ -401,7 +455,7 @@ impl SceneExtractor {
                 Arc::new(next)
             }));
         }
-        self.palettes.retain(|id, _| active_palettes.contains(id));
+        self.palettes.retain(|id, _| skin_indices.contains_key(id));
         let mut components = ComponentOutputs::default();
         for (key, owner) in &mut dependencies.components {
             owner.refresh(self.registry[key], world, &self.transforms, &mut components)?;
@@ -412,12 +466,13 @@ impl SceneExtractor {
             &render_materials,
             previous.map(|p| p.routes.as_ref()),
         )?);
-        let mut model_records =
-            vec![[0; 20]; routes.model_slots.values().max().map_or(0, |n| n + 1)];
+        let mut model_records = vec![[0; 20]; routes.model_capacity];
         for i in &instances {
             model_records[routes.model_slots[&i.id]] = i.gpu_model();
         }
         let models = crate::rdg::rows::Rows::new(&model_records);
+        dependencies.light_count = light_count;
+        let has_lights = light_count != 0;
         let scene = Arc::new(RenderScene {
             routes,
             models,
@@ -444,6 +499,13 @@ impl SceneExtractor {
                 .map(|scene| scene.atlas_cache.clone())
                 .unwrap_or_default(),
         });
+        let roots = dependencies
+            .skins
+            .iter()
+            .filter_map(|s| self.palettes[&s.id].space.as_ref().map(|space| space.root))
+            .collect::<Vec<_>>();
+        self.transforms.configure_pose_interiors(&roots);
+        self.pending_visual = false;
         self.dependencies = dependencies;
         Ok(scene)
     }
@@ -469,39 +531,40 @@ impl SceneExtractor {
             skin.joints.len() == skin.inverse_bind.len(),
             "invalid skin palette"
         );
-        let joints = skin
-            .joints
-            .iter()
-            .map(|&joint| {
-                let entry = self.transforms.get(joint).context("missing skin joint")?;
-                Ok((joint, entry.version))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let slots: Vec<_> = joints
-            .iter()
-            .map(|(id, _)| self.transforms.slots[id])
-            .collect();
-        if let Some(prior) = self.palettes.get_mut(&id)
-            && prior.joints == joints
-            && prior.inverse_bind == skin.inverse_bind
-        {
-            prior.slots = slots;
-            return Ok(false);
+        let mut slots = Vec::with_capacity(skin.joints.len());
+        let mut joints = Vec::with_capacity(skin.joints.len());
+        for joint in &skin.joints {
+            let &slot = self
+                .transforms
+                .slots
+                .get(joint)
+                .context("missing skin joint")?;
+            slots.push(slot);
+            joints.push((*joint, self.transforms.rows[slot].version));
         }
-        let matrices = joints
-            .iter()
-            .zip(&skin.inverse_bind)
-            .map(|(&(id, _), &inverse)| self.transforms.get(id).unwrap().world * inverse)
-            .collect();
+        let space = PoseSpace::bind(world, &self.transforms, &slots);
+        let matrices: Arc<[Mat4]> = if let Some(space) = &space {
+            space.initial(&skin.inverse_bind)
+        } else {
+            slots
+                .iter()
+                .zip(&skin.inverse_bind)
+                .map(|(&slot, &inverse)| self.transforms.rows[slot].world * inverse)
+                .collect()
+        };
+        let prior = self.palettes.get(&id).filter(|p| *p.matrices == *matrices);
+        let changed = prior.is_none();
+        let matrices = prior.map_or(matrices, |p| p.matrices.clone());
         self.palettes.insert(
             id,
             Palette {
+                space,
                 slots,
                 joints,
                 inverse_bind: skin.inverse_bind.clone(),
                 matrices,
             },
         );
-        Ok(true)
+        Ok(changed)
     }
 }

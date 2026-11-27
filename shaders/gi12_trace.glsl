@@ -145,12 +145,12 @@ void main() {
         vec3 d=r*(cos(angle)*tangent+sin(angle)*cross(normal,tangent))+sqrt(1.-r*r)*normal;
         Interaction h;
         if(intersectWorld(a.point.xyz+normal*0.004,d,h)) {
-            p.address.x=findCell(h,frame.x);
+            if(controls.w<2.5) p.address.x=findCell(h,frame.x);
             p.first=vec4(outgoingDirect(h,p.address.x,false,seed,p.firstLamp),1.);
             recordDirect(p.address.x,p.first.rgb,false,path);
             // Half of first hits trace one more cosine-weighted ray. Use a separate RNG
             // stream so the first-bounce samples match between both comparison modes.
-            if(controls.w>1.5 && any(greaterThan(h.albedo,vec3(0))) && random(seed)<0.5) {
+            if(controls.w>1.5 && controls.w<2.5 && any(greaterThan(h.albedo,vec3(0))) && random(seed)<0.5) {
                 p.weight=vec4(h.albedo*2.,0);
                 vec3 next=cosineDirection(h.normal,seed);
                 Interaction h2;

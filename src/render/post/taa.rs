@@ -1,6 +1,6 @@
 use super::*;
 use crate::rdg::PassPhase;
-use crate::rdg::{Access, Dispatch, Op, Shader, Storage};
+use crate::rdg::{Access, Dispatch, Op, Shader};
 use anyhow::ensure;
 use bytemuck::{Pod, Zeroable};
 
@@ -30,18 +30,14 @@ impl Backend for Taa {
         let hdr = inputs.color.encoding == ColorEncoding::LinearRgba32;
         let debug = frame.debug;
         let output_hdr = hdr && debug == DebugView::Off;
-        let output = graph.resource(
+        let output = graph.local_buffer(
             if debug == DebugView::Off {
                 "Temporal AA color"
             } else {
                 "Temporal diagnostic color"
             },
-            Storage::Buffer {
-                bytes: count * if output_hdr { 16 } else { 4 },
-                initial: None,
-            },
+            count * if output_hdr { 16 } else { 4 },
         );
-        graph.prefer_local_buffer(output);
         let groups = [width.div_ceil(8), height.div_ceil(8), 1];
         if debug == DebugView::Motion {
             let extent = graph.extent;
@@ -67,12 +63,12 @@ impl Backend for Taa {
         }
         let history = graph.history_buffer(
             "Temporal history color and depth",
-            frame.key,
+            frame.color_key,
             16 + count * 16,
         );
         let tags = graph.history_buffer(
             "Temporal history surface tags",
-            frame.key ^ (1 << 56),
+            frame.color_key ^ (1 << 56),
             count * 4,
         );
         graph.prefer_local_buffer(history);

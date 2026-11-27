@@ -82,6 +82,10 @@ fn presents_and_resizes_with_optional_frame_capture() -> Result<()> {
         } else {
             assert!(frame.pixels.is_empty());
         }
+        let active: std::collections::BTreeSet<_> =
+            frame.passes.iter().map(|p| p.batch.queue).collect();
+        assert_eq!(frame.profile.physical_queues, active.len());
+        assert!(frame.profile.physical_queues <= frame.profile.physical_queue_limit);
         assert_eq!(frame.profile.wsi_transitions, 2);
         assert!(frame.profile.resource_barriers >= frame.profile.barrier_calls);
         assert_eq!(frame.profile.timeline_signals, frame.submissions);
@@ -304,15 +308,12 @@ fn verify_scratch_slots(
             let a = a.or_else(|| {
                 (requested > 0).then(|| graph.scratch_buffer("Caster faces", 7, requested))
             });
-            if stage == 1 {
-                graph.input("optional header", vec![0; 16]);
-            }
+            let unused_header = (stage == 1).then(|| graph.input("optional header", vec![0; 16]));
             let output = graph.input(
                 "pixels",
                 vec![0; extent[0] as usize * extent[1] as usize * 4],
             );
             let intermediate = graph.resource("copy image", image.clone());
-            let work = a.unwrap_or(b);
             graph.pass(
                 "upload",
                 Op::WritePixels {
@@ -320,20 +321,24 @@ fn verify_scratch_slots(
                     buffer: src,
                 },
             );
-            graph.pass(
-                "write scratch",
-                Op::ReadPixels {
-                    image: intermediate,
-                    buffer: work,
-                },
-            );
-            graph.pass(
-                "read scratch",
-                Op::WritePixels {
-                    image: intermediate,
-                    buffer: work,
-                },
-            );
+            // Keep both scratch owners on the path to the checked pixel. At stage 2
+            // owner 7 is absent and owner 9 alone carries the pixel across the copy.
+            for work in a.into_iter().chain([b]) {
+                graph.pass(
+                    "write scratch",
+                    Op::ReadPixels {
+                        image: intermediate,
+                        buffer: work,
+                    },
+                );
+                graph.pass(
+                    "read scratch",
+                    Op::WritePixels {
+                        image: intermediate,
+                        buffer: work,
+                    },
+                );
+            }
             graph.pass(
                 "copy result",
                 Op::ReadPixels {
@@ -406,6 +411,9 @@ fn verify_scratch_slots(
                 committed
             );
             let slot = &backend.slots[index];
+            if let Some(header) = unused_header {
+                assert!(matches!(slot.resources[header.0], Physical::Vacant));
+            }
             for (column, resource) in [a, Some(b), Some(output)].into_iter().enumerate() {
                 let Some(resource) = resource else { continue };
                 let buffer = slot.resources[resource.0].buffer();
