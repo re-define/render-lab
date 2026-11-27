@@ -10,6 +10,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GLSLC");
     println!("cargo:rerun-if-changed=shaders");
     let shaders = [
+        "forest_stream_sky.comp",
+        "forest_stream_cut.comp",
+        "forest_stream_draws.comp",
+        "forest_stream.mesh",
+        "forest_stream.frag",
+        "forest_stream_resolve.comp",
         "stream.mesh",
         "stream.frag",
         "stream_resolve.comp",
@@ -443,8 +449,13 @@ fn build_storage() {
         for name in ["dstorage.dll", "dstoragecore.dll"] {
             let source = root.join("bin/x64").join(name);
             println!("cargo:rerun-if-changed={}", source.display());
-            std::fs::copy(source, dir.join(name))
-                .expect("stage DirectStorage runtime beside executable");
+            // Windows locks a loaded DLL. Concurrent runs can safely share an identical SDK.
+            let destination = dir.join(name);
+            let bytes = std::fs::read(source).expect("read DirectStorage runtime");
+            if std::fs::read(&destination).ok().as_deref() != Some(bytes.as_slice()) {
+                std::fs::write(destination, bytes)
+                    .expect("stage DirectStorage runtime beside executable");
+            }
         }
     }
     let vk = PathBuf::from(env::var_os("VULKAN_SDK").expect("Vulkan SDK required"));

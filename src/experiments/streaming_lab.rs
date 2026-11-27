@@ -36,7 +36,7 @@ pub fn scene() -> Result<World> {
     Ok(w)
 }
 fn package() -> Result<Package> {
-    let path = crate::assets::cache_dir().join("woven-surface-v1.pages");
+    let path = crate::assets::cache_dir().join("woven-surface-v2.pages");
     Package::open(&path).or_else(|_| {
         let textures = [8, 64, 256].map(|side| {
             let mut v = Vec::new();
@@ -102,6 +102,12 @@ impl Technique for Surface {
         let mut params = bytemuck::cast_slice(&s.view_projection().to_cols_array()).to_vec();
         params.extend(bytemuck::bytes_of(&offsets));
         params.extend(bytemuck::bytes_of(&sizes));
+        params.extend(bytemuck::bytes_of(&[
+            tex.word_offset,
+            geo.word_offset,
+            skin.word_offset,
+            0,
+        ]));
         let uniform = g.input("Surface parameters", params);
         let vis = g.resource("Stream surface visibility", Storage::Color);
         let depth = g.resource("Stream surface depth", Storage::Depth);
@@ -122,7 +128,7 @@ impl Technique for Surface {
                 count: DrawCount::Mesh([(2 * sizes[1] * sizes[1]).div_ceil(32), 1, 1]),
             },
         );
-        let feedback = g.input("Visible page demand", vec![0; 16]);
+        let feedback = streamer.request_buffer(&mut g);
         let [w, h] = s.extent;
         let out = g.resource(
             "Streamed material color",
@@ -174,9 +180,7 @@ impl Technique for Surface {
                 ],
             },
         );
-        if !s.secondary_view {
-            streamer.observe_demand(&mut g, feedback);
-        }
+        streamer.observe_requests(&mut g, feedback, s.secondary_view);
         g.set_output(out);
         Ok(g)
     }

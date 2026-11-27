@@ -319,12 +319,21 @@ impl Timelines {
             };
             let mut waits = vec![];
             #[cfg(lab_directstorage)]
-            for step in &p.steps[start..end] {
-                if let Op::CopyStreamPage { src, .. } = p.graph.passes[step.index].op
-                    && let Physical::External(import) = &resources[src.0]
-                {
-                    waits.push(sem(import.semaphore, 1, Stage::COPY));
+            {
+                let mut external = HashMap::<_, u64>::new();
+                for step in &p.steps[start..end] {
+                    if let Op::CopyStreamPage { src, .. } = p.graph.passes[step.index].op
+                        && let Physical::External(import) = &resources[src.0]
+                    {
+                        let wait = external.entry(import.semaphore).or_default();
+                        *wait = (*wait).max(import.point);
+                    }
                 }
+                waits.extend(
+                    external
+                        .into_iter()
+                        .map(|(handle, point)| sem(handle, point, Stage::COPY)),
+                );
             }
             let mut sources = vec![];
             for (src, &(v, stages)) in needed.iter().enumerate() {
@@ -380,6 +389,48 @@ impl Timelines {
                 .set((self.generation, signals[*index].0, signals[*index].1));
         }
         Ok(batches)
+    }
+    /// Query each contributing queue at most once, independent of unrelated render completion.
+    pub fn publish_stream_copies(&self, pending: &VecDeque<Submitted>) -> Result<()> {
+        if !pending
+            .iter()
+            .any(|frame| !frame.plan.graph.page_copies.is_empty())
+        {
+            return Ok(());
+        }
+        let mut completed = vec![None; self.sems.len()];
+        for ticket in pending
+            .iter()
+            .flat_map(|frame| frame.plan.graph.page_copies.iter().map(|(_, t)| t))
+        {
+            let lease = &ticket.lease;
+            if lease.complete.load(std::sync::atomic::Ordering::Relaxed)
+                || lease.failure.get().is_some()
+            {
+                continue;
+            }
+            let Some(&(generation, queue, point)) = lease.ready.get() else {
+                continue;
+            };
+            if generation != self.generation {
+                continue;
+            }
+            let value = match completed[queue] {
+                Some(value) => value,
+                None => {
+                    let value =
+                        unsafe { self.gpu.dev.get_semaphore_counter_value(self.sems[queue])? };
+                    completed[queue] = Some(value);
+                    value
+                }
+            };
+            if point <= value {
+                lease
+                    .complete
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        Ok(())
     }
     pub fn targets(&self) -> Vec<u64> {
         self.values.clone()

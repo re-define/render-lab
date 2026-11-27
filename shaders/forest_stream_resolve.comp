@@ -1,0 +1,40 @@
+#version 460
+#include "forest_stream.glsl"
+#include "visibility_image.glsl"
+#define PAGE_TABLE 1
+#include "stream_pages.glsl"
+#define STREAM_REQUEST_BINDING 4
+#include "stream_requests.glsl"
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=2,std430) readonly buffer Bindings {Unit units[];};
+layout(binding=3,std430) buffer OutputColor {uint colors[];};
+layout(binding=5,std430) buffer Stats {uint stats[];};
+void main(){
+    uvec2 p=gl_GlobalInvocationID.xy,size=textureSize(visibilityImage,0);
+    if(any(greaterThanEqual(p,size)))return;
+    uvec2 v=visibilityAt(p);uint mat=v.x&255u;
+    vec2 uv=unpackHalf2x16(v.y);
+    float light=float(v.x>>8)/255.;
+    vec3 color=mix(vec3(.22,.31,.36),vec3(.59,.70,.75),1.-float(p.y)/float(size.y));
+    if(mat==1u){
+        vec2 tc=clamp(vec2(uv.x,uv.y*.125),0.,.999999)*4.;
+        uvec2 tile=uvec2(tc);uint id=tile.y*4+tile.x;
+        uvec2 nx=visibilityAt(min(p+uvec2(1,0),size-1)),ny=visibilityAt(min(p+uvec2(0,1),size-1));
+        // Silhouettes still request detail; interior samples use the UV footprint.
+        float footprint=0.;
+        if((nx.x&255u)==1u && (ny.x&255u)==1u){
+            vec2 a=abs(unpackHalf2x16(nx.y)-uv)*vec2(1.,.125);
+            vec2 b=abs(unpackHalf2x16(ny.y)-uv)*vec2(1.,.125);
+            footprint=max(length(a),length(b));
+        }
+        if(footprint<1./32.)requestStreamUnit(id,1u,uint(clamp(8./max(footprint,0.0001),1.,16000000.)));
+        Unit unit=units[id];uint n=unit.level>0u?128u:8u;
+        uvec2 pix=uvec2(fract(tc)*n);
+        color=unpackUnorm4x8(wordAt(unit.first,unit.offset+pix.y*n+pix.x)).rgb;
+        color=sqrt(clamp(color*light,0.,1.));
+        atomicAdd(stats[unit.level>0?3:2],1u);
+    }else if(mat==2u){
+        color=sqrt(vec3(.115,.225,.073)*light*(.65+.26*clamp(uv.y,0.,1.)+.12*fract(uv.x)));
+    }
+    colors[p.y*size.x+p.x]=packUnorm4x8(vec4(color.bgr,1));
+}

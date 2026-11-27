@@ -2,6 +2,12 @@
 #[cfg(lab_directstorage)]
 pub(crate) mod directstorage;
 mod disk;
+mod feedback;
+mod policy;
+pub(crate) use feedback::FeedbackSink;
+use feedback::{PRIORITY_MASK, Reports};
+pub use policy::StreamStats;
+use policy::{Admission, Metrics};
 mod package;
 use crate::rdg::{Graph, Op, Resource};
 use anyhow::{Result, ensure};
@@ -10,11 +16,12 @@ pub use package::{Level, Package, Part};
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, Weak,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
+    time::Instant,
 };
 
 pub const PAGE_BYTES: usize = 64 * 1024;
@@ -28,9 +35,9 @@ pub struct Budget {
 impl Default for Budget {
     fn default() -> Self {
         Self {
-            requests: 4,
-            upload_pages: 2,
-            in_flight: 8,
+            requests: 8,
+            upload_pages: 4,
+            in_flight: 16,
             pool_pages: 32,
         }
     }
@@ -47,6 +54,9 @@ pub(crate) struct Lease {
     pub retirement: std::sync::OnceLock<mpsc::Sender<(u64, usize)>>,
     pub slot: usize,
     pub complete: AtomicBool,
+    pub cold: AtomicBool,
+    pub evict: AtomicBool,
+    pub detached: AtomicBool,
     pub ready: std::sync::OnceLock<(u64, usize, u64)>,
 }
 impl Drop for Lease {
@@ -59,6 +69,11 @@ impl Drop for Lease {
 struct Page {
     lease: Arc<Lease>,
     stage: Option<Staged>,
+}
+impl Drop for Page {
+    fn drop(&mut self) {
+        self.lease.detached.store(true, Ordering::Release);
+    }
 }
 /// One owner reference per admitted page, including evicted uploads still held by a GPU frame.
 struct Permit {
@@ -76,17 +91,22 @@ pub(crate) struct CopyTicket {
 struct Pending {
     page: Page,
     ticket: Option<Weak<CopyTicket>>,
+    last_used: u64,
 }
 #[derive(Clone, Copy)]
 pub struct Binding {
     pub level: usize,
     pub first_page: u32,
+    pub word_offset: u32,
 }
 pub struct View {
     pub table: Resource,
     pub parts: Vec<Option<Binding>>,
     pub uploads: usize,
+    pub stats: StreamStats,
 }
+/// Consumers use a streaming unit as the smallest representation they can publish
+/// atomically (e.g. one texture tile or all payload pages for one cluster group).
 pub struct Streamer {
     parts: Vec<Option<Part>>,
     pool: u64,
@@ -94,16 +114,21 @@ pub struct Streamer {
     slots: Vec<Weak<Lease>>,
     pages: BTreeMap<Key, Pending>,
     pending: std::collections::BTreeSet<Key>,
-    failed: std::collections::BTreeSet<Key>,
+    cache_frames: u64,
+    frame_budget_ms: f64,
+    metrics: Metrics,
+    waiting: BTreeMap<usize, (usize, u64, Instant)>,
+    last_visible: Vec<usize>,
+    minimum: BTreeMap<usize, u32>,
     permits: Arc<()>,
-    jobs: mpsc::SyncSender<ReadJob>,
+    jobs: mpsc::SyncSender<Vec<ReadJob>>,
     results: mpsc::Receiver<(Key, Result<Staged, String>)>,
     host_only: bool,
     retry_after: BTreeMap<Key, u64>,
     frame: u64,
     cancelled: Arc<AtomicBool>,
-    feedback: Arc<AtomicU32>,
-    admission: Option<(u32, Vec<usize>, std::collections::BTreeSet<Key>)>,
+    feedback: Arc<Mutex<Reports>>,
+    admission: Option<(BTreeMap<usize, u32>, Admission)>,
     pub last_error: Option<String>,
 }
 impl Streamer {
@@ -115,7 +140,15 @@ impl Streamer {
         let mut paths = Vec::new();
         let mut files = Vec::new();
         let mut parts = Vec::new();
-        for package in packages {
+        let mut roots = std::collections::HashSet::<Arc<[u8]>>::new();
+        for mut package in packages {
+            for part in &mut package.parts {
+                if let Some(shared) = roots.get(&part.root) {
+                    part.root = shared.clone();
+                } else {
+                    roots.insert(part.root.clone());
+                }
+            }
             files.extend(std::iter::repeat_n(paths.len(), package.parts.len()));
             paths.push(package.path);
             parts.extend(package.parts.into_iter().map(Some));
@@ -126,36 +159,16 @@ impl Streamer {
                 && budget.in_flight > 0
                 && budget.pool_pages > 0
                 && budget.pool_pages <= 16384
-                && (1..=8).contains(&parts.len()),
+                && (1..=feedback::MAX_UNITS).contains(&parts.len()),
             "invalid stream budget or part count"
         );
-        for p in parts.iter().flatten() {
-            ensure!(p.levels.len() <= 4, "feedback has four bits per part");
-        }
-        let (jobs, work) = mpsc::sync_channel::<ReadJob>(budget.in_flight);
+        let (jobs, work) = mpsc::sync_channel::<Vec<ReadJob>>(budget.in_flight);
         let (send, results) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let stop = cancelled.clone();
         thread::Builder::new()
             .name("lab-page-io".into())
-            .spawn(move || {
-                let mut readers: Vec<_> = paths.iter().map(|_| None).collect();
-                for (key, range, adapter, permit) in work {
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let file = files[key.0];
-                    let path = &paths[file];
-                    let result = readers[file]
-                        .get_or_insert_with(|| disk::Reader::new(path, adapter))
-                        .read(path, range, adapter.is_some())
-                        .map(|upload| Staged { upload, permit })
-                        .map_err(|e| format!("{e:#}"));
-                    if send.send((key, result)).is_err() {
-                        break;
-                    }
-                }
-            })?;
+            .spawn(move || disk::run(paths, files, work, send, stop))?;
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Ok(Self {
             permits: Default::default(),
@@ -163,6 +176,7 @@ impl Streamer {
             retry_after: Default::default(),
             frame: 0,
             cancelled,
+            last_visible: vec![0; parts.len()],
             parts,
             admission: None,
             pool: NEXT.fetch_add(1, Ordering::Relaxed),
@@ -170,7 +184,11 @@ impl Streamer {
             budget,
             pages: Default::default(),
             pending: Default::default(),
-            failed: Default::default(),
+            cache_frames: 8,
+            frame_budget_ms: 1000. / 60.,
+            metrics: Default::default(),
+            waiting: Default::default(),
+            minimum: Default::default(),
             jobs,
             results,
             feedback: Default::default(),
@@ -193,8 +211,8 @@ impl Streamer {
             .retain(|key, p| match p.page.lease.failure.get() {
                 #[cfg(lab_directstorage)]
                 Some(UploadFailure::Import(e)) => {
-                    self.last_error = Some(e.clone());
                     self.host_only = true;
+                    self.last_error = Some(e.clone());
                     false
                 }
                 Some(UploadFailure::Capacity(e)) => {
@@ -205,44 +223,72 @@ impl Streamer {
                 None => true,
             });
         let adapter = if self.host_only { None } else { adapter };
-        let demand = self.feedback.load(Ordering::Acquire);
+        let mut demand = self.minimum.clone();
+        let reports = self.feedback.lock().unwrap();
+        reports.merge(&mut demand);
+        self.metrics.stats.feedback_overflows = reports.overflows;
+        let slow = reports.gpu_ms.is_some_and(|ms| ms > self.frame_budget_ms);
+        drop(reports);
+        for (&unit, &word) in &demand {
+            let desired = (word >> 24) as usize;
+            if self.parts.get(unit).is_some_and(Option::is_some)
+                && self.last_visible[unit] < desired
+                && self.waiting.get(&unit).is_none_or(|w| w.0 != desired)
+            {
+                self.waiting
+                    .insert(unit, (desired, self.frame, Instant::now()));
+            }
+        }
+        self.waiting.retain(|id, _| demand.contains_key(id));
         if self
             .admission
             .as_ref()
-            .is_none_or(|(last, _, _)| *last != demand)
+            .is_none_or(|(last, _)| last != &demand)
         {
-            let mut desired = Vec::new();
-            let mut room = self.budget.pool_pages;
-            // Always admit complete levels. Divide bounded capacity across independently requested parts.
-            for (i, p) in self.parts.iter().enumerate() {
-                let wanted = (((demand >> (4 * i)) & 15).count_ones() as usize)
-                    .min(p.as_ref().map_or(0, |p| p.levels.len()));
-                desired.push(wanted);
-            }
-            // Reserve capacity coarse-to-fine, round robin across kinds. Keep a reachable fallback.
-            let mut wanted = std::collections::BTreeSet::new();
-            let mut allowed = vec![0; self.parts.len()];
-            for level in 1..=desired.iter().copied().max().unwrap_or(0) {
-                for (i, p) in self.parts.iter().enumerate() {
-                    if desired[i] < level || allowed[i] + 1 != level {
-                        continue;
-                    }
-                    let n = p.as_ref().unwrap().levels[level - 1]
-                        .bytes
-                        .div_ceil(PAGE_BYTES);
-                    if n <= room {
-                        room -= n;
-                        allowed[i] = level;
-                        wanted.extend((0..n).map(|j| (i, level, j)));
-                    }
-                }
-            }
-            self.pages.retain(|k, _| wanted.contains(k));
-            self.failed.retain(|k| wanted.contains(k));
-            self.retry_after.retain(|k, _| wanted.contains(k));
-            self.admission = Some((demand, allowed, wanted));
+            let selection = Admission::new(
+                &self.parts,
+                &demand,
+                self.budget.pool_pages,
+                &self.waiting,
+                self.frame,
+            );
+            self.admission = Some((demand, selection));
         }
-        let (_, allowed, wanted) = self.admission.as_ref().unwrap();
+        let admission = &self.admission.as_ref().unwrap().1;
+        let wanted = &admission.wanted;
+        self.retry_after.retain(|k, _| wanted.contains(k));
+        // Drop unwanted pending uploads immediately. Keep completed cold pages briefly while
+        // spare capacity exists. Immutable old frame tables independently retain their leases.
+        self.pages.retain(|key, p| {
+            let cold = !wanted.contains(key);
+            p.page.lease.cold.store(cold, Ordering::Release);
+            if p.page.lease.evict.swap(false, Ordering::AcqRel) && cold {
+                return false;
+            }
+            if !cold {
+                p.last_used = self.frame;
+                return true;
+            }
+            p.page.lease.complete.load(Ordering::Acquire)
+                && self.frame.saturating_sub(p.last_used) <= self.cache_frames
+        });
+        let mut cold: Vec<_> = self
+            .pages
+            .iter()
+            .filter(|(k, _)| !wanted.contains(k))
+            .map(|(k, p)| (p.last_used, *k))
+            .collect();
+        let discard = cold
+            .len()
+            .saturating_sub(self.budget.pool_pages.saturating_sub(wanted.len()));
+        if discard > 0 {
+            cold.sort_unstable();
+            for (_, key) in cold.into_iter().take(discard) {
+                self.pages.remove(&key);
+            }
+        }
+        let allowed = &admission.levels;
+        let upload_limit = if slow { 1 } else { self.budget.upload_pages };
         // Completed copies release CPU staging immediately; failed/dropped plans may retry.
         for p in self.pages.values_mut() {
             if p.page.lease.complete.load(Ordering::Acquire) {
@@ -262,7 +308,7 @@ impl Streamer {
                 let stage = match result {
                     Ok(v) => v,
                     Err(e) => {
-                        self.failed.insert(key);
+                        self.retry_after.insert(key, self.frame.saturating_add(60));
                         self.last_error = Some(e);
                         continue;
                     }
@@ -273,6 +319,9 @@ impl Streamer {
                     slot,
                     failure: Default::default(),
                     complete: AtomicBool::new(false),
+                    cold: Default::default(),
+                    evict: Default::default(),
+                    detached: Default::default(),
                     ready: Default::default(),
                 });
                 self.slots[slot] = Arc::downgrade(&lease);
@@ -284,16 +333,17 @@ impl Streamer {
                             stage: Some(stage),
                         },
                         ticket: None,
+                        last_used: self.frame,
                     },
                 );
             }
         }
-        let mut requested = 0;
-        for &k in wanted {
+        let mut jobs = Vec::new();
+        for &k in &admission.requests {
             if !dispatch
-                || requested >= self.budget.requests
+                || jobs.len() >= self.budget.requests
                 || Arc::strong_count(&self.permits) > self.budget.in_flight
-                || self.pending.len() >= self.budget.in_flight
+                || self.pending.len() + jobs.len() >= self.budget.in_flight
             {
                 break;
             }
@@ -303,7 +353,6 @@ impl Streamer {
                 .is_some_and(|frame| *frame > self.frame)
                 || self.pending.contains(&k)
                 || self.pages.contains_key(&k)
-                || self.failed.contains(&k)
             {
                 continue;
             }
@@ -314,26 +363,31 @@ impl Streamer {
                 offset: level.offset + start as u64,
                 bytes: (level.bytes - start).min(PAGE_BYTES),
             };
-            if self
-                .jobs
-                .try_send((
-                    k,
-                    range,
-                    adapter,
-                    Arc::new(Permit {
-                        _owner: self.permits.clone(),
-                    }),
-                ))
-                .is_ok()
-            {
-                self.pending.insert(k);
-                requested += 1
+            jobs.push((
+                k,
+                range,
+                adapter,
+                Arc::new(Permit {
+                    _owner: self.permits.clone(),
+                }),
+            ));
+        }
+        if !jobs.is_empty() {
+            let submitted: Vec<_> = jobs.iter().map(|(k, l, _, _)| (*k, l.bytes)).collect();
+            if self.jobs.try_send(jobs).is_ok() {
+                for (k, n) in submitted {
+                    self.pending.insert(k);
+                    self.metrics.read(k, n);
+                }
             }
         }
-        for pending in self.pages.values_mut() {
-            if !dispatch || uploaded >= self.budget.upload_pages {
+        for key in &admission.requests {
+            if !dispatch || uploaded >= upload_limit {
                 break;
             }
+            let Some(pending) = self.pages.get_mut(key) else {
+                continue;
+            };
             let page = &pending.page;
             let Some(stage) = page.stage.as_ref() else {
                 continue;
@@ -362,13 +416,14 @@ impl Streamer {
         }
         let mut parts = vec![];
         let mut bindings = vec![];
+        let mut roots = BTreeMap::new();
         for (i, p) in self.parts.iter().enumerate() {
             let Some(p) = p else {
                 parts.push(None);
                 continue;
             };
             let mut selected = allowed[i];
-            while selected > 0 {
+            while p.root_offset(selected).is_none() {
                 let n = p.levels[selected - 1].bytes.div_ceil(PAGE_BYTES);
                 if (0..n).all(|j| {
                     self.pages
@@ -382,10 +437,22 @@ impl Streamer {
             parts.push(Some(Binding {
                 level: selected,
                 first_page: bindings.len() as u32,
+                word_offset: p.root_offset(selected).unwrap_or(0) as u32,
             }));
-            if selected == 0 {
-                let root = g.resident_input("Pinned stream root", p.root.clone());
-                g.stream_roots.insert(root);
+            if dispatch {
+                self.last_visible[i] = selected;
+                if self.waiting.get(&i).is_some_and(|v| v.0 <= selected)
+                    && let Some((_, _, start)) = self.waiting.remove(&i)
+                {
+                    self.metrics.available(start);
+                }
+            }
+            if p.root_offset(selected).is_some() {
+                let root = *roots.entry(p.root.as_ptr()).or_insert_with(|| {
+                    let root = g.resident_input("Pinned stream root", p.root.clone());
+                    g.stream_roots.insert(root);
+                    root
+                });
                 bindings.push(root)
             } else {
                 for j in 0..p.levels[selected - 1].bytes.div_ceil(PAGE_BYTES) {
@@ -394,10 +461,13 @@ impl Streamer {
             }
         }
         let table = g.address_table(bindings);
+        self.metrics.stats.deferred_units = self.waiting.len();
+        self.metrics.finish();
         Ok(View {
             table,
             parts,
             uploads: uploaded,
+            stats: self.metrics.stats,
         })
     }
     /// Detach an asset now. Existing frame graphs keep their immutable binding and GPU leases.
@@ -407,20 +477,62 @@ impl Streamer {
             .get_mut(part)
             .ok_or_else(|| anyhow::anyhow!("unknown stream part"))?;
         entry.take();
+        self.minimum.remove(&part);
+        self.waiting.remove(&part);
         self.pages.retain(|key, _| key.0 != part);
         self.admission = None;
         Ok(())
     }
-    pub fn observe_demand(&self, g: &mut Graph, buffer: Resource) {
+    /// Allocate one feedback target for all contributing passes in this view.
+    pub fn request_buffer(&self, g: &mut Graph) -> Resource {
+        g.input(
+            "Visible streaming units",
+            feedback::buffer(self.parts.len()),
+        )
+    }
+    /// Call after the last writer; the RHI publishes this immutable view's feedback upon retirement.
+    pub fn observe_requests(&self, g: &mut Graph, buffer: Resource, secondary: bool) {
         g.pass(
-            "Read completed demand",
+            "Read visible streaming units",
             Op::Counters {
                 buffer,
                 first: 0,
-                labels: vec!["visible page demand"],
+                labels: vec![],
             },
         );
-        g.stream_feedback.insert(buffer, self.feedback.clone());
+        g.stream_feedback.insert(
+            buffer,
+            FeedbackSink {
+                reports: self.feedback.clone(),
+                frame: self.frame,
+                secondary,
+                units: self.parts.len(),
+            },
+        );
+    }
+    pub fn set_cache_frames(&mut self, frames: u64) {
+        self.cache_frames = frames;
+    }
+    /// A world/physics consumer can pin the minimum detail of a unit. Zero removes its vote.
+    pub fn set_minimum(&mut self, unit: usize, level: usize) -> Result<()> {
+        let part = self
+            .parts
+            .get(unit)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| anyhow::anyhow!("unknown streaming unit"))?;
+        ensure!(level <= part.levels.len(), "invalid minimum stream level");
+        if level == 0 {
+            self.minimum.remove(&unit);
+        } else {
+            self.minimum
+                .insert(unit, ((level as u32) << 24) | PRIORITY_MASK);
+        }
+        Ok(())
+    }
+    pub fn set_target_frame_ms(&mut self, ms: f64) -> Result<()> {
+        ensure!(ms.is_finite() && ms > 0., "invalid frame-time target");
+        self.frame_budget_ms = ms;
+        Ok(())
     }
 }
 
@@ -453,7 +565,8 @@ mod tests {
                 pool_pages: 1,
             },
         )?;
-        s.feedback.store(0x11, Ordering::Release);
+        s.set_minimum(0, 1)?;
+        s.set_minimum(1, 1)?;
         let mut old = Graph::new([1, 1]);
         let v = s.bind(&mut old, None)?;
         assert_eq!(s.pending.len(), 1);
@@ -482,6 +595,95 @@ mod tests {
         assert!(next.physical_pages.is_empty());
         Ok(())
     }
+
+    #[test]
+    fn admission_reserves_high_benefit_complete_groups_and_keeps_a_reachable_fallback() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("groups.pages");
+        let mut payloads = vec![vec![
+            vec![0; 4],
+            vec![1; PAGE_BYTES],
+            vec![2; PAGE_BYTES * 4],
+        ]];
+        payloads.push(vec![vec![0; 4], vec![5; PAGE_BYTES * 2]]);
+        let p = Package::cook(&path, payloads)?;
+        let parts = p.parts.into_iter().map(Some).collect::<Vec<_>>();
+        let demand = BTreeMap::from([(0, 2 << 24 | 4), (1, 1 << 24 | 15)]);
+        let selection = Admission::new(&parts, &demand, 3, &Default::default(), 33);
+        assert_eq!(selection.levels, [1, 1]);
+        assert_eq!(selection.requests, [(1, 1, 0), (1, 1, 1), (0, 1, 0)]);
+        let small = Admission::new(&parts, &demand, 1, &Default::default(), 34);
+        assert_eq!(small.levels, [1, 0]); // Never reserve an undrawable half group.
+        Ok(())
+    }
+    #[test]
+    fn packed_levels_keep_word_offsets_and_independent_units_exceed_eight() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("joint.pages");
+        let data = (0..40)
+            .map(|_| vec![vec![0; 4], vec![3; 16], vec![7; 64]])
+            .collect();
+        Package::cook(&path, data)?;
+        assert_eq!(path.metadata()?.len(), 0);
+        let package = Package::open(&path)?;
+        assert_eq!(&package.parts[39].root[20..24], &[7; 4]);
+        let mut s = Streamer::new(package, Default::default())?;
+        s.set_minimum(39, 2)?;
+        let mut g = Graph::new([1, 1]);
+        let view = s.bind(&mut g, None)?;
+        assert_eq!(view.parts[39].unwrap().word_offset, 5);
+        assert_eq!(view.parts[0].unwrap().level, 0);
+        assert_eq!(view.stats.reads, 0);
+        assert_eq!(g.stream_roots.len(), 1);
+        Ok(())
+    }
+    #[test]
+    fn cached_pages_survive_a_short_reversal_and_retry_after_an_io_error() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("cold.pages");
+        let mut s = Streamer::new(make(&path, 3)?, Default::default())?;
+        s.set_cache_frames(3);
+        s.set_minimum(0, 1)?;
+        std::fs::File::create(&path)?;
+        let started = Instant::now();
+        loop {
+            let mut g = Graph::new([1, 1]);
+            s.bind(&mut g, None)?;
+            if s.last_error.is_some() {
+                break;
+            }
+            ensure!(started.elapsed().as_secs() < 5, "missing failure");
+            std::thread::yield_now();
+        }
+        std::fs::write(&path, vec![3; PAGE_BYTES])?;
+        loop {
+            let mut g = Graph::new([1, 1]);
+            s.bind(&mut g, None)?;
+            if let Some((_, ticket)) = g.page_copies.first() {
+                ticket.lease.complete.store(true, Ordering::Release);
+                break;
+            }
+            ensure!(started.elapsed().as_secs() < 5, "retry did not recover");
+            std::thread::yield_now();
+        }
+        let mut g = Graph::new([1, 1]);
+        let read = s.bind(&mut g, None)?.stats.reads;
+        s.set_minimum(0, 0)?;
+        let mut g = Graph::new([1, 1]);
+        assert_eq!(s.bind(&mut g, None)?.parts[0].unwrap().level, 0);
+        s.set_minimum(0, 1)?;
+        let mut g = Graph::new([1, 1]);
+        let v = s.bind(&mut g, None)?;
+        assert_eq!(v.parts[0].unwrap().level, 1);
+        assert_eq!(v.stats.reads, read);
+        s.set_minimum(0, 0)?;
+        for _ in 0..5 {
+            s.bind(&mut Graph::new([1, 1]), None)?;
+        }
+        assert!(s.pages.is_empty());
+        Ok(())
+    }
     #[test]
     fn short_disk_read_keeps_rendering_root() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -489,7 +691,7 @@ mod tests {
         let package = make(&p, 3)?;
         std::fs::File::create(p)?;
         let mut s = Streamer::new(package, Default::default())?;
-        s.feedback.store(1, Ordering::Release);
+        s.set_minimum(0, 1)?;
         let start = std::time::Instant::now();
         loop {
             let mut g = Graph::new([1, 1]);

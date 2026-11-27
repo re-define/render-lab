@@ -235,6 +235,15 @@ impl Allocator {
                     binding,
                 ));
             }
+            if class == Class::StreamPage && req.size > self.stats.stream_available() {
+                let limit = self.stats.stream_budget_bytes.expect("limited stream pool");
+                return Err(memory::BudgetExceeded {
+                    live: limit - self.stats.stream_available(),
+                    request: req.size,
+                    limit,
+                }
+                .into());
+            }
             // A block can exceed available budget or contiguous memory while the exact range fits.
             if !self.stats.allows(local, req.size) {
                 over_budget = true;
@@ -243,6 +252,9 @@ impl Allocator {
             match target.allocate_memory(g, ty, req.size, true) {
                 Ok(memory) => {
                     self.stats.allocate(class, local, req.size);
+                    if class == Class::StreamPage {
+                        self.stats.stream_dedicated_bytes += req.size;
+                    }
                     self.tracker.row(id).driver_allocated(req.size);
                     return Ok((
                         Backing {
@@ -291,7 +303,9 @@ impl Allocator {
             }
         }
         let bytes = if size <= 128 << 10 { 2 << 20 } else { 16 << 20 };
-        if !self.stats.allows(info.device_local, bytes) {
+        if (stream && bytes > self.stats.stream_available())
+            || !self.stats.allows(info.device_local, bytes)
+        {
             return Ok(None);
         }
         match self.open_block(g, target, ty, bytes, info.device_local, (opener, stream)) {
@@ -371,6 +385,9 @@ impl Allocator {
         let class = row.class;
         row.unbind(info.allocated_bytes, backing.capacity, backing.used);
         if !info.pooled {
+            if class == Class::StreamPage {
+                self.stats.stream_dedicated_bytes -= info.allocated_bytes;
+            }
             unsafe {
                 g.dev.free_memory(backing.memory, None);
             }

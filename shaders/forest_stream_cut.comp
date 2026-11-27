@@ -1,0 +1,36 @@
+#version 460
+#include "forest_stream.glsl"
+#define STREAM_REQUEST_BINDING 7
+#include "stream_requests.glsl"
+layout(local_size_x=64) in;
+layout(binding=0,std430) readonly buffer View {Frame f;};
+layout(binding=1,std430) readonly buffer Models {mat4 model[];};
+layout(binding=2,std430) readonly buffer Groups {CanopyGroup groups[];};
+layout(binding=3,std430) readonly buffer Links {uint parents[];};
+layout(binding=4,std430) readonly buffer Schedule {uint order[];};
+layout(binding=5,std430) readonly buffer Bindings {Unit units[];};
+layout(binding=6,std430) buffer State {uint activeGroup[];};
+layout(push_constant) uniform Params{layout(offset=32) uint first;uint count;} p;
+void main(){
+    uint i=gl_GlobalInvocationID.x;
+    if(i>=p.count)return;
+    uint instance=gl_WorkGroupID.y,base=instance*f.size.z,g=order[p.first+i];
+    CanopyGroup group=groups[g];
+    bool ready=true;
+    for(uint k=0;k<group.count;k++)ready=ready && activeGroup[base+parents[group.parents+k]]!=0;
+    if(group.unit!=NONE && ready){
+        mat4 m=model[instance];vec3 world=(m*vec4(group.sphere.xyz,1)).xyz;
+        float scale=length(m[0].xyz),radius=group.sphere.w*scale;
+        vec4 clip=f.vp*vec4(world,1);
+        float depth=max(distance(world,f.eye.xyz)-radius,0.15);
+        float pixelError=uintBitsToFloat(group.errorBits)*scale*f.eye.w/depth;
+        // A conservative sphere may overlap the frustum even if its center is outside.
+        float slack=radius*3.;
+        ready=clip.w+slack>0.&&all(lessThanEqual(abs(clip.xy),vec2(clip.w+slack)))&&pixelError>1.25;
+        if(ready){
+            requestStreamUnit(group.unit,1u,uint(clamp(pixelError*256.,1.,16000000.)));
+            ready=units[group.unit].level>0u;
+        }
+    }
+    activeGroup[base+g]=ready?1u:0u;
+}

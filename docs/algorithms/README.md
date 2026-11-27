@@ -3,6 +3,7 @@
 | 研究问题 | 输入与输出 | 主要实验 |
 | --- | --- | --- |
 | [怎样构建和绘制稀疏植被](cluster-voxels.md) | 几何与表面属性 → 混合簇层级 → 每像素最近表面 | `clusters`、`forest-karst` |
+| [树皮与树冠如何按页驻留](forest-streaming.md) | 可见 UV 和树冠误差 → 页请求 → 完整子组替换与分区退役 | `forest-stream` |
 | [怎样从可见性得到光照](visibility-lighting.md) | 表面 ID、深度、材质、光源和运动历史 → 直接光、间接光、重建颜色 | `restir`、`gi12-forest`、`mixed` |
 | [怎样选出下一段动作](animation-physics.md) | 输入轨迹、脚的位置与速度、上一子步实际运动 → 基础姿态与期望根位移 | `motion`、`silver-contact` |
 | [怎样给不同角色组合姿态](pose-graphs.md) | 基础动作、片段、骨骼遮罩和接触观测 → 角色的最终局部姿态 | `silver-contact`、`silver-contact-duo` |

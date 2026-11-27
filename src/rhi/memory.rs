@@ -117,6 +117,18 @@ pub struct ManagedMemory {
     pub pool_blocks: usize,
     /// Committed Vulkan blocks dedicated to fixed-size streamed pages.
     pub stream_pool_bytes: u64,
+    /// Device-wide allowance across stream owners. Pins have priority over refinements.
+    pub stream_budget_bytes: Option<u64>,
+    pub stream_dedicated_bytes: u64,
+    pub stream_root_bytes: u64,
+    /// Bound fine pages detached from the manager but held by plans or native frame slots.
+    pub stream_retiring_bytes: u64,
+    /// Committed external slabs plus portable source bytes in submitted/uploading graphs.
+    pub stream_staging_bytes: u64,
+    pub stream_native_staging_bytes: u64,
+    /// Reserved part of the allowance for asynchronous D3D12 slabs; zero on portable devices.
+    pub stream_native_reserve_bytes: u64,
+    pub stream_eviction_requests: u64,
     /// Snapshot sequence, including submissions without a presented image.
     pub submission: u64,
     pub purposes: std::sync::Arc<[super::PurposeMemory]>,
@@ -124,9 +136,29 @@ pub struct ManagedMemory {
 impl ManagedMemory {
     pub(super) fn allows(&self, local: bool, bytes: u64) -> bool {
         !local
-            || self
-                .budget_bytes
-                .is_none_or(|cap| bytes <= cap.saturating_sub(self.device_local.total()))
+            || self.budget_bytes.is_none_or(|cap| {
+                bytes
+                    <= cap
+                        .saturating_sub(self.device_local.total())
+                        .saturating_sub(self.stream_native_staging_bytes)
+            })
+    }
+    pub(super) fn stream_available(&self) -> u64 {
+        let resident = self
+            .stream_pool_bytes
+            .saturating_add(self.stream_dedicated_bytes)
+            .saturating_add(self.stream_root_bytes)
+            .saturating_add(
+                self.stream_staging_bytes
+                    .saturating_sub(self.stream_native_staging_bytes),
+            )
+            .saturating_add(
+                self.stream_native_reserve_bytes
+                    .max(self.stream_native_staging_bytes),
+            );
+        self.stream_budget_bytes
+            .unwrap_or(u64::MAX)
+            .saturating_sub(resident)
     }
     pub(super) fn set_budget(&mut self, bytes: Option<u64>) -> Result<()> {
         ensure!(

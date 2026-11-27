@@ -34,43 +34,36 @@ UE RDG 根据图内资源生命周期计划瞬态复用，外部资源由调用�
 
 Epic 公开的 Nanite 资料中，层级元数据常驻。遍历可以看到当前驻留边界之外，提出理想细节请求；实际绘制使用足以覆盖表面的已驻留祖先。虚拟纹理由 GPU 反馈可见 tile 的需求，CPU 获知需求存在帧延迟，物理页池与页表分开。[Nanite 团队 SIGGRAPH 讲义](https://advances.realtimerendering.com/s2021/Karis_Nanite_SIGGRAPH_Advances_2021_final.pdf) · [Streaming Virtual Texturing](https://dev.epicgames.com/documentation/en-us/unreal-engine/streaming-virtual-texturing-in-unreal-engine) · [虚拟纹理物理池](https://dev.epicgames.com/documentation/unreal-engine/virtual-texture-memory-pools-in-unreal-engine)
 
-每个流式资产有不可变清单、常驻粗级和独立细节页。以 64 KiB 为物理页的单位；逻辑页约定有效字节和内容版本。贴图、几何和骨骼各自有独立的细节选择。第一版以完整级别作为提交单位，单个级别可以跨页。后台读取按页进行，前台限制每帧接纳的页数。页未齐、请求失败或预算不够时继续画粗级。发布新映射时冻结当帧的地址表；RHI 只能在最后一次 GPU 使用完成后回收页。细化请求从已完成帧得到，GPU 无需等待 CPU 返回请求。实验在同一相机下分别强制粗级、延迟提供细级、以及全部驻留，并检查实际像素。
+运行时使用 64 KiB 的物理页。烘焙者为每个可独立使用的单元提供一个常驻根和若干细级。森林把一个可替换的簇组或一块树皮纹理登记成一个单元，织纹实验则将贴图、网格和关节分别登记。一个细级可跨多个页，全部到齐后一次发布。最多 256 字节的细级在根容量足够时与根共享缓冲和字偏移，相同根数据在同一管理器内共享。旧格式的索引仍可读取。[包格式](../../src/streaming/package.rs) · [调度](../../src/streaming/policy.rs)
 
-### 文件路径、传输队列和帧预算
+### 反馈、预算与页表
 
-GPU 根据屏幕上的实际使用反馈期望细节。CPU 消费已退役帧的请求，处理文件范围、驻留和预算。每帧有请求数、在途页数、上传字节限制，后台读取遇到慢盘时继续使用父级。流式 copy 是 RDG transfer pass，通过时间线信号量与消费队列衔接。物理队列不足时沿用 RHI 的同队列映射。
+GPU 向有界缓冲报告单元编号、期望等级和相对优先级。同一单元用原子最大值合并，首次请求写入最多 512 个去重编号的短表。短表溢出时从完整分数表恢复需求，同时累计溢出次数。每个管理器最多登记 16,384 个单元。主、次视图独立上报，主视图负责每帧接纳预算；次视图过期后退出合并。显式最低等级可用于预取。无可用细级时仍绘制常驻根。[着色器协议](../../shaders/stream_requests.glsl) · [读回与多视图](../../src/streaming/feedback.rs)
 
-Windows 的 DirectStorage 可以向 D3D12 缓冲写入。Vulkan 的 NVIDIA 解压与间接复制扩展本身没有打开和读取文件的接口。原生路径采用同适配器的 DirectStorage 文件队列与可导入的 GPU 缓冲；可移植路径只在后台读取本次请求的文件页，通过暂存拷贝。两种后端应分别标记。系统内部是否使用中转内存取决于磁盘、驱动和运行时。[NVIDIA RTX IO](https://developer.nvidia.com/rtx-io) · [Microsoft DirectStorage](https://github.com/microsoft/DirectStorage)
+缺页调度先按收益排序，同收益优先等待较久的单元，预留能完整发布的表示并在剩余容量内准备中间级。默认每主视图帧最多接纳 8 个页读请求、上传 4 页（256 KiB），16 页可同时在途。最近 GPU 跨度的平滑值超出目标帧时间后，单帧上传降至 1 页。延迟从 CPU 首次收到对应需求计到首次构建可使用它的地址表，统计最近 512 次完成的 P95。未满足需求另计。慢盘、暂时的读取失败或设备容量不足时保留可绘制的较粗数据，失败读取在继续需要时退避重试。[管理器与计数](../../src/streaming.rs)
 
-### 从请求到销毁
+### 从硬盘到最后一次 GPU 使用
 
-`Streamer::from_packages` 把多个包交给同一个页池和后台文件线程。实验的 32 位反馈字最多描述八个独立部分，每部分有常驻根和最多四个细级。解码时按粗到细分配容量，整个级别的页就绪后才提升。两张图同时读取一个物理页时，两张图各有一份引用。后台文件读失败保留根级；DirectStorage 导入失败会改用分段文件读取；设备页分配超预算后隔 60 个主视图构建再试。[页管理](../../src/streaming.rs) · [包格式](../../src/streaming/package.rs) · [Vulkan 资源准备](../../src/rhi/mod.rs)
+1. 后台线程按文件和传输后端归并一帧已接纳的请求，并按文件偏移排序。连续文件范围可合并读取。Windows DirectStorage 后端允许多批在途，复用同适配器共享缓冲，一批请求共用时间线点。普通后台文件读取通过 Vulkan 暂存复制，两条路径都受预算约束。[文件读取](../../src/streaming/disk.rs) · [DirectStorage 桥接](../../src/rhi/storage_bridge.cpp)
+2. RDG 把复制登记成 transfer pass。RHI 查询精确的复制时间线点，允许页比整帧更早就绪；新帧冻结自己的地址表，消费队列与该上传点同步。原生后端检查同适配器和 Win32 外部内存、栅栏导入能力。同一通用队列族有三条队列时 transfer 用第三条，队列不足时使用图形队列。[时间线](../../src/rhi/queues.rs)
+3. 失去需求后，映射降级；有空位时短暂保留已完成的冷页，通用默认 8 帧，森林演示 75 帧。显式卸载会撤销管理器持有的引用，旧图和在途命令继续持有页租约。RHI 收到最后引用的退役通知后回收槽位，专用块内全部页退役后归还 Vulkan device memory。[帧租约](../../src/streaming.rs) · [显存分配](../../src/rhi/allocator.rs)
+4. 设备级流式预算默认 64 MiB，可用 `RENDER_LAB_STREAM_BUDGET_MIB` 配置。各管理器保留各自的逻辑容量。设备高水位时优先向含冷页的块发回收请求。监控分别报告常驻根、绑定细页、页池已分配块、待退役页和上传暂存；这些数值部分互相包含。驱动私有内存与系统内部中转另计。[设备级预算](../../src/rhi/streaming.rs) · [内存计数](../../src/rhi/memory.rs) · [Microsoft DirectStorage](https://github.com/microsoft/DirectStorage/blob/main/Docs/DeveloperGuidance.md)
 
-| 时刻 | 新帧能看到什么 | 物理内存发生什么 |
-| --- | --- | --- |
-| GPU 首次看到表面 | mesh shader 用当前级几何和骨骼生成可见性，resolve 用命中 UV 采样当前级纹理 | resolve 用相邻可见像素的 UV 足迹计算各部分的需求，各工作组归并后写反馈 |
-| RHI 读到已退役的反馈 | 保持当前精度 | 主视图默认每帧最多接纳 4 个文件请求、提交 2 页复制（128 KiB）；等待文件或等待复制的页合计上限为 8 |
-| 细级传输完成 | 下次构图选择完整细级，把对应设备地址写入新帧的地址表 | 传输队列发出 timeline 值，读取簇或纹理的队列建立可见性。RHI 的三队列配置在同一通用队列族内为 transfer 分配第 3 条队列。双队列配置和单队列配置把 transfer 映射到图形队列 |
-| 拉远、失去可见性或显式卸载 | 收到较低精度反馈后重新选级；显式 `unload_part` 立即使后续地址表省略该部分，迟到的反馈无法将它复活 | 已构建的图、上传命令和在途 GPU 提交继续持有旧页。常规帧释放暂存、导入的共享缓冲和栅栏 |
-| 最后一个读者退役 | 下次申请可以使用相同页槽 | 最后一份引用向 RHI 投递回收事件。每次清理最多处理 8 个事件；队列空闲时也处理。RHI 先核对该槽目前的所有者，再销毁缓冲、归还子分配。专用块内最后一页归还后释放 Vulkan device memory |
+### 世界分区与共享资产
 
-默认细页池最多 32 页，即 2 MiB **有效页容量**。常驻根、地址表、在途传输源和驱动内部资源另计。块内可复用空间仍占承诺显存；观察 `managed.device_local.stream_page` 看已绑定页，观察 `managed.stream_pool_bytes` 看页池专用块。设备要求专用分配或预算只容得下单页时，分配器可以退回单独分配。DirectStorage 的共享传输源额外计入帧资源字节；系统的私有 staging 和驱动总占用不在该 Vulkan 管理器的快照内。[分配器](../../src/rhi/allocator.rs) · [内存计数](../../src/rhi/memory.rs) · [DirectStorage 数据流与内部 staging](https://github.com/microsoft/DirectStorage/blob/main/Docs/DeveloperGuidance.md)
+单元声明带版本的资产名和启动所需的最低等级。空间索引汇总各加载源范围内的声明，重叠需求取最高等级并发布到提取快照。渲染端可报告实际达到的等级，世界在随后的 tick 检查激活条件。撤销一个单元时只撤销该单元的需求。完全卸载后重入会创建新的就绪状态，先前快照迟到的反馈无法放行新一轮激活。[单元与依赖](../../src/scene/partition.rs) · [森林消费者](../../src/experiments/vegetation/streaming.rs)
 
-### 世界逻辑分区
-
-`world-stream` 有持久运动场景和三个独立的逻辑单元，每个单元六个带重力的实体。空间格索引查询相机以及 `Engine::streaming_sources` 提供的流式源。启动半径是 9，预取半径是 14，卸载半径是 18。进入预取范围时后台读文件，进入启动范围时把整单元插入 ECS，当次世界 tick 即可推进模拟。离开 14 后停止推进，离开 18 后释放预取副本。一帧增删实体合计最多 32 个，读和写合计最多 2 个在途任务。单元定义中的实体数量必须适合这一帧预算。[分区调度](../../src/scene/partition.rs) · [单元格式](../../src/scene/partition/cell.rs) · [Epic World Partition](https://dev.epicgames.com/documentation/en-us/unreal-engine/world-partition-in-unreal-engine)
-
-有状态单元退场时冻结一份行数据交给后台写临时检查点。写成后释放行数据，重入时再加载。保存场景会在存档旁发布按内容命名的 `cells/` 文件，然后原子替换根文档。复制存档时需要同时复制这个目录。叶实体可以持有持久的网格、材质和几何代理引用，行内保存变换和插件组件。父子关系跨单元迁移、活动角色自动改属单元和全世界 HLOD 留给后续工作。[存档](../../src/scene.rs) · [带运动与物理的预设](../../src/experiments/movement_lab.rs)
+`world-stream` 的激活、预取和卸载半径分别为 9、14 和 18。实体增删预算为每 tick 合计 32 行，装配批之间检查 1 ms 的主线程时间预算。由独立叶实体组成的大单元可以烘焙成共享位置和依赖的多个原子批，各批独立激活和存档。单个批内部的执行耗时可能超过时间预算。有状态实体退出时写入后台检查点；可移动叶实体改变所属单元时保留稳定 ID、姿态和动量。存档发布内容寻址的单元文件并原子替换根清单，重复保存复用未变单元。复制存档需要同时复制旁边的 `cells/` 目录。跨单元骨架和有父子依赖的实体组还需要专门的依赖描述。[移动实体](../../src/scene/partition/mobile.rs) · [增量保存](../../src/scene/partition/archive.rs) · [Epic World Partition](https://dev.epicgames.com/documentation/en-us/unreal-engine/world-partition-in-unreal-engine)
 
 ### 接入与复现
 
-普通构建使用后台文件读取和 Vulkan transfer。Windows x64 MSVC 构建可设置 `RENDER_LAB_DSTORAGE_SDK` 指向官方 NuGet 包中包含 `include/`、`bin/x64/` 的 `native` 目录，同时配置 `VULKAN_SDK`。构建脚本将两个官方运行库放在可执行文件旁。启动时检查同一适配器的 LUID、可导入 D3D12 资源及时间线栅栏。严格测试要求所有成功上传均走 DirectStorage。[SDK](https://www.nuget.org/packages/Microsoft.Direct3D.DirectStorage/1.3.0) · [桥接实现](../../src/rhi/storage_bridge.cpp)
+普通构建使用后台文件读取和 Vulkan transfer。Windows x64 MSVC 的可选原生后端需要 `VULKAN_SDK`，以及指向官方 NuGet 包（含 `include/` 和 `bin/x64/` 的 `native` 目录）的 `RENDER_LAB_DSTORAGE_SDK`。构建脚本将两个运行库放在可执行文件旁。设置 `RENDER_LAB_REQUIRE_DIRECTSTORAGE=1` 运行上传回归可以核对实际成功的上传均使用该路径。[SDK](https://www.nuget.org/packages/Microsoft.Direct3D.DirectStorage/1.3.0)
 
 ```powershell
-cargo run --release --locked -- --experiment streaming
-cargo run --release --locked -- --experiment world-stream
-cargo test --release --locked --lib preload_activate_simulate_unload_save_and_resume
+cargo run --release --locked -- --experiment forest-stream
+cargo run --release --locked --example forest_stream
+cargo test --release --locked --lib scene::partition::tests
 cargo test --release --locked --lib streamed_pixels_refine_then_release -- --ignored --nocapture
 ```
 
-在准备好 SDK 的终端里设置 `$env:RENDER_LAB_REQUIRE_DIRECTSTORAGE='1'` 可将最后一项变成严格传输后端测试。研究场景已经按三种细节实际绘制，旧森林 DAG、普通材质图集及银狼完整动画库各自沿用原有驻留路径。此版以完整级别为发布单位，距离可按任意可见纹理 tile、单个 DAG 页和动画片段寻址的生产系统还有粒度差距。世界层和资产层有各自的实验入口。[渲染场景与 GPU 回归](../../src/experiments/streaming_lab.rs) · [测量数据](performance.md)
+`forest-stream` 使用两个相邻分区共享的一种森林橡树，验证树冠三角 DAG 和树皮 tile 的可见反馈。完整岩柱森林的体素、阴影/GI 和银狼完整动画库仍有各自的驻留路径。织纹和世界分区仍可独立通过 `streaming`、`world-stream` 运行。[实验目录](../experiment-catalog.md) · [实测与边界](performance.md)

@@ -38,6 +38,7 @@ mod generate;
 mod karst;
 mod landscape;
 mod river_forest;
+pub mod streaming;
 use crate::{
     engine::{Engine, SimulationData, SimulationSystem, SystemAccess, SystemContext, SystemOrder},
     experiments::clusters,

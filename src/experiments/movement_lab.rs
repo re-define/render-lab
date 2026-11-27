@@ -102,6 +102,7 @@ pub fn partitioned() -> Result<World> {
             center,
             file,
             save_state: true,
+            assets: Default::default(),
         });
     }
     w.partition = Some(Layout::new(base, cells, 9., 14., 18.)?.into());

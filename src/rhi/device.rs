@@ -432,6 +432,9 @@ pub(super) struct Buffer {
     pub uploaded: Option<std::sync::Weak<[u8]>>,
 }
 impl Buffer {
+    pub(super) fn memory_block(&self) -> vk::DeviceMemory {
+        self.backing.memory
+    }
     pub fn new(
         gpu: &Arc<Gpu>,
         bytes: u64,

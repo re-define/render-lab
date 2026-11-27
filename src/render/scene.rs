@@ -286,6 +286,8 @@ impl SceneExtractor {
         self.previous = Some(scene.clone());
         Ok(Snapshot {
             secondary_view: false,
+            cell_asset_levels: world.cell_asset_levels.clone(),
+            cell_asset_ready: world.cell_asset_ready.clone(),
             buffer_atomic64: false,
             stream_adapter: None,
             reference_draws: std::env::var_os("RENDER_LAB_REFERENCE_DRAWS").is_some(),

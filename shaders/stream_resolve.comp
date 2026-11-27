@@ -2,9 +2,10 @@
 #define PAGE_TABLE 1
 #include "stream_pages.glsl"
 #include "visibility_image.glsl"
-layout(set=0,binding=2,std430) readonly buffer Scene {mat4 vp;uvec4 offsets;uvec4 sizes;};
+layout(set=0,binding=2,std430) readonly buffer Scene {mat4 vp;uvec4 offsets;uvec4 sizes;uvec4 starts;};
 layout(set=0,binding=3,std430) buffer OutputColor {uint color[];};
-layout(set=0,binding=4,std430) buffer Feedback {uint demand[];};
+#define STREAM_REQUEST_BINDING 4
+#include "stream_requests.glsl"
 layout(local_size_x=8,local_size_y=8) in;
 shared uint groupDemand;
 void main(){
@@ -18,7 +19,7 @@ void main(){
             vec2 uv=unpackUnorm2x16(hit.y);
             uint side=sizes.x;
             uvec2 texel=min(uvec2(uv*side),uvec2(side-1));
-            c=unpackUnorm4x8(wordAt(offsets.x,texel.y*side+texel.x)).rgb;
+            c=unpackUnorm4x8(wordAt(offsets.x,starts.x+texel.y*side+texel.x)).rgb;
             uvec2 nx=visibilityAt(min(p+uvec2(1,0),extent-1)), ny=visibilityAt(min(p+uvec2(0,1),extent-1));
             if(nx.x!=0 && ny.x!=0){
                 vec2 dx=uv-unpackUnorm2x16(nx.y),dy=uv-unpackUnorm2x16(ny.y);
@@ -33,5 +34,10 @@ void main(){
         color[p.y*extent.x+p.x]=packUnorm4x8(vec4(c.bgr,1));
     }
     barrier();
-    if(gl_LocalInvocationIndex==0 && groupDemand!=0)atomicOr(demand[0],groupDemand);
+    if(gl_LocalInvocationIndex==0 && groupDemand!=0){
+        for(uint unit=0u;unit<3u;unit++){
+            uint level=bitCount((groupDemand>>(4u*unit))&3u);
+            requestStreamUnit(unit,level,level*100u);
+        }
+    }
 }

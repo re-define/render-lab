@@ -9,6 +9,7 @@ pub use frame::{
 };
 mod memory;
 mod raster_queries;
+mod streaming;
 use memory::Class;
 pub use memory::{AllocationActivity, Class as MemoryClass, ManagedMemory, MemoryBreakdown};
 mod purposes;
@@ -337,6 +338,15 @@ impl Backend {
                 mib.checked_mul(1 << 20).context("GPU budget overflow")?,
             ))?;
         }
+        let stream_limit = std::env::var("RENDER_LAB_STREAM_BUDGET_MIB")
+            .ok()
+            .map(|v| v.parse::<u64>())
+            .transpose()
+            .context("invalid stream budget in MiB")?
+            .unwrap_or(64)
+            .checked_mul(1 << 20)
+            .context("stream budget overflow")?;
+        gpu.allocator.lock().unwrap().stats.stream_budget_bytes = Some(stream_limit);
         let slots = [FrameSlot::new(&gpu, 0)?, FrameSlot::new(&gpu, 1)?];
         let timelines = queues::Timelines::new(&gpu)?;
         let (page_retirement, retired_pages) = std::sync::mpsc::channel();
@@ -375,7 +385,9 @@ impl Backend {
         index: usize,
         reuse: &transient::Reuse,
     ) -> Result<UploadBytes> {
+        self.timelines.publish_stream_copies(&self.pending)?;
         self.prune_stream_pages();
+        self.update_stream_pressure(&plan.graph);
         let g = &self.gpu;
         let graph = &plan.graph;
         let slot = &mut self.slots[index];
@@ -1030,6 +1042,9 @@ impl Backend {
         if let Some(frame) = self.completed.pop_front() {
             return Some(Ok(frame));
         }
+        if let Err(error) = self.timelines.publish_stream_copies(&self.pending) {
+            return Some(self.recover().and(Err(error)));
+        }
         self.prune_stream_pages();
 
         let front = self.pending.front()?;
@@ -1455,6 +1470,8 @@ impl Backend {
         let mut counters = std::collections::BTreeMap::new();
         if !plan.graph.upload_sources.is_empty() {
             let mut counts = [0u64; 3];
+            #[cfg(lab_directstorage)]
+            let mut source_batches = std::collections::BTreeSet::new();
             for (upload, lease) in plan.graph.upload_sources.values() {
                 let index = if lease.failure.get().is_some() {
                     2
@@ -1464,7 +1481,18 @@ impl Backend {
                     1
                 };
                 counts[index] += 1;
+                #[cfg(lab_directstorage)]
+                if index == 1
+                    && let crate::streaming::Upload::Direct(page) = upload
+                {
+                    source_batches.insert(Arc::as_ptr(&page.batch));
+                }
             }
+            #[cfg(lab_directstorage)]
+            counters.insert(
+                "stream DirectStorage source batches",
+                source_batches.len() as u64,
+            );
             for (label, n) in [
                 "stream host uploads",
                 "stream DirectStorage uploads",
@@ -1490,10 +1518,7 @@ impl Backend {
                     if first == 0
                         && let Some(feedback) = plan.graph.stream_feedback.get(&buffer)
                     {
-                        feedback.store(
-                            u32::from_ne_bytes(data[..4].try_into()?),
-                            std::sync::atomic::Ordering::Release,
-                        );
+                        feedback.publish(data);
                     }
                     for (&name, word) in labels.iter().zip(data[first * 4..].chunks_exact(4)) {
                         *counters.entry(name).or_insert(0) +=
@@ -1516,14 +1541,20 @@ impl Backend {
         };
         account(&slot.heap._buffer.allocation);
         let mut shared = std::collections::BTreeSet::new();
+        #[cfg(lab_directstorage)]
+        let mut external = std::collections::BTreeSet::new();
         for r in &slot.resources {
             match r {
                 #[cfg(lab_directstorage)]
-                Physical::External(_) => account(&AllocationInfo {
-                    allocated_bytes: crate::streaming::PAGE_BYTES as u64,
-                    device_local: true,
-                    ..Default::default()
-                }),
+                Physical::External(import) => {
+                    if external.insert(import.buffer.as_raw()) {
+                        account(&AllocationInfo {
+                            allocated_bytes: import.capacity,
+                            device_local: true,
+                            ..Default::default()
+                        });
+                    }
+                }
                 Physical::Vacant => continue,
                 Physical::Buffer(b) => account(&b.allocation),
                 Physical::SharedBuffer(b) => {
@@ -1585,6 +1616,11 @@ impl Backend {
             u64::from(presentation.is_none() || profile.wsi_binary_pairs != 0);
         profile.rhi_ms = start.elapsed().as_secs_f64() * 1000.;
         profile.gpu_span_ms = aligned.then(|| (span[1] - span[0]) as f64 * period_ms);
+        if let Some(ms) = profile.gpu_span_ms {
+            for sink in plan.graph.stream_feedback.values() {
+                sink.report_gpu_ms(ms);
+            }
+        }
         for p in &mut passes {
             if let Some(interval) = &mut p.interval {
                 for t in interval {

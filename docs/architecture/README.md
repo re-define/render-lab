@@ -19,6 +19,9 @@ flowchart TD
     RDG --> RHI["RHI 线程 · 资源与帧槽、命令录制、提交"]
     RHI --> GPU["Vulkan 物理队列"]
     GPU -->|可见页需求，随帧退役| Pages["资产页管理 · 预算与后台 I/O"]
+    Cells -->|共享资产最低等级，经快照发布| Pages
+    Pages -->|已可用等级与当前需求世代| Cells
+    RHI -->|复制时间线与设备显存压力| Pages
     Pages -->|不可变帧地址表与 transfer pass| RDG
     GPU -->|主视口| Window["交换链呈现 · GPUI HUD"]
     GPU -->|显式读回| Export["截图、录像、诊断"]

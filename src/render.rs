@@ -141,6 +141,9 @@ pub use materials::{LightingInput, MaterialCode, MaterialPrograms};
 pub mod post;
 pub struct Snapshot {
     pub(crate) secondary_view: bool,
+    /// Minimum asset levels requested by the union of prefetched and active world cells.
+    pub cell_asset_levels: Arc<std::collections::BTreeMap<String, u8>>,
+    pub(crate) cell_asset_ready: crate::scene::partition::ReadyLevels,
     pub(crate) stream_adapter: Option<[u8; 8]>,
     /// Capabilities of the backend which will execute this snapshot.
     pub buffer_atomic64: bool,
@@ -155,6 +158,10 @@ pub struct Snapshot {
     pub(crate) previous_deformation: Option<Arc<RenderScene>>,
 }
 impl Snapshot {
+    /// Call with a completed resident level to unblock dependent logical cells.
+    pub fn report_asset_residency(&self, key: &str, level: u8) {
+        self.cell_asset_ready.record(key, level);
+    }
     pub fn new(
         world: &World,
         camera: Camera,
@@ -168,6 +175,8 @@ impl Snapshot {
     pub(crate) fn for_camera(&self, camera: Camera, extent: [u32; 2]) -> Self {
         Self {
             secondary_view: true,
+            cell_asset_levels: self.cell_asset_levels.clone(),
+            cell_asset_ready: self.cell_asset_ready.clone(),
             stream_adapter: self.stream_adapter,
             camera,
             extent,

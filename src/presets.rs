@@ -17,6 +17,7 @@ pub(super) const PRESETS: &[(&str, SceneBuilder)] = &[
         "world-stream",
         render_lab::experiments::movement_lab::partitioned,
     ),
+    ("forest-stream", vegetation::streaming::scene),
     ("streaming", render_lab::experiments::streaming_lab::scene),
     ("clusters", clusters::scene),
     ("vegetation", vegetation::scene),

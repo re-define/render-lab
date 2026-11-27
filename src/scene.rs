@@ -290,6 +290,10 @@ pub struct World {
     version: u32,
     #[serde(default)]
     pub partition: Option<Arc<partition::Layout>>,
+    #[serde(skip)]
+    pub(crate) cell_asset_levels: Arc<BTreeMap<String, u8>>,
+    #[serde(skip)]
+    pub(crate) cell_asset_ready: partition::ReadyLevels,
     /// Simulation seconds at the current dispatch, or the accepted boundary between ticks.
     #[serde(default)]
     pub(crate) time_seconds: f64,
@@ -311,6 +315,8 @@ impl Default for World {
         Self {
             version: 1,
             partition: None,
+            cell_asset_levels: Default::default(),
+            cell_asset_ready: Default::default(),
             time_seconds: 0.,
             motion_writers: &[],
             clocks: Default::default(),
@@ -607,6 +613,7 @@ impl World {
             let l = Arc::make_mut(l);
             l.base = path.parent().unwrap_or(Path::new(".")).to_owned();
             l.validate()?;
+            l.prepare_batches()?;
         }
         world.validate()?;
         // v1 stored the shading path on each use. Split only mismatching legacy uses

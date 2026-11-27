@@ -6,36 +6,70 @@ use std::{
     sync::Arc,
 };
 /// Level 0 is pinned. Other levels are immutable aligned file ranges, coarse to fine.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Part {
     pub root: Arc<[u8]>,
     pub levels: Vec<Level>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    inline: Vec<Option<usize>>,
 }
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Level {
     pub offset: u64,
     pub bytes: usize,
 }
+impl Part {
+    pub(super) fn root_offset(&self, level: usize) -> Option<usize> {
+        match level {
+            0 => Some(0),
+            n => self.inline.get(n - 1).copied().flatten(),
+        }
+    }
+}
+const INDEX_BYTES: u64 = 64 * 1024 * 1024;
 pub struct Package {
     pub path: PathBuf,
     pub parts: Vec<Part>,
 }
 impl Package {
     pub fn open(path: &Path) -> Result<Self> {
-        let parts: Vec<Part> = serde_json::from_reader(std::io::BufReader::new(
-            std::fs::File::open(path.with_extension("index"))?.take(4 << 20),
-        ))?;
+        let file = std::fs::File::open(path.with_extension("index"))?;
+        ensure!(
+            file.metadata()?.len() <= INDEX_BYTES,
+            "oversized streaming index"
+        );
+        let parts: Vec<Part> =
+            serde_json::from_reader(std::io::BufReader::new(file.take(INDEX_BYTES)))?;
         let length = path.metadata()?.len();
-        ensure!((1..=8).contains(&parts.len()), "invalid stream index");
+        ensure!(
+            (1..=super::feedback::MAX_UNITS).contains(&parts.len()),
+            "invalid stream index"
+        );
         for p in &parts {
             ensure!(
                 !p.root.is_empty()
                     && p.root.len() <= PAGE_BYTES
                     && p.root.len().is_multiple_of(4)
-                    && p.levels.len() <= 4,
+                    && p.levels.len() <= u8::MAX as usize,
                 "invalid stream root"
             );
-            for l in &p.levels {
+            ensure!(
+                p.inline.is_empty() || p.inline.len() == p.levels.len(),
+                "invalid inline level table"
+            );
+            for (i, l) in p.levels.iter().enumerate() {
+                if let Some(word) = p.root_offset(i + 1) {
+                    ensure!(
+                        l.bytes > 0
+                            && l.bytes.is_multiple_of(4)
+                            && word
+                                .checked_mul(4)
+                                .and_then(|start| start.checked_add(l.bytes))
+                                .is_some_and(|end| end <= p.root.len()),
+                        "invalid inline payload"
+                    );
+                    continue;
+                }
                 ensure!(
                     l.offset.is_multiple_of(PAGE_BYTES as u64)
                         && l.bytes > 0
@@ -60,16 +94,16 @@ impl Package {
         let mut offset = 0;
         let mut manifest = Vec::new();
         ensure!(
-            (1..=8).contains(&parts.len()),
-            "expected one to eight stream parts"
+            (1..=super::feedback::MAX_UNITS).contains(&parts.len()),
+            "invalid number of streaming units"
         );
         for levels in parts {
             ensure!(
-                (1..=5).contains(&levels.len()),
-                "expected a root and up to four detail levels"
+                (1..=256).contains(&levels.len()),
+                "expected a root and up to 255 detail levels"
             );
             let mut iter = levels.into_iter();
-            let root = iter
+            let mut root = iter
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("missing streaming root"))?;
             ensure!(
@@ -77,11 +111,22 @@ impl Package {
                 "invalid root page"
             );
             let mut ranges = Vec::new();
+            let mut inline = Vec::new();
             for bytes in iter {
                 ensure!(
                     !bytes.is_empty() && bytes.len().is_multiple_of(4),
                     "invalid stream level"
                 );
+                if bytes.len() <= 256 && root.len() + bytes.len() <= PAGE_BYTES {
+                    inline.push(Some(root.len() / 4));
+                    ranges.push(Level {
+                        offset: 0,
+                        bytes: bytes.len(),
+                    });
+                    root.extend(bytes);
+                    continue;
+                }
+                inline.push(None);
                 ranges.push(Level {
                     offset,
                     bytes: bytes.len(),
@@ -94,10 +139,15 @@ impl Package {
             manifest.push(Part {
                 root: root.into(),
                 levels: ranges,
+                inline,
             });
         }
         let mut index = tempfile::NamedTempFile::new_in(dir)?;
         serde_json::to_writer(&mut index, &manifest)?;
+        ensure!(
+            index.as_file().metadata()?.len() <= INDEX_BYTES,
+            "oversized streaming index"
+        );
         publish_immutable(out, path)?;
         publish_immutable(index, &path.with_extension("index"))?;
         Ok(Self {

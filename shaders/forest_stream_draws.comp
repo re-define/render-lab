@@ -1,0 +1,23 @@
+#version 460
+#include "forest_stream.glsl"
+layout(local_size_x=64) in;
+layout(binding=0,std430) readonly buffer View {Frame f;};
+layout(binding=1,std430) readonly buffer Chunks {uvec4 chunks[];};
+layout(binding=2,std430) readonly buffer State {uint activeGroup[];};
+layout(binding=3,std430) buffer Jobs {uvec2 jobs[];};
+layout(binding=4,std430) buffer Args {uvec4 args[];};
+layout(push_constant) uniform Params{layout(offset=24) uint pageSize;}p;
+layout(binding=5,std430) buffer Stats {uint stats[];};
+void main(){
+    uint i=gl_GlobalInvocationID.x,instance=gl_WorkGroupID.y;
+    if(i>=f.size.w)return;
+    uvec4 c=chunks[i];uint base=instance*f.size.z;
+    if(c.x!=NONE && activeGroup[base+c.x]==0)return;
+    if(c.y!=NONE && activeGroup[base+c.y]!=0)return;
+    uint slot=atomicAdd(stats[4],1u);
+    uint page=slot/p.pageSize;
+    jobs[slot]=uvec2(instance,i);
+    atomicAdd(args[page].x,1u);
+    if(slot%p.pageSize==0u)atomicAdd(stats[5],1u);
+    atomicAdd(stats[c.x==NONE?0u:1u],c.w);
+}

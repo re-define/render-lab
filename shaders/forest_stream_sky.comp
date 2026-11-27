@@ -1,0 +1,9 @@
+#version 460
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=0,std430) buffer OutputColor{uint colors[];};
+layout(push_constant) uniform Params{layout(offset=4) uint width;uint height;}p;
+void main(){
+    uvec2 xy=gl_GlobalInvocationID.xy;if(any(greaterThanEqual(xy,uvec2(p.width,p.height))))return;
+    vec3 c=mix(vec3(.22,.31,.36),vec3(.59,.70,.75),1.-float(xy.y)/float(p.height));
+    colors[xy.y*p.width+xy.x]=packUnorm4x8(vec4(c.bgr,1));
+}

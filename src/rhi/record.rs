@@ -463,8 +463,7 @@ impl Recorder {
                 if matches!(res[src.0], Physical::Vacant)
                     || matches!(res[dst.0], Physical::Vacant) => {}
             Op::CopyStreamPage { src, dst, bytes } => {
-                let region = vk::BufferCopy::builder().size(bytes as u64);
-                let source = match &res[src.0] {
+                let (source, offset) = match &res[src.0] {
                     #[cfg(lab_directstorage)]
                     Physical::External(import) => {
                         let acquire = vk::BufferMemoryBarrier2::builder()
@@ -474,16 +473,37 @@ impl Recorder {
                             .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
                             .dst_queue_family_index(self.gpu.family)
                             .buffer(import.buffer)
-                            .size(vk::WHOLE_SIZE);
+                            .offset(import.offset)
+                            .size(bytes as u64);
                         d.cmd_pipeline_barrier2(
                             cmd,
                             &vk::DependencyInfo::builder().buffer_memory_barriers(&[acquire]),
                         );
-                        import.buffer
+                        (import.buffer, import.offset)
                     }
-                    source => source.buffer().raw,
+                    source => (source.buffer().raw, 0),
                 };
+                let region = vk::BufferCopy::builder()
+                    .src_offset(offset)
+                    .size(bytes as u64);
                 d.cmd_copy_buffer(cmd, source, res[dst.0].buffer().raw, &[region]);
+                #[cfg(lab_directstorage)]
+                if matches!(&res[src.0], Physical::External(_)) {
+                    // The storage worker may reuse this slab after the last Vulkan frame releases it.
+                    let release = vk::BufferMemoryBarrier2::builder()
+                        .src_stage_mask(S::COPY)
+                        .src_access_mask(A::TRANSFER_READ)
+                        .dst_stage_mask(S::NONE)
+                        .src_queue_family_index(self.gpu.family)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+                        .buffer(source)
+                        .offset(offset)
+                        .size(bytes as u64);
+                    d.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::builder().buffer_memory_barriers(&[release]),
+                    );
+                }
             }
             Op::ReadPixels { image, buffer } | Op::WritePixels { image, buffer } => {
                 let [width, height] = plan.graph.image_desc(image).unwrap().extent;

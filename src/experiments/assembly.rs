@@ -36,6 +36,7 @@ pub(super) static ROOT_PROVIDERS: std::sync::LazyLock<Vec<crate::scene::RootWrit
 const MODULES: &[Registration] = &[
     super::movement_lab::MODULE,
     super::streaming_lab::MODULE,
+    vegetation::streaming::MODULE,
     clusters::MODULE,
     vegetation::MODULE,
     effects::MODULE,

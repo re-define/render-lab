@@ -1,0 +1,45 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#include "forest_stream.glsl"
+#define PAGE_TABLE 5
+#include "stream_pages.glsl"
+layout(local_size_x=32) in;
+layout(triangles,max_vertices=96,max_primitives=32) out;
+layout(binding=0,std430) readonly buffer View {Frame f;};
+layout(binding=1,std430) readonly buffer Models {mat4 model[];};
+layout(binding=2,std430) readonly buffer Groups {CanopyGroup groups[];};
+layout(binding=3,std430) readonly buffer Chunks {uvec4 chunks[];};
+layout(binding=4,std430) readonly buffer Bindings {Unit units[];};
+layout(binding=6,std430) readonly buffer Roots {uint roots[];};
+layout(binding=7,std430) readonly buffer Jobs {uvec2 jobs[];};
+layout(push_constant) uniform Params{layout(offset=32) uint first;}p;
+layout(location=0) out vec2 uv[];
+layout(location=1) out float light[];
+layout(location=2) flat out uint material[];
+uint getWord(uint page,uint j){if(page==NONE)return roots[j]; return wordAt(page,j);}
+void main(){
+    uvec2 job=jobs[p.first+gl_WorkGroupID.x];
+    uvec4 c=chunks[job.y];
+    SetMeshOutputsEXT(c.w*3,c.w);
+    uint t=gl_LocalInvocationIndex;
+    if(t>=c.w)return;
+    uint page=NONE,base=c.z;
+    if(c.x!=NONE){
+        CanopyGroup g=groups[c.x];
+        if(g.unit==NONE)base+=g.root;
+        else {Unit part=units[g.unit];page=part.first;base+=part.offset;}
+    }
+    mat4 m=model[job.x];
+    for(uint k=0;k<3;k++){
+        uint v=t*3+k,j=base+v*4;
+        vec2 xy=unpackHalf2x16(getWord(page,j));
+        vec3 p=vec3(xy,unpackHalf2x16(getWord(page,j+1)).x);
+        vec3 normal=normalize(mat3(m)*(unpackUnorm4x8(getWord(page,j+3)).xyz*2.-1.));
+        gl_MeshVerticesEXT[v].gl_Position=f.vp*m*vec4(p,1);
+        uv[v]=unpackHalf2x16(getWord(page,j+2));
+        material[v]=c.x==NONE?1u:2u;
+        float nl=dot(normal,normalize(vec3(-.35,.82,.51)));
+        light[v]=c.x==NONE?.32+.68*max(nl,0.):.36+.44*max(nl,0.)+.18*abs(nl);
+    }
+    gl_PrimitiveTriangleIndicesEXT[t]=uvec3(3*t)+uvec3(0,1,2);
+}

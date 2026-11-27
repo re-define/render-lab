@@ -481,7 +481,7 @@ pub struct Graph {
     >,
     pub(crate) page_copies: Vec<(usize, Arc<crate::streaming::CopyTicket>)>,
     pub(crate) stream_feedback:
-        std::collections::BTreeMap<Resource, Arc<std::sync::atomic::AtomicU32>>,
+        std::collections::BTreeMap<Resource, crate::streaming::FeedbackSink>,
     pub(crate) resident_inputs: BTreeSet<Resource>,
     pub resources: Vec<(String, Storage)>,
     pub passes: Vec<Pass>,
